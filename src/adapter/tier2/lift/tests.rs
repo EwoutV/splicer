@@ -31,6 +31,7 @@ const TEST_WIT: &str = r#"
     interface t {
         enum color { red, green, blue }
         flags fperms { read, write, exec }
+        flags fcaps { net, fs, time, env, rand }
         variant shape { circle, sq(u32), tri(u32) }
         record point { x: u32, y: s32 }
         record nested { p: point, c: color }
@@ -99,6 +100,14 @@ const TEST_WIT: &str = r#"
         f-list-handle-own: func(xs: list<own<my-res>>);
         f-list-handle-borrow: func(xs: list<borrow<my-res>>);
         f-list-error-context: func(xs: list<error-context>);
+        f-list-flags: func(xs: list<fperms>);
+        f-list-tuple-of-flags: func(xs: list<tuple<fperms, fperms>>);
+        // Mixed-width tuple element: fperms (3 bits) + fcaps (5 bits)
+        // — cumulative `scratch_offset_in_elem` for the second cell
+        // must equal `3 * STRING_FLAT_BYTES`, not 5x. Catches a
+        // regression where the offset is computed from a uniform
+        // per-cell stride.
+        f-list-tuple-mixed-flags: func(xs: list<tuple<fperms, fcaps>>);
         f-list-tuple-of-handles:
             func(xs: list<tuple<own<my-res>, borrow<my-res>>>);
         record handle-and-stuff { h: own<my-res>, x: u32 }
@@ -207,6 +216,24 @@ fn enum_info(type_name: &str, items: &[&str]) -> NamedListInfo {
     NamedListInfo {
         type_name: type_name.into(),
         item_names: items.iter().map(|s| (*s).to_string()).collect(),
+    }
+}
+
+/// `Cell::Flags` shorthand for fixtures. Interns `type_name` and
+/// each item name; mirrors plan-build's interning so [`BlobSlice`]s
+/// match by-value regardless of which side ran first.
+fn flags_cell(
+    names: &mut NameInterner,
+    flat_slot: u32,
+    type_name: &str,
+    items: &[&str],
+) -> Cell {
+    let type_name = names.intern(type_name);
+    let flag_names = items.iter().map(|n| names.intern(n)).collect();
+    Cell::Flags {
+        flat_slot,
+        type_name,
+        flag_names,
     }
 }
 
@@ -398,23 +425,22 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                     source: TupleIdxSource::Static(BlobSlice { off, len }),
                 }
             }
-            Cell::Flags { info, .. } => {
+            Cell::Flags { flag_names, .. } => {
                 use super::sidetable::flags_info::FlagsSlotSource;
                 let scratch_addr = flags_cursor;
-                flags_cursor += info.item_names.len() as u32 * STRING_FLAT_BYTES;
+                flags_cursor += flag_names.len() as u32 * STRING_FLAT_BYTES;
                 let fill = FlagsRuntimeFill {
-                    slot_source: FlagsSlotSource::Static(flags_idx),
+                    slot_source: FlagsSlotSource::Static {
+                        entry_idx: flags_idx,
+                        scratch_addr: scratch_addr as i32,
+                    },
                     type_name: BlobSlice {
                         off: 0,
                         len: STUB_FLAG_NAME_LEN,
                     },
-                    scratch_addr: scratch_addr as i32,
-                    flag_names: info
-                        .item_names
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| BlobSlice {
-                            off: i as u32 * STUB_FLAG_NAME_STRIDE,
+                    flag_names: (0..flag_names.len() as u32)
+                        .map(|i| BlobSlice {
+                            off: i * STUB_FLAG_NAME_STRIDE,
                             len: STUB_FLAG_NAME_LEN,
                         })
                         .collect(),
@@ -530,9 +556,14 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let handle_info_base = builder.alloc_local(ValType::I32);
     let flags_info_base = builder.alloc_local(ValType::I32);
     let next_handle_idx = builder.alloc_local(ValType::I32);
+    let next_flags_idx = builder.alloc_local(ValType::I32);
     let list_elem_handle_base = builder.alloc_local(ValType::I32);
     let handle_slot_addr = builder.alloc_local(ValType::I32);
     let handle_payload_idx = builder.alloc_local(ValType::I32);
+    let list_elem_flags_base = builder.alloc_local(ValType::I32);
+    let list_elem_flags_scratch_base = builder.alloc_local(ValType::I32);
+    let flags_slot_addr = builder.alloc_local(ValType::I32);
+    let flags_payload_idx = builder.alloc_local(ValType::I32);
     let list_locals = super::emit::alloc_list_emit_locals(plan, resolve, &sizes, &mut builder);
     let FrozenLocals { locals } = builder.freeze();
 
@@ -556,9 +587,14 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         handle_info_base: Some(handle_info_base),
         flags_info_base: Some(flags_info_base),
         next_handle_idx: Some(next_handle_idx),
+        next_flags_idx: Some(next_flags_idx),
         list_elem_handle_base: Some(list_elem_handle_base),
         handle_slot_addr: Some(handle_slot_addr),
         handle_payload_idx: Some(handle_payload_idx),
+        list_elem_flags_base: Some(list_elem_flags_base),
+        list_elem_flags_scratch_base: Some(list_elem_flags_scratch_base),
+        flags_slot_addr: Some(flags_slot_addr),
+        flags_payload_idx: Some(flags_payload_idx),
         result: None,
         tr_addr: None,
         id_local,
@@ -709,10 +745,7 @@ fn flags_assigns_one_cell_one_slot() {
     let plan = plan_for_named("fperms", &r, &mut names);
     assert_plan_no_root(
         &plan,
-        vec![Cell::Flags {
-            flat_slot: 0,
-            info: enum_info("fperms", &["read", "write", "exec"]),
-        }],
+        vec![flags_cell(&mut names, 0, "fperms", &["read", "write", "exec"])],
         1,
     );
 }
@@ -1151,6 +1184,7 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
     // #5 flagged. Pin: counts == Σ(per-cell offsets) for every kind
     // that contributes both a count AND a build-time-relative
     // offset_in_elem (TupleOf children, Handle slots).
+    use super::sidetable::flags_info::FlagsSlotSource;
     use super::sidetable::handle_info::HandleSlotSource;
     let (r, mut names) = setup();
     for fn_name in [
@@ -1160,6 +1194,9 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         "f-list-handle-own",
         "f-list-tuple-of-handles",
         "f-list-error-context",
+        "f-list-flags",
+        "f-list-tuple-of-flags",
+        "f-list-tuple-mixed-flags",
     ] {
         let plan = plan_for_param(fn_name, &r, &mut names);
         let elem_plan = list_element_plan(&plan, 0);
@@ -1168,6 +1205,8 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         let mut expected_chars = 0u32;
         let mut expected_tuple_slots = 0u32;
         let mut expected_handles = 0u32;
+        let mut expected_flags = 0u32;
+        let mut expected_flags_scratch = 0u32;
         let mut running_tuple_off = 0u32;
         for (cell, sd) in elem_plan.cells.iter().zip(side.iter()) {
             match cell {
@@ -1206,6 +1245,33 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
                     );
                     expected_handles += 1;
                 }
+                Cell::Flags { flag_names, .. } => {
+                    let CellSideData::Flags(fill) = sd else {
+                        panic!("expected Flags side data, got {sd:?}");
+                    };
+                    let FlagsSlotSource::PerIteration {
+                        entry_offset_in_elem,
+                        scratch_offset_in_elem,
+                    } = fill.slot_source
+                    else {
+                        panic!(
+                            "list-element Flags must carry PerIteration slot source, \
+                             got {:?}",
+                            fill.slot_source,
+                        );
+                    };
+                    assert_eq!(
+                        entry_offset_in_elem, expected_flags,
+                        "Flags entry_offset_in_elem must be the cumulative count",
+                    );
+                    assert_eq!(
+                        scratch_offset_in_elem, expected_flags_scratch,
+                        "Flags scratch_offset_in_elem must be cumulative \
+                         (sum of prior cells' set-flags scratch sizes)",
+                    );
+                    expected_flags += 1;
+                    expected_flags_scratch += flag_names.len() as u32 * STRING_FLAT_BYTES;
+                }
                 _ => assert!(matches!(sd, CellSideData::None)),
             }
         }
@@ -1221,7 +1287,53 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
             counts.handles, expected_handles,
             "counts.handles drift in {fn_name}",
         );
+        assert_eq!(
+            counts.flags, expected_flags,
+            "counts.flags drift in {fn_name}",
+        );
+        assert_eq!(
+            counts.flags_scratch_bytes, expected_flags_scratch,
+            "counts.flags_scratch_bytes drift in {fn_name}",
+        );
     }
+}
+
+#[test]
+fn walk_element_plan_pins_mixed_flags_scratch_bytes_literal() {
+    // Cross-check the cumulative `scratch_offset_in_elem` formula at
+    // a literal value: `f-list-tuple-mixed-flags` = list<tuple<fperms,
+    // fcaps>>, fperms = 3 bits, fcaps = 5 bits. Per-element scratch is
+    // (3 + 5) * STRING_FLAT_BYTES; cell 0 starts at offset 0, cell 1
+    // at 3 * STRING_FLAT_BYTES. A regression that uses a uniform stride
+    // (max-bits or first-cell-bits) would compute different values and
+    // be caught here in a way that the lockstep test (which derives
+    // expected values from the same per-cell formula) wouldn't.
+    use super::sidetable::flags_info::FlagsSlotSource;
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-tuple-mixed-flags", &r, &mut names);
+    let elem_plan = list_element_plan(&plan, 0);
+    let (side, counts) = super::emit::walk_element_plan(elem_plan);
+    let flags_offsets: Vec<(u32, u32)> = side
+        .iter()
+        .filter_map(|sd| match sd {
+            CellSideData::Flags(fill) => match fill.slot_source {
+                FlagsSlotSource::PerIteration {
+                    entry_offset_in_elem,
+                    scratch_offset_in_elem,
+                } => Some((entry_offset_in_elem, scratch_offset_in_elem)),
+                _ => panic!("list-element Flags must be PerIteration"),
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        flags_offsets,
+        vec![(0, 0), (1, 3 * STRING_FLAT_BYTES)],
+        "tuple<fperms, fcaps> must give cell 0 (entry 0, scratch 0) \
+         and cell 1 (entry 1, scratch 3 * STRING_FLAT_BYTES)",
+    );
+    assert_eq!(counts.flags, 2);
+    assert_eq!(counts.flags_scratch_bytes, (3 + 5) * STRING_FLAT_BYTES);
 }
 
 #[test]
@@ -1239,6 +1351,7 @@ fn walk_element_plan_zero_counts_for_scalar_only() {
             "{fn_name} should have no tuple-idx slots",
         );
         assert_eq!(counts.handles, 0, "{fn_name} should have no handle cells");
+        assert_eq!(counts.flags, 0, "{fn_name} should have no flags cells");
     }
 }
 
@@ -1462,6 +1575,9 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
         plan_for_param("f-list-handle-own", &r, &mut names),
         plan_for_param("f-list-handle-borrow", &r, &mut names),
         plan_for_param("f-list-error-context", &r, &mut names),
+        plan_for_param("f-list-flags", &r, &mut names),
+        plan_for_param("f-list-tuple-of-flags", &r, &mut names),
+        plan_for_param("f-list-tuple-mixed-flags", &r, &mut names),
         plan_for_param("f-list-tuple-of-handles", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
@@ -1530,14 +1646,8 @@ fn record_with_flags_field_recurses_into_flags() {
     assert_plan(
         &plan,
         vec![
-            Cell::Flags {
-                flat_slot: 0,
-                info: enum_info("fperms", &["read", "write", "exec"]),
-            },
-            Cell::Flags {
-                flat_slot: 1,
-                info: enum_info("fperms", &["read", "write", "exec"]),
-            },
+            flags_cell(&mut names, 0, "fperms", &["read", "write", "exec"]),
+            flags_cell(&mut names, 1, "fperms", &["read", "write", "exec"]),
             record_of(
                 &mut names,
                 "perms-pair",
@@ -2194,6 +2304,15 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         // `handles_per_elem > 1` and `offset_in_elem` math in both
         // `emit_handle_runtime_fill` and `stage_handle_cell_payload`.
         plan_for_param("f-list-tuple-of-handles", &r, &mut names),
+        // List-element flags: per-call flags-info buffer + variable-
+        // stride per-list scratch slab. `f-list-tuple-of-flags`
+        // additionally pins `flags_per_elem > 1`; `mixed-flags`
+        // (fperms 3 bits + fcaps 5 bits) pins cumulative
+        // `scratch_offset_in_elem` math against a uniform-stride
+        // regression.
+        plan_for_param("f-list-flags", &r, &mut names),
+        plan_for_param("f-list-tuple-of-flags", &r, &mut names),
+        plan_for_param("f-list-tuple-mixed-flags", &r, &mut names),
         // `func(top: own<R>, xs: list<own<R>>)` params[1] — mixed
         // wrapper with both a static handle (top) and a
         // list-element handle (xs). Pins the

@@ -135,8 +135,16 @@ pub(crate) enum Cell {
     },
 
     /// `flags { ... }` → `cell::flags-set(u32)`. Single i32 lift slot
-    /// (canonical-ABI caps flags at 32 bits).
-    Flags { flat_slot: u32, info: NamedListInfo },
+    /// (canonical-ABI caps flags at 32 bits). `type_name` and each
+    /// flag's name are pre-interned [`BlobSlice`]s into the shared
+    /// name blob (mirrors [`Cell::Handle`]) so emit-phase code reads
+    /// them directly off the cell — no layout-phase string-table
+    /// lookup needed.
+    Flags {
+        flat_slot: u32,
+        type_name: BlobSlice,
+        flag_names: Vec<BlobSlice>,
+    },
     /// `variant { ... }` → `cell::variant-case(u32)`. Flat layout
     /// `[disc, ...joined_flat_of_each_case]`. `per_case_payload[i]`
     /// is `Some(child_idx)` for cases with a payload, `None` for unit.
@@ -257,6 +265,12 @@ pub(crate) enum ListElementClass {
     /// the per-(fn, param | result) handle-info buffer is grown at
     /// runtime to fit `static_count + Σ_lists len * handles_per_elem`.
     PrestagedHandle,
+    /// `Cell::Flags`. Folds to `CellSideData::Flags` with
+    /// `FlagsSlotSource::PerIteration`. Two per-call buffers grow
+    /// with list-element flags: the flags-info entries buffer
+    /// (uniform stride) and the set-flags scratch buffer
+    /// (per-cell variable stride within an iteration).
+    PrestagedFlags,
 }
 
 impl Cell {
@@ -271,6 +285,7 @@ impl Cell {
             Cell::Option { .. } | Cell::Result { .. } => Some(ListElementClass::PrestagedChildIdx),
             Cell::TupleOf { .. } => Some(ListElementClass::PrestagedTupleIndices),
             Cell::Handle { .. } => Some(ListElementClass::PrestagedHandle),
+            Cell::Flags { .. } => Some(ListElementClass::PrestagedFlags),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -280,10 +295,7 @@ impl Cell {
             | Cell::Text { .. }
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
-            Cell::Flags { .. }
-            | Cell::RecordOf { .. }
-            | Cell::Variant { .. }
-            | Cell::ListOf { .. } => None,
+            Cell::RecordOf { .. } | Cell::Variant { .. } | Cell::ListOf { .. } => None,
         }
     }
 
@@ -406,6 +418,16 @@ impl LiftPlan {
         })
     }
 
+    /// Companion to [`has_list_elem_handle`] for `Cell::Flags`.
+    pub(crate) fn has_list_elem_flags(&self) -> bool {
+        self.list_specs().any(|spec| {
+            spec.element_plan
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Flags { .. }))
+        })
+    }
+
     /// Iterator over every `Cell::EnumCase` in the plan tree
     /// (including list element plans). Used by the side-table builder
     /// to register enum strings.
@@ -414,17 +436,6 @@ impl LiftPlan {
             .into_iter()
             .filter_map(|op| match op {
                 Cell::EnumCase { info, .. } => Some(info),
-                _ => None,
-            })
-    }
-
-    /// Iterator over every `Cell::Flags` in the plan tree. Used by the
-    /// side-table builder to register flag-type and flag-name strings.
-    pub(super) fn flags_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
-        self.walk_cells_recursive()
-            .into_iter()
-            .filter_map(|op| match op {
-                Cell::Flags { info, .. } => Some(info),
                 _ => None,
             })
     }
@@ -617,8 +628,14 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Flags(_) => {
                     let info = flags_lift_info_for_type(ty, resolve)
                         .expect("Flags kind implies flags-info available");
+                    let type_name = names.intern(&info.type_name);
+                    let flag_names = info.item_names.iter().map(|n| names.intern(n)).collect();
                     let flat_slot = self.bump_flat_slot();
-                    self.push_cell(Cell::Flags { flat_slot, info })
+                    self.push_cell(Cell::Flags {
+                        flat_slot,
+                        type_name,
+                        flag_names,
+                    })
                 }
                 wit_parser::TypeDefKind::Option(inner) => self.push_option(inner, resolve, names),
                 wit_parser::TypeDefKind::Result(_) => self.push_result(ty, resolve, names),
@@ -1000,10 +1017,10 @@ impl LiftPlanBuilder {
                 "`list<T>` element type {elem:?} contains a cell shape that \
                  isn't yet supported as a list element (allowed today: bool, \
                  integers, floats, string, list<u8>, enum, char, option, \
-                 result, tuple, own/borrow/stream/future/error-context handles \
-                 — with allowed inner cells throughout). Still gated: flags, \
-                 record, variant, nested list. File a request at {ISSUES_URL} \
-                 to bump priority."
+                 result, tuple, flags, own/borrow/stream/future/error-context \
+                 handles — with allowed inner cells throughout). Still \
+                 gated: record, variant, nested list. File a request at \
+                 {ISSUES_URL} to bump priority."
             ));
         }
         let arm_guards = self.arm_guard_stack.clone();

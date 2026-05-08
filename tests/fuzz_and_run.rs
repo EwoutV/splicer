@@ -353,27 +353,30 @@ impl Shape {
     /// types.
     fn wit_decls(&self) -> String {
         let mut decls = String::new();
-        let mut seen_resources = HashSet::new();
-        self.collect_wit_decls(&mut decls, &mut seen_resources);
+        let mut seen = HashSet::new();
+        self.collect_wit_decls(&mut decls, &mut seen);
         decls
     }
 
-    fn collect_wit_decls(&self, out: &mut String, seen_resources: &mut HashSet<&'static str>) {
+    fn collect_wit_decls(&self, out: &mut String, seen: &mut HashSet<&'static str>) {
         match self {
             Shape::Primitive { .. } => {}
             Shape::Option { inner, .. } | Shape::List(inner) => {
-                inner.collect_wit_decls(out, seen_resources)
+                inner.collect_wit_decls(out, seen)
             }
             Shape::Tuple(parts) => {
                 for p in parts {
-                    p.collect_wit_decls(out, seen_resources);
+                    p.collect_wit_decls(out, seen);
                 }
             }
             Shape::Record {
                 wit_name, fields, ..
             } => {
                 for (_, fshape) in fields {
-                    fshape.collect_wit_decls(out, seen_resources);
+                    fshape.collect_wit_decls(out, seen);
+                }
+                if !seen.insert(*wit_name) {
+                    return;
                 }
                 if !out.is_empty() {
                     out.push_str("\n\n");
@@ -389,8 +392,11 @@ impl Shape {
             } => {
                 for case in cases {
                     if let Some(p) = &case.payload {
-                        p.collect_wit_decls(out, seen_resources);
+                        p.collect_wit_decls(out, seen);
                     }
+                }
+                if !seen.insert(*wit_name) {
+                    return;
                 }
                 if !out.is_empty() {
                     out.push_str("\n\n");
@@ -409,6 +415,9 @@ impl Shape {
             Shape::Enum {
                 wit_name, cases, ..
             } => {
+                if !seen.insert(*wit_name) {
+                    return;
+                }
                 if !out.is_empty() {
                     out.push_str("\n\n");
                 }
@@ -421,6 +430,9 @@ impl Shape {
             Shape::Flags {
                 wit_name, flags, ..
             } => {
+                if !seen.insert(*wit_name) {
+                    return;
+                }
                 if !out.is_empty() {
                     out.push_str("\n\n");
                 }
@@ -432,18 +444,18 @@ impl Shape {
             }
             Shape::Result_ { ok, err, .. } => {
                 if let Some(o) = ok {
-                    o.collect_wit_decls(out, seen_resources);
+                    o.collect_wit_decls(out, seen);
                 }
                 if let Some(e) = err {
-                    e.collect_wit_decls(out, seen_resources);
+                    e.collect_wit_decls(out, seen);
                 }
             }
             // Both own<X> and borrow<X> share the same `resource X`
-            // declaration. Dedupe via `seen_resources` so a shape that
-            // mixes `own<cat>` and `borrow<cat>` emits one resource decl
+            // declaration. Dedupe via `seen` so a shape that mixes
+            // `own<cat>` and `borrow<cat>` emits one resource decl
             // rather than two clashing ones.
             Shape::ResourceOwn { wit_name, .. } | Shape::ResourceBorrow { wit_name, .. } => {
-                if seen_resources.insert(*wit_name) {
+                if seen.insert(*wit_name) {
                     if !out.is_empty() {
                         out.push_str("\n\n");
                     }
@@ -1743,6 +1755,43 @@ fn tier2_shapes() -> Vec<Shape> {
             wit_name: "cat",
             rust_name: "Cat",
         })),
+        // list<fperms>: per-call flags-info buffer + per-call set-flags
+        // scratch slab. Mixed bitmask (READ|EXEC, bit 1 unset) exercises
+        // the bit-walk's skip-then-set transition inside a list element.
+        Shape::List(Box::new(Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0b101,
+        })),
+        // Empty bitmask inside a list — patches set-flags.len to 0 and
+        // skips the per-bit name writes for that element.
+        Shape::List(Box::new(Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0,
+        })),
+        // Multi-flags-per-element: tuple<fperms, fperms>. Two flags
+        // cells per iteration, distinct cumulative
+        // `(entry_offset_in_elem, scratch_offset_in_elem)` slots in
+        // the per-call buffers. End-to-end pin for `flags_per_elem
+        // > 1` — the cumulative offset math is otherwise only exercised
+        // at the validator level.
+        Shape::List(Box::new(Shape::Tuple(vec![
+            Shape::Flags {
+                wit_name: "fperms",
+                rust_name: "Fperms",
+                flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+                selected: 0b101,
+            },
+            Shape::Flags {
+                wit_name: "fperms",
+                rust_name: "Fperms",
+                flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+                selected: 0b010,
+            },
+        ]))),
     ]
 }
 

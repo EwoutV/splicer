@@ -524,16 +524,22 @@ impl CellLayout {
         );
     }
 
-    /// `cell::flags-set(u32)` — build-time-known index into
-    /// `field-tree.flags-infos`. The pointed-at entry's `set-flags.len`
-    /// is patched at runtime by the bit-walk emitted alongside this.
-    pub(crate) fn emit_flags_set(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+    /// `cell::flags-set(u32)` — index into `field-tree.flags-infos`.
+    /// `payload` is `ConstI32(idx)` for static cells (build-time idx)
+    /// or `Local(local)` for list-element cells (runtime-staged idx
+    /// off `list_elem_flags_base`).
+    pub(crate) fn emit_flags_set(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        payload: PayloadSource,
+    ) {
         self.emit_cell(
             f,
             addr_local,
             self.disc_of("flags-set"),
             &[PayloadPart {
-                source: PayloadSource::ConstI32(side_table_idx as i32),
+                source: payload,
                 kind: StoreKind::I32,
                 offset: 0,
             }],
@@ -959,7 +965,9 @@ mod tests {
         // params: (addr_local: i32). side_table_idx is i32.const, no
         // additional locals.
         let cl = synth_cell_layout();
-        build_and_validate(&[ValType::I32], |f| cl.emit_flags_set(f, 0, 11));
+        build_and_validate(&[ValType::I32], |f| {
+            cl.emit_flags_set(f, 0, PayloadSource::ConstI32(11))
+        });
     }
 
     #[test]

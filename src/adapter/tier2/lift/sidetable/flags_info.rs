@@ -17,37 +17,48 @@
 //! entries contiguously.
 
 use super::super::super::super::abi::emit::{BlobSlice, STRING_FLAT_BYTES};
-use super::super::super::blob::NameInterner;
 use super::super::super::FuncClassified;
-use super::super::plan::{Cell, LiftPlan, NamedListInfo};
-use super::{register_side_table_strings, PerCellIndices, StringTable};
+use super::super::classify::ResultSource;
+use super::super::plan::{Cell, LiftPlan};
+use super::PerCellIndices;
 
 /// Where a `Cell::Flags`'s slot lives in the per-(fn, param | result)
-/// flags-info buffer.
+/// flags-info buffer, plus where its set-flags scratch slot is.
+/// Static cells use the build-time-const slab address; list-element
+/// cells stripe both the entry idx and the scratch ptr off per-iter
+/// bases.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FlagsSlotSource {
-    /// Build-time absolute index — outer-plan flags.
-    Static(u32),
-    // List-element variant lands when `Cell::Flags` is opened in
-    // `Cell::list_element_class`. Will mirror `HandleSlotSource::PerIteration`:
-    // idx = `list_elem_flags_base + offset_in_elem` at runtime.
+    /// Outer-plan flags: entry idx is build-time-const; the scratch
+    /// slab is reserved at layout time at `scratch_addr`.
+    Static {
+        entry_idx: u32,
+        scratch_addr: i32,
+    },
+    /// List-element flags: entry idx is `list_elem_flags_base +
+    /// entry_offset_in_elem`; scratch is `list.flags_scratch_base +
+    /// j * flags_scratch_bytes_per_elem + scratch_offset_in_elem`.
+    /// Both `*_offset_in_elem`s are build-time-known (the cell's
+    /// position among the element-plan's flags cells); the runtime
+    /// locals are staged by the list-of-arm.
+    PerIteration {
+        entry_offset_in_elem: u32,
+        scratch_offset_in_elem: u32,
+    },
 }
 
 /// Per-(plan-cell) emit-phase data for one `Cell::Flags`. The
-/// wrapper writes `type-name` + `set-flags.ptr` (build-time-const)
-/// and `set-flags.len` (runtime) into the buffer slot resolved
-/// from `slot_source`; cell payload is `cell::flags-set(idx)`.
+/// wrapper writes `type-name` + `set-flags.ptr` + `set-flags.len`
+/// (the first two build-time-const for static cells / runtime-staged
+/// for list-element cells; `len` always runtime from the bit-walk)
+/// into the buffer slot resolved from `slot_source`. Cell payload
+/// is `cell::flags-set(idx)`.
 #[derive(Clone, Debug)]
 pub(crate) struct FlagsRuntimeFill {
-    /// Slot index into the (fn, param | result) flags-info buffer.
+    /// Slot location + scratch source. See [`FlagsSlotSource`].
     pub slot_source: FlagsSlotSource,
     /// `(off, len)` of the type-name into the shared name blob.
     pub type_name: BlobSlice,
-    /// Address of the per-cell scratch slab the bit-walker writes
-    /// `(name_ptr, name_len)` pairs into. Build-time-static for
-    /// non-list-element cells; reserved by the layout phase via
-    /// [`flags_scratch_sizes`].
-    pub scratch_addr: i32,
     /// Each flag's interned `(off, len)`, in bit-position order.
     pub flag_names: Vec<BlobSlice>,
 }
@@ -69,20 +80,6 @@ pub(crate) struct FlagsInfoMaps {
     pub per_result_count: Vec<u32>,
 }
 
-/// Intern type-name + flag-names for every `Cell::Flags` across all
-/// param plans, compound result plans, and single-cell flags results.
-pub(crate) fn register_flags_strings(
-    per_func: &[FuncClassified],
-    names: &mut NameInterner,
-) -> StringTable {
-    register_side_table_strings(
-        per_func,
-        names,
-        |plan, visit| plan.flags_infos().for_each(visit),
-        |st| st.flags_info.as_ref(),
-    )
-}
-
 /// Walk every (fn, param | compound-result | direct-flags-result) to
 /// collect per-cell `FlagsRuntimeFill`s + per-(fn, param | result)
 /// entry counts. Caller supplies `scratch_addrs`, one pre-reserved
@@ -91,7 +88,6 @@ pub(crate) fn register_flags_strings(
 /// are written into a per-call `cabi_realloc`'d buffer at emit time.
 pub(crate) fn build_flags_info_maps(
     per_func: &[FuncClassified],
-    strings: &StringTable,
     scratch_addrs: &mut impl Iterator<Item = u32>,
 ) -> FlagsInfoMaps {
     let mut per_param_fill: Vec<Vec<Vec<Option<FlagsRuntimeFill>>>> =
@@ -106,7 +102,7 @@ pub(crate) fn build_flags_info_maps(
         let mut params_fill = Vec::with_capacity(fd.params.len());
         let mut params_count = Vec::with_capacity(fd.params.len());
         for p in &fd.params {
-            let (fill, count) = scan_plan(&p.plan, strings, scratch_addrs);
+            let (fill, count) = scan_plan(&p.plan, scratch_addrs);
             params_fill.push(fill);
             params_count.push(count);
         }
@@ -115,21 +111,16 @@ pub(crate) fn build_flags_info_maps(
         let (result_fill, result_count, single) = match fd.result_lift.as_ref() {
             Some(rl) => match rl.compound() {
                 Some(c) => {
-                    let (fill, count) = scan_plan(&c.plan, strings, scratch_addrs);
+                    let (fill, count) = scan_plan(&c.plan, scratch_addrs);
                     (fill, count, None)
                 }
-                None => match rl.side_table.flags_info.as_ref() {
+                None => match &rl.source {
                     // Direct(Flags) is exactly one entry — same single-
                     // entry rule as Direct(Handle).
-                    Some(info) => (
+                    ResultSource::Direct(cell @ Cell::Flags { .. }) => (
                         Vec::new(),
                         1,
-                        Some(build_fill(
-                            FlagsSlotSource::Static(0),
-                            info,
-                            strings,
-                            scratch_addrs,
-                        )),
+                        Some(build_static_fill(0, cell, scratch_addrs)),
                     ),
                     _ => (Vec::new(), 0, None),
                 },
@@ -151,48 +142,50 @@ pub(crate) fn build_flags_info_maps(
     }
 }
 
-/// Walk one plan, allocating range-relative `Static(side_table_idx)`
-/// per `Cell::Flags` and pulling type-name + flag-names off the cell.
+/// Walk one plan's outer cells, allocating range-relative
+/// `Static { entry_idx, scratch_addr }` per `Cell::Flags` and pulling
+/// type-name + flag-names off the cell. List-element flags use
+/// `PerIteration` (assigned by [`super::super::emit::walk_element_plan`])
+/// and don't participate in this static count.
 fn scan_plan(
     plan: &LiftPlan,
-    strings: &StringTable,
     scratch_addrs: &mut impl Iterator<Item = u32>,
 ) -> (Vec<Option<FlagsRuntimeFill>>, u32) {
     let mut fill_map: Vec<Option<FlagsRuntimeFill>> =
         (0..plan.cells.len()).map(|_| None).collect();
     let mut count: u32 = 0;
     for (cell_pos, cell) in plan.cells.iter().enumerate() {
-        if let Cell::Flags { info, .. } = cell {
-            fill_map[cell_pos] = Some(build_fill(
-                FlagsSlotSource::Static(count),
-                info,
-                strings,
-                scratch_addrs,
-            ));
+        if matches!(cell, Cell::Flags { .. }) {
+            fill_map[cell_pos] = Some(build_static_fill(count, cell, scratch_addrs));
             count += 1;
         }
     }
     (fill_map, count)
 }
 
-fn build_fill(
-    slot_source: FlagsSlotSource,
-    info: &NamedListInfo,
-    strings: &StringTable,
+fn build_static_fill(
+    entry_idx: u32,
+    cell: &Cell,
     scratch_addrs: &mut impl Iterator<Item = u32>,
 ) -> FlagsRuntimeFill {
-    let s = strings
-        .get(&info.type_name)
-        .expect("register_flags_strings ran for every info");
+    let Cell::Flags {
+        type_name,
+        flag_names,
+        ..
+    } = cell
+    else {
+        unreachable!("build_static_fill called on non-Flags cell {cell:?}");
+    };
     let scratch_addr = scratch_addrs
         .next()
         .expect("layout phase must reserve one scratch slot per Cell::Flags cell");
-    debug_assert_eq!(info.item_names.len(), s.items.len());
     FlagsRuntimeFill {
-        slot_source,
-        type_name: s.type_name,
-        scratch_addr: scratch_addr as i32,
-        flag_names: s.items.clone(),
+        slot_source: FlagsSlotSource::Static {
+            entry_idx,
+            scratch_addr: scratch_addr as i32,
+        },
+        type_name: *type_name,
+        flag_names: flag_names.clone(),
     }
 }
 
@@ -209,8 +202,8 @@ pub(crate) fn flags_scratch_sizes(per_func: &[FuncClassified]) -> Vec<u32> {
         if let Some(rl) = &fd.result_lift {
             if let Some(c) = rl.compound() {
                 collect_flags_sizes(&c.plan, &mut sizes);
-            } else if let Some(info) = &rl.side_table.flags_info {
-                sizes.push(info.item_names.len() as u32 * STRING_FLAT_BYTES);
+            } else if let ResultSource::Direct(Cell::Flags { flag_names, .. }) = &rl.source {
+                sizes.push(flag_names.len() as u32 * STRING_FLAT_BYTES);
             }
         }
     }
@@ -219,8 +212,8 @@ pub(crate) fn flags_scratch_sizes(per_func: &[FuncClassified]) -> Vec<u32> {
 
 fn collect_flags_sizes(plan: &LiftPlan, sizes: &mut Vec<u32>) {
     for cell in &plan.cells {
-        if let Cell::Flags { info, .. } = cell {
-            sizes.push(info.item_names.len() as u32 * STRING_FLAT_BYTES);
+        if let Cell::Flags { flag_names, .. } = cell {
+            sizes.push(flag_names.len() as u32 * STRING_FLAT_BYTES);
         }
     }
 }

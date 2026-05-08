@@ -51,8 +51,7 @@ pub(super) use sidetable::char_info::{
 };
 pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
 pub(super) use sidetable::flags_info::{
-    build_flags_info_maps, flags_scratch_sizes, register_flags_strings, FlagsInfoMaps,
-    FlagsRuntimeFill,
+    build_flags_info_maps, flags_scratch_sizes, FlagsInfoMaps, FlagsRuntimeFill,
 };
 pub(super) use sidetable::handle_info::{
     build_handle_info_maps, HandleInfoMaps, HandleRuntimeFill,

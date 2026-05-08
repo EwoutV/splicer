@@ -99,13 +99,14 @@ struct OnCallCallSite {
 }
 
 /// Where the patched `cells: list<cell>` slice lives in linear memory,
-/// plus the per-plan handle-info-buffer pre-pass seed (`static_count`
-/// — the build-time-known number of `Cell::Handle` cells in the plan's
-/// outer cells; the pre-pass adds list-element handle counts on top).
+/// plus the per-plan info-buffer pre-pass seeds (build-time-known
+/// counts of outer `Cell::Handle` / `Cell::Flags` in the plan; the
+/// pre-pass adds list-element counts on top).
 struct CellsTarget {
     fields_base_ptr: i32,
     cells_field_off: u32,
     static_handle_count: u32,
+    static_flags_count: u32,
 }
 
 /// Cells-slab allocation for one (param | result) plan. Runs the
@@ -128,6 +129,7 @@ fn emit_alloc_cells_for_plan(
         ctx,
         plan,
         target.static_handle_count,
+        target.static_flags_count,
         list_locals,
         local_base,
         lcl,
@@ -239,17 +241,41 @@ fn emit_alloc_handle_info_for_plan(
 }
 
 /// Per-call flags-info buffer alloc + slice-ptr patch. Mirrors
-/// [`emit_alloc_handle_info_for_plan`]'s static-count branch — runtime
-/// count lands with `list<flags>`. Field-tree's `flags_infos.len`
-/// was baked statically in `build_fields_blob`.
+/// [`emit_alloc_handle_info_for_plan`]'s two-regime structure
+/// (static-count + runtime-count) for the per-call flags-info
+/// entries buffer. The set-flags scratch slabs themselves stay
+/// per-cell static for non-list-element flags; list-element flags
+/// get a per-list scratch buffer allocated in `emit_list_of_arm`.
 fn emit_alloc_flags_info_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
     static_count: u32,
+    runtime_sized: bool,
     base_ptr: i32,
     slice_field_off: u32,
     lcl: &WrapperLocals,
 ) {
+    if runtime_sized {
+        let count_local = lcl.next_flags_idx.expect(
+            "next_flags_idx unset — fn_has_list_elem_flags gate disagrees \
+             with the plan's list_specs",
+        );
+        let base_local = lcl.flags_info_base.expect(
+            "flags_info_base local unset — fn_has_flags_cells gate disagrees \
+             with fn_has_list_elem_flags",
+        );
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            ctx.flags_info.align,
+            count_local,
+            ctx.flags_info.entry_size,
+            base_local,
+        );
+        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
+        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
+        return;
+    }
     if static_count == 0 {
         return;
     }
@@ -353,6 +379,7 @@ pub(super) fn emit_wrapper_function(
                     fields_base_ptr: fd.fields_buf_offset as i32,
                     cells_field_off: field_off + cells_slice_off,
                     static_handle_count: p.handle_count,
+                    static_flags_count: p.flags_count,
                 },
             );
             emit_alloc_handle_info_for_plan(
@@ -368,6 +395,7 @@ pub(super) fn emit_wrapper_function(
                 &mut f,
                 &lift_ctx,
                 p.flags_count,
+                p.lift.plan.has_list_elem_flags(),
                 fd.fields_buf_offset as i32,
                 field_off + flags_infos_slice_off,
                 &lcl,
@@ -509,6 +537,7 @@ pub(super) fn emit_wrapper_function(
                         fields_base_ptr: after_pf.params_offset,
                         cells_field_off,
                         static_handle_count: result_handle_count,
+                        static_flags_count: result_flags_count,
                     },
                 );
                 emit_alloc_handle_info_for_plan(
@@ -524,6 +553,7 @@ pub(super) fn emit_wrapper_function(
                     &mut f,
                     &lift_ctx,
                     result_flags_count,
+                    plan.has_list_elem_flags(),
                     after_pf.params_offset,
                     flags_infos_field_off,
                     &lcl,
@@ -571,6 +601,7 @@ pub(super) fn emit_wrapper_function(
                     &mut f,
                     &lift_ctx,
                     result_flags_count,
+                    false,
                     after_pf.params_offset,
                     flags_infos_field_off,
                     &lcl,

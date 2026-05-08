@@ -20,7 +20,7 @@ use super::lift::{
     back_fill_variant_entry_addrs, build_char_scratch_map, build_enum_info_blob,
     build_flags_info_maps, build_handle_info_maps, build_record_info_blob,
     build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes,
-    fold_cell_side_data, register_enum_strings, register_flags_strings, register_variant_strings,
+    fold_cell_side_data, register_enum_strings, register_variant_strings,
     CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoMaps, FlagsRuntimeFill,
     HandleInfoMaps, HandleRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
     ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
@@ -370,10 +370,10 @@ pub(super) fn lay_out_static_memory(
     // Side-table strings get appended to the name interner BEFORE we
     // place it — every side-table-info entry references these string
     // offsets, so they have to land in the data segment first.
-    // Record-info strings are already interned at plan-build time;
-    // enum-info and flags-info both need a registration pass here.
+    // Record-info, flags-info, and handle-info strings are already
+    // interned at plan-build time and live on their cells; enum-info
+    // and variant-info still need a registration pass here.
     let enum_strings = register_enum_strings(&per_func, &mut names);
-    let flags_strings = register_flags_strings(&per_func, &mut names);
     let variant_strings = register_variant_strings(&per_func, &mut names);
 
     let mut layout = StaticLayout::new();
@@ -441,7 +441,7 @@ pub(super) fn lay_out_static_memory(
         per_result_single_fill: flags_per_result_single_fill,
         per_param_count: flags_per_param_count,
         per_result_count: flags_per_result_count,
-    } = build_flags_info_maps(&per_func, &flags_strings, &mut flags_scratch_iter);
+    } = build_flags_info_maps(&per_func, &mut flags_scratch_iter);
     debug_assert!(
         flags_scratch_iter.next().is_none(),
         "flags scratch reservations must be consumed exactly once per Cell::Flags",

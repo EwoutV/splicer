@@ -184,15 +184,16 @@ pub(crate) enum ResultSourceLayout {
 }
 
 /// Result-side per-kind info. Populated when a single-cell direct
-/// result needs side-table entries (enum cases / flag names).
+/// result needs side-table entries (enum cases). Flags-typed
+/// direct results carry their interned BlobSlices on the cell
+/// itself ([`Cell::Flags`]); the layout phase picks them up by
+/// matching `ResultSource::Direct(Cell::Flags {..})` instead of
+/// going through this struct.
 #[derive(Default, Clone)]
 pub(super) struct SideTableInfo {
     /// `Some` for enum-typed result lifts: type-name + case names in
     /// disc order.
     pub(super) enum_info: Option<NamedListInfo>,
-    /// `Some` for flags-typed result lifts: type-name + flag names in
-    /// declaration (= bit) order.
-    pub(super) flags_info: Option<NamedListInfo>,
 }
 
 // ─── Classifiers ──────────────────────────────────────────────────
@@ -355,18 +356,15 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
 }
 
 /// Build the `SideTableInfo` for a single-cell result. Empty for
-/// primitive lifts; populated for kinds that need per-tree side-table
-/// entries (today: enum, flags).
+/// primitive lifts; populated for enum direct results (flags direct
+/// results read interned slices off the cell — see [`SideTableInfo`]).
 fn side_table_info_for_cell(cell: &Cell) -> SideTableInfo {
     let mut info = SideTableInfo::default();
-    match cell {
-        Cell::EnumCase {
-            info: enum_info, ..
-        } => info.enum_info = Some(enum_info.clone()),
-        Cell::Flags {
-            info: flags_info, ..
-        } => info.flags_info = Some(flags_info.clone()),
-        _ => {}
+    if let Cell::EnumCase {
+        info: enum_info, ..
+    } = cell
+    {
+        info.enum_info = Some(enum_info.clone());
     }
     info
 }
