@@ -108,6 +108,7 @@ struct CellsTarget {
     static_handle_count: u32,
     static_flags_count: u32,
     static_record_count: u32,
+    static_variant_count: u32,
 }
 
 /// Cells-slab allocation for one (param | result) plan. Runs the
@@ -132,6 +133,7 @@ fn emit_alloc_cells_for_plan(
         target.static_handle_count,
         target.static_flags_count,
         target.static_record_count,
+        target.static_variant_count,
         list_locals,
         local_base,
         lcl,
@@ -355,19 +357,40 @@ fn emit_alloc_record_info_for_plan(
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
-/// Per-call variant-info buffer alloc + slice-ptr patch. Static-only
-/// regime today (mirrors [`emit_alloc_record_info_for_plan`]'s
-/// build-time-const branch); the runtime-sized branch lands when
-/// `Cell::Variant` opens in `list_element_class`. Field-tree's
-/// `variant_infos.len` was baked statically in `build_fields_blob`.
+/// Per-call variant-info buffer alloc + slice-ptr patch. Mirrors
+/// [`emit_alloc_record_info_for_plan`]'s two-regime structure
+/// (static-count + runtime-count). No per-list scratch — variant
+/// has uniform-stride entries with no inner sub-slabs.
 fn emit_alloc_variant_info_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
     static_count: u32,
+    runtime_sized: bool,
     base_ptr: i32,
     slice_field_off: u32,
     lcl: &WrapperLocals,
 ) {
+    if runtime_sized {
+        let count_local = lcl.next_variant_idx.expect(
+            "next_variant_idx unset — fn_has_list_elem_variant gate disagrees \
+             with the plan's list_specs",
+        );
+        let base_local = lcl.variant_info_base.expect(
+            "variant_info_base local unset — fn_has_variant_cells gate disagrees \
+             with fn_has_list_elem_variant",
+        );
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            ctx.variant_info.align,
+            count_local,
+            ctx.variant_info.entry_size,
+            base_local,
+        );
+        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
+        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
+        return;
+    }
     if static_count == 0 {
         return;
     }
@@ -489,6 +512,7 @@ pub(super) fn emit_wrapper_function(
                     static_handle_count: p.handle_count,
                     static_flags_count: p.flags_count,
                     static_record_count: p.record_count,
+                    static_variant_count: p.variant_count,
                 },
             );
             emit_alloc_handle_info_for_plan(
@@ -522,6 +546,7 @@ pub(super) fn emit_wrapper_function(
                 &mut f,
                 &lift_ctx,
                 p.variant_count,
+                p.lift.plan.has_list_elem_variant(),
                 fd.fields_buf_offset as i32,
                 field_off + variant_infos_slice_off,
                 &lcl,
@@ -679,6 +704,7 @@ pub(super) fn emit_wrapper_function(
                         static_handle_count: result_handle_count,
                         static_flags_count: result_flags_count,
                         static_record_count: result_record_count,
+                        static_variant_count: result_variant_count,
                     },
                 );
                 emit_alloc_handle_info_for_plan(
@@ -712,6 +738,7 @@ pub(super) fn emit_wrapper_function(
                     &mut f,
                     &lift_ctx,
                     result_variant_count,
+                    plan.has_list_elem_variant(),
                     after_pf.params_offset,
                     variant_infos_field_off,
                     &lcl,
@@ -777,6 +804,7 @@ pub(super) fn emit_wrapper_function(
                     &mut f,
                     &lift_ctx,
                     result_variant_count,
+                    false,
                     after_pf.params_offset,
                     variant_infos_field_off,
                     &lcl,

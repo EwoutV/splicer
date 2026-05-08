@@ -21,10 +21,11 @@ use super::PerCellIndices;
 pub(crate) enum VariantSlotSource {
     /// Build-time absolute index — outer-plan variants.
     Static { entry_idx: u32 },
-    // List-element variant lands when `Cell::Variant` is opened in
-    // `Cell::list_element_class`. Will mirror `FlagsSlotSource::PerIteration`:
-    // entry idx = `list_elem_variant_base + entry_offset_in_elem`,
-    // computed at runtime.
+    /// List-element variants: entry idx is `list_elem_variant_base +
+    /// entry_offset_in_elem` at runtime. `entry_offset_in_elem` is
+    /// build-time-known (the cell's position among the element-plan's
+    /// variant cells); the runtime local is staged by the list-of-arm.
+    PerIteration { entry_offset_in_elem: u32 },
 }
 
 /// Per-(plan-cell) emit-phase data for one `Cell::Variant`. The

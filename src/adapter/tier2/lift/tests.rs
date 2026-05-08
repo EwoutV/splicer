@@ -129,6 +129,11 @@ const TEST_WIT: &str = r#"
         // generic-test used to assert. New still-gated kinds drop in
         // here as one-liners.
         f-list-of-variant: func(xs: list<shape>);
+        // Multi-variant element — pins `variants_per_elem > 1` +
+        // cumulative `entry_offset_in_elem` so a uniform-stride bug
+        // would compute different cell-array indices than the
+        // cumulative-count formula.
+        f-list-tuple-of-variants: func(xs: list<tuple<shape, shape>>);
         // Multi-record element with mismatched field counts (point=2,
         // solo=1) — pins literal `tuples_offset_in_elem` so a
         // uniform-stride bug (e.g. records_per_elem * max_fields *
@@ -613,6 +618,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let next_handle_idx = builder.alloc_local(ValType::I32);
     let next_flags_idx = builder.alloc_local(ValType::I32);
     let next_record_idx = builder.alloc_local(ValType::I32);
+    let next_variant_idx = builder.alloc_local(ValType::I32);
     let list_elem_handle_base = builder.alloc_local(ValType::I32);
     let handle_slot_addr = builder.alloc_local(ValType::I32);
     let handle_payload_idx = builder.alloc_local(ValType::I32);
@@ -625,6 +631,9 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let record_slot_addr = builder.alloc_local(ValType::I32);
     let record_payload_idx = builder.alloc_local(ValType::I32);
     let record_tuples_slice_addr = builder.alloc_local(ValType::I32);
+    let list_elem_variant_base = builder.alloc_local(ValType::I32);
+    let variant_slot_addr = builder.alloc_local(ValType::I32);
+    let variant_payload_idx = builder.alloc_local(ValType::I32);
     let list_locals = super::emit::alloc_list_emit_locals(
         plan,
         resolve,
@@ -658,6 +667,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         next_handle_idx: Some(next_handle_idx),
         next_flags_idx: Some(next_flags_idx),
         next_record_idx: Some(next_record_idx),
+        next_variant_idx: Some(next_variant_idx),
         list_elem_handle_base: Some(list_elem_handle_base),
         handle_slot_addr: Some(handle_slot_addr),
         handle_payload_idx: Some(handle_payload_idx),
@@ -670,6 +680,9 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         record_slot_addr: Some(record_slot_addr),
         record_payload_idx: Some(record_payload_idx),
         record_tuples_slice_addr: Some(record_tuples_slice_addr),
+        list_elem_variant_base: Some(list_elem_variant_base),
+        variant_slot_addr: Some(variant_slot_addr),
+        variant_payload_idx: Some(variant_payload_idx),
         result: None,
         tr_addr: None,
         id_local,
@@ -1278,6 +1291,7 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
     use super::sidetable::flags_info::FlagsSlotSource;
     use super::sidetable::handle_info::HandleSlotSource;
     use super::sidetable::record_info::RecordSlotSource;
+    use super::sidetable::variant_info::VariantSlotSource;
     let (r, mut names) = setup();
     let (_, record_tuple_layout) = synth_record_info_layouts(&r);
     let record_tuple_size = record_tuple_layout.size;
@@ -1293,6 +1307,8 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         "f-list-tuple-mixed-flags",
         "f-list-of-record",
         "f-list-tuple-record-mixed",
+        "f-list-of-variant",
+        "f-list-tuple-of-variants",
     ] {
         let plan = plan_for_param(fn_name, &r, &mut names);
         let elem_plan = list_element_plan(&plan, 0);
@@ -1305,6 +1321,7 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         let mut expected_flags_scratch = 0u32;
         let mut expected_records = 0u32;
         let mut expected_record_tuples_bytes = 0u32;
+        let mut expected_variants = 0u32;
         let mut running_tuple_off = 0u32;
         for (cell, sd) in elem_plan.cells.iter().zip(side.iter()) {
             match cell {
@@ -1397,6 +1414,26 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
                     expected_records += 1;
                     expected_record_tuples_bytes += fields.len() as u32 * record_tuple_size;
                 }
+                Cell::Variant { .. } => {
+                    let CellSideData::Variant(fill) = sd else {
+                        panic!("expected Variant side data, got {sd:?}");
+                    };
+                    let VariantSlotSource::PerIteration {
+                        entry_offset_in_elem,
+                    } = fill.slot_source
+                    else {
+                        panic!(
+                            "list-element Variant must carry PerIteration slot source, \
+                             got {:?}",
+                            fill.slot_source,
+                        );
+                    };
+                    assert_eq!(
+                        entry_offset_in_elem, expected_variants,
+                        "Variant entry_offset_in_elem must be the cumulative count",
+                    );
+                    expected_variants += 1;
+                }
                 _ => assert!(matches!(sd, CellSideData::None)),
             }
         }
@@ -1427,6 +1464,10 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         assert_eq!(
             counts.record_tuples_bytes, expected_record_tuples_bytes,
             "counts.record_tuples_bytes drift in {fn_name}",
+        );
+        assert_eq!(
+            counts.variants, expected_variants,
+            "counts.variants drift in {fn_name}",
         );
     }
 }
@@ -1529,6 +1570,7 @@ fn walk_element_plan_zero_counts_for_scalar_only() {
         assert_eq!(counts.handles, 0, "{fn_name} should have no handle cells");
         assert_eq!(counts.flags, 0, "{fn_name} should have no flags cells");
         assert_eq!(counts.records, 0, "{fn_name} should have no record cells");
+        assert_eq!(counts.variants, 0, "{fn_name} should have no variant cells");
     }
 }
 
@@ -1572,20 +1614,22 @@ fn nested_list_bails_at_plan_build() {
 }
 
 #[test]
-fn list_of_variant_bails_at_plan_build() {
-    // Variants are still gated as a list-element kind. Pins the
-    // bail message + URL so a future change that opens variant
-    // before its emit path is wired surfaces here.
+fn list_of_variant_classifies_with_perivariant_element() {
+    // list<shape>: variant elements are now supported. The element
+    // plan carries one `Cell::Variant` after its primitive disc/payload
+    // cells (children-first), and `has_list_elem_variant()` flips
+    // true so the wrapper alloc routes through the runtime-sized
+    // variant-info branch.
     let (r, mut names) = setup();
-    let err = LiftPlan::for_type(
-        &func_named(&r, "f-list-of-variant").params[0].ty,
-        &r,
-        &mut names,
-    )
-    .expect_err("list<variant> must bail at plan build");
-    let msg = err.to_string();
-    assert!(msg.contains("`list<T>` element type"));
-    assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+    let plan = plan_for_param("f-list-of-variant", &r, &mut names);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf at cell 0, got {:?}", plan.cells[0]);
+    };
+    assert!(matches!(
+        element_plan.cells.last(),
+        Some(Cell::Variant { .. })
+    ));
+    assert!(plan.has_list_elem_variant());
 }
 
 #[test]
@@ -2554,6 +2598,14 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         // `records_per_elem > 1` + cumulative `tuples_offset_in_elem`
         // for the multi-record case (point=2 fields, solo=1 field).
         plan_for_param("f-list-tuple-record-mixed", &r, &mut names),
+        // List-element variants: per-call variant-info buffer; the
+        // N-way disc dispatch writes case-name + payload using the
+        // per-iter staged slot address; payload `child_idx` resolves
+        // to `elem_cell_base + child_pos` at runtime.
+        plan_for_param("f-list-of-variant", &r, &mut names),
+        // Multi-variant element — pins `variants_per_elem > 1` +
+        // cumulative `entry_offset_in_elem`.
+        plan_for_param("f-list-tuple-of-variants", &r, &mut names),
         // `func(top: own<R>, xs: list<own<R>>)` params[1] — mixed
         // wrapper with both a static handle (top) and a
         // list-element handle (xs). Pins the

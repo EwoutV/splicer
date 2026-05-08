@@ -1790,6 +1790,83 @@ fn tier2_shapes() -> Vec<Shape> {
                 selected: 0b010,
             },
         ]))),
+        // list<shape>: per-call variant-info buffer; the N-way disc
+        // dispatch writes case-name + payload using a per-iter staged
+        // slot address; payload child-idx resolves to `elem_cell_base
+        // + child_pos` at runtime. `selected: 1` exercises the
+        // OPTION_SOME payload write path.
+        Shape::List(Box::new(Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 1,
+        })),
+        // Same shape, unit case active (`selected: 0`) — exercises
+        // the OPTION_NONE payload-disc write path inside a list
+        // element. The validator only checks shape, so without a
+        // runtime arm the unit-case write would silently regress.
+        Shape::List(Box::new(Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 0,
+        })),
         // list<point>: per-call record-info buffer + per-call
         // field-tuples buffer. Each iteration writes one record-info
         // entry and the matching `(field-name, child-cell-idx)` tuples

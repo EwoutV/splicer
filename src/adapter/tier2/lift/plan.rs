@@ -288,6 +288,12 @@ pub(crate) enum ListElementClass {
     /// variant, list, …) cells stay gated until classify can flatten
     /// them through the element plan.
     PrestagedRecord,
+    /// `Cell::Variant`. Folds to `CellSideData::Variant` with
+    /// `VariantSlotSource::PerIteration`. Per-call variant-info
+    /// entries buffer grows uniformly (one entry per cell per
+    /// iteration); per-arm payload child indices resolve to
+    /// `elem_cell_base + child_pos_in_elem` at the dispatch site.
+    PrestagedVariant,
 }
 
 impl Cell {
@@ -304,6 +310,7 @@ impl Cell {
             Cell::Handle { .. } => Some(ListElementClass::PrestagedHandle),
             Cell::Flags { .. } => Some(ListElementClass::PrestagedFlags),
             Cell::RecordOf { .. } => Some(ListElementClass::PrestagedRecord),
+            Cell::Variant { .. } => Some(ListElementClass::PrestagedVariant),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -313,7 +320,7 @@ impl Cell {
             | Cell::Text { .. }
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
-            Cell::Variant { .. } | Cell::ListOf { .. } => None,
+            Cell::ListOf { .. } => None,
         }
     }
 
@@ -453,6 +460,16 @@ impl LiftPlan {
                 .cells
                 .iter()
                 .any(|c| matches!(c, Cell::RecordOf { .. }))
+        })
+    }
+
+    /// Companion to [`has_list_elem_handle`] for `Cell::Variant`.
+    pub(crate) fn has_list_elem_variant(&self) -> bool {
+        self.list_specs().any(|spec| {
+            spec.element_plan
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Variant { .. }))
         })
     }
 
@@ -1030,10 +1047,10 @@ impl LiftPlanBuilder {
                 "`list<T>` element type {elem:?} contains a cell shape that \
                  isn't yet supported as a list element (allowed today: bool, \
                  integers, floats, string, list<u8>, enum, char, option, \
-                 result, tuple, flags, record, own/borrow/stream/future/error-context \
-                 handles — with allowed inner cells throughout). Still \
-                 gated: variant, nested list. File a request at \
-                 {ISSUES_URL} to bump priority."
+                 result, tuple, flags, record, variant, \
+                 own/borrow/stream/future/error-context handles — with \
+                 allowed inner cells throughout). Still gated: nested list. \
+                 File a request at {ISSUES_URL} to bump priority."
             ));
         }
         let arm_guards = self.arm_guard_stack.clone();

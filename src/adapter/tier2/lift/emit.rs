@@ -184,6 +184,19 @@ pub(crate) struct WrapperLocals {
     /// `Some` iff [`fn_has_variant_cells`]. Same stage-then-consume
     /// invariant as [`Self::handle_info_base`].
     pub variant_info_base: Option<u32>,
+    /// Companion to [`Self::next_handle_idx`] for variant-info entries.
+    /// `Some` iff [`fn_has_list_elem_variant`].
+    pub next_variant_idx: Option<u32>,
+    /// Per-iteration `variant_slot_base + j * variants_per_elem` —
+    /// staged once per iter by the list-of-arm; `Some` iff
+    /// [`fn_has_list_elem_variant`].
+    pub list_elem_variant_base: Option<u32>,
+    /// Scratch for the runtime entry-address (list-element variants
+    /// only; static slots fold the offset into a memarg).
+    pub variant_slot_addr: Option<u32>,
+    /// Scratch for the runtime cell-payload entry idx
+    /// (`list_elem_variant_base + entry_offset_in_elem`).
+    pub variant_payload_idx: Option<u32>,
     /// Base address of the active plan's flags-info buffer.
     /// `Some` iff [`fn_has_flags_cells`]. Same stage-then-consume
     /// invariant as [`Self::handle_info_base`].
@@ -484,6 +497,13 @@ pub(crate) struct ListEmitLocals {
     /// `Σ fields.len() * tuple_size` over all `Cell::RecordOf` cells
     /// in `element_plan` — variable per cell.
     pub record_tuples_bytes_per_elem: u32,
+    /// Starting slot in the variant-info buffer for this list's
+    /// elements; captured before the pre-pass bumps the running
+    /// total. `Some` iff `variants_per_elem > 0`.
+    pub variant_slot_base: Option<u32>,
+    /// `Cell::Variant` count in `element_plan`. Drives the per-list
+    /// bump (`len * variants_per_elem`) + the per-iteration stage.
+    pub variants_per_elem: u32,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -551,6 +571,8 @@ fn build_one_list_emit_locals(
     let record_tuples_buf_base =
         (counts.record_tuples_bytes > 0).then(|| builder.alloc_local(ValType::I32));
     let record_tuples_bytes_per_elem = counts.record_tuples_bytes;
+    let variant_slot_base = (counts.variants > 0).then(|| builder.alloc_local(ValType::I32));
+    let variants_per_elem = counts.variants;
     let elem_cell_base = builder.alloc_local(ValType::I32);
     ListEmitLocals {
         start_i,
@@ -577,6 +599,8 @@ fn build_one_list_emit_locals(
         records_per_elem,
         record_tuples_buf_base,
         record_tuples_bytes_per_elem,
+        variant_slot_base,
+        variants_per_elem,
     }
 }
 
@@ -620,6 +644,10 @@ fn fn_has_list_elem_flags(fd: &FuncDispatch) -> bool {
 
 fn fn_has_list_elem_record(fd: &FuncDispatch) -> bool {
     fn_has_list_elem_class(fd, ListElementClass::PrestagedRecord)
+}
+
+fn fn_has_list_elem_variant(fd: &FuncDispatch) -> bool {
+    fn_has_list_elem_class(fd, ListElementClass::PrestagedVariant)
 }
 
 /// Any `Cell::Char` in the wrapper (params or result, including
@@ -672,12 +700,11 @@ fn fn_has_record_cells(fd: &FuncDispatch) -> bool {
             .is_some_and(|rl| rl.record_count > 0)
 }
 
-/// Any `Cell::Variant` in the wrapper. Gates
-/// `WrapperLocals.variant_info_base`. List-element variant support
-/// (commit-2) will fold in here when `Cell::Variant` opens in
-/// `list_element_class`.
+/// Any `Cell::Variant` in the wrapper (params or result, including
+/// list-element plans). Gates `WrapperLocals.variant_info_base`.
 fn fn_has_variant_cells(fd: &FuncDispatch) -> bool {
-    fd.params.iter().any(|p| p.variant_count > 0)
+    fn_has_list_elem_variant(fd)
+        || fd.params.iter().any(|p| p.variant_count > 0)
         || fd
             .result_lift
             .as_ref()
@@ -717,6 +744,10 @@ pub(super) struct ElementCounts {
     /// `record_tuples_buf_base + j * record_tuples_bytes
     /// + tuples_offset_in_elem`.
     pub record_tuples_bytes: u32,
+    /// `Cell::Variant` count in `element_plan` — uniform-stride
+    /// entry slots at `variant_slot_base + j * variants +
+    /// entry_offset_in_elem`.
+    pub variants: u32,
 }
 
 /// Single walk over `element_plan.cells` producing both the
@@ -826,6 +857,30 @@ pub(super) fn walk_element_plan(
                         },
                     ))
                 }
+                ListElementClass::PrestagedVariant => {
+                    let Cell::Variant {
+                        type_name,
+                        case_names,
+                        per_case_payload,
+                        ..
+                    } = cell
+                    else {
+                        unreachable!("PrestagedVariant class on non-Variant {cell:?}")
+                    };
+                    let entry_offset_in_elem = counts.variants;
+                    counts.variants += 1;
+                    CellSideData::Variant(Box::new(
+                        super::sidetable::variant_info::VariantRuntimeFill {
+                            slot_source:
+                                super::sidetable::variant_info::VariantSlotSource::PerIteration {
+                                    entry_offset_in_elem,
+                                },
+                            type_name: *type_name,
+                            case_names: case_names.clone(),
+                            per_case_payload: per_case_payload.clone(),
+                        },
+                    ))
+                }
             }
         })
         .collect();
@@ -884,6 +939,11 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let record_payload_idx = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
     let record_tuples_slice_addr =
         needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let needs_list_variant_locals = fn_has_list_elem_variant(fd);
+    let list_elem_variant_base =
+        needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
+    let variant_slot_addr = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
+    let variant_payload_idx = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -1023,6 +1083,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let next_handle_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
     let next_flags_idx = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
     let next_record_idx = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let next_variant_idx = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
 
     let frozen = builder.freeze();
     (
@@ -1053,6 +1114,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             record_slot_addr,
             record_payload_idx,
             record_tuples_slice_addr,
+            list_elem_variant_base,
+            variant_slot_addr,
+            variant_payload_idx,
             result,
             tr_addr,
             id_local,
@@ -1065,6 +1129,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             flags_info_base,
             record_info_base,
             variant_info_base,
+            next_variant_idx,
             next_handle_idx,
             next_flags_idx,
             next_record_idx,
@@ -1277,6 +1342,7 @@ pub(crate) fn emit_list_pre_pass(
     static_handle_count: u32,
     static_flags_count: u32,
     static_record_count: u32,
+    static_variant_count: u32,
     list_locals: &[ListEmitLocals],
     local_base: u32,
     lcl: &WrapperLocals,
@@ -1299,6 +1365,10 @@ pub(crate) fn emit_list_pre_pass(
     if let Some(next_record_idx) = lcl.next_record_idx {
         f.instructions().i32_const(static_record_count as i32);
         f.instructions().local_set(next_record_idx);
+    }
+    if let Some(next_variant_idx) = lcl.next_variant_idx {
+        f.instructions().i32_const(static_variant_count as i32);
+        f.instructions().local_set(next_variant_idx);
     }
     for spec in plan.list_specs() {
         let ll = &list_locals[spec.list_idx as usize];
@@ -1368,6 +1438,20 @@ pub(crate) fn emit_list_pre_pass(
             }
             f.instructions().i32_add();
             f.instructions().local_set(next_record_idx);
+        }
+        if let (Some(next_variant_idx), Some(variant_slot_base)) =
+            (lcl.next_variant_idx, ll.variant_slot_base)
+        {
+            f.instructions().local_get(next_variant_idx);
+            f.instructions().local_set(variant_slot_base);
+            f.instructions().local_get(next_variant_idx);
+            f.instructions().local_get(ll.len);
+            if ll.variants_per_elem != 1 {
+                f.instructions().i32_const(ll.variants_per_elem as i32);
+                f.instructions().i32_mul();
+            }
+            f.instructions().i32_add();
+            f.instructions().local_set(next_variant_idx);
         }
         emit_close_arm_guards(f, spec.arm_guards.len());
     }
@@ -1587,13 +1671,9 @@ fn emit_single_slot_cell(
             let CellSideData::Variant(fill) = side_data else {
                 panic!("Variant cell paired with non-Variant side data {side_data:?}");
             };
-            emit_variant_runtime_fill(f, source, fill, lcl, ctx.variant_info);
-            // Migration commit: every variant cell is `Static`. When
-            // PerIteration lands this `let` becomes refutable and
-            // rustc forces the per-iter wiring before recompiling.
-            let super::sidetable::variant_info::VariantSlotSource::Static { entry_idx } =
-                fill.slot_source;
-            cell_layout.emit_variant_case(f, addr, entry_idx);
+            emit_variant_runtime_fill(f, source, fill, elem_cell_base, lcl, ctx.variant_info);
+            let payload = stage_variant_cell_payload(f, lcl, fill);
+            cell_layout.emit_variant_case(f, addr, payload);
         }
         // Multi-slot + side-table-only + list — caller's responsibility.
         Cell::Text { .. }
@@ -1810,6 +1890,22 @@ fn emit_list_of_arm(
         f.instructions()
             .i32_const(ll.record_tuples_bytes_per_elem as i32);
         f.instructions().i32_mul();
+        f.instructions().i32_add();
+        f.instructions().local_set(dest);
+    }
+
+    // list_elem_variant_base = variant_slot_base + j * variants_per_elem
+    if let Some(slot_base) = ll.variant_slot_base {
+        let dest = lcl.list_elem_variant_base.expect(
+            "list_elem_variant_base unset — fn_has_list_elem_variant gate \
+             disagrees with ListEmitLocals.variant_slot_base",
+        );
+        f.instructions().local_get(slot_base);
+        f.instructions().local_get(ll.j);
+        if ll.variants_per_elem != 1 {
+            f.instructions().i32_const(ll.variants_per_elem as i32);
+            f.instructions().i32_mul();
+        }
         f.instructions().i32_add();
         f.instructions().local_set(dest);
     }
@@ -2170,6 +2266,12 @@ fn emit_record_runtime_fill(
     info: RecordInfoOffsets,
 ) {
     use super::sidetable::record_info::RecordSlotSource;
+    // PerIteration ↔ Some couple — see emit_variant_runtime_fill.
+    debug_assert_eq!(
+        matches!(fill.slot_source, RecordSlotSource::PerIteration { .. }),
+        elem_cell_base.is_some(),
+        "slot_source / elem_cell_base must agree (PerIteration ↔ Some)",
+    );
     let base_local = lcl.record_info_base.expect(
         "record_info_base local unset on a wrapper containing Cell::RecordOf — \
          fn_has_record_cells gate must agree with the cells reaching \
@@ -2562,9 +2664,10 @@ fn emit_flags_runtime_fill(
 /// Fill one `Cell::Variant`'s slot in the per-call variant-info
 /// buffer: write `type-name` (build-time-const) and the
 /// disc-dispatched `case-name` + `payload` (option<u32>) at runtime.
-/// Static cells fold the entry offset into memargs; per-iteration
-/// cells (commit-2) will stage `slot_addr = base + iter_base *
-/// entry_size` once and reuse for the per-arm stores.
+/// Static cells fold offsets into memargs; per-iteration cells stage
+/// `slot_addr = base + (iter_base + offset_in_elem) * entry_size`
+/// once and reuse for every store. List-element payload child idxs
+/// resolve to `elem_cell_base + child_pos_in_elem` at runtime.
 ///
 /// N-way disc dispatch is encoded as nested if/else. For typical
 /// variants (≤ 8 cases) the nested depth is manageable; `br_table`
@@ -2574,21 +2677,26 @@ fn emit_variant_runtime_fill(
     f: &mut Function,
     disc_local: u32,
     fill: &VariantRuntimeFill,
+    elem_cell_base: Option<u32>,
     lcl: &WrapperLocals,
     info: VariantInfoOffsets,
 ) {
     use super::sidetable::variant_info::VariantSlotSource;
+    // PerIteration ↔ Some couple: walk_element_plan only assigns
+    // PerIteration to list-element cells, and emit_cell_op only
+    // threads `Some(elem_cell_base)` inside list bodies. A drift
+    // would silently produce wrong wasm (Static + Some would write
+    // child_idx as a const ignoring `elem_cell_base`).
+    debug_assert_eq!(
+        matches!(fill.slot_source, VariantSlotSource::PerIteration { .. }),
+        elem_cell_base.is_some(),
+        "slot_source / elem_cell_base must agree (PerIteration ↔ Some)",
+    );
     let base_local = lcl.variant_info_base.expect(
         "variant_info_base local unset on a wrapper containing Cell::Variant — \
          fn_has_variant_cells gate must agree with the cells reaching \
          emit_variant_runtime_fill",
     );
-    // Migration commit: only `Static` slots are constructed. When
-    // PerIteration lands this let becomes refutable, forcing the
-    // per-iter slot-addr stage to be wired before recompiling.
-    let VariantSlotSource::Static { entry_idx } = fill.slot_source;
-    let entry_off = entry_idx * info.entry_size;
-
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
@@ -2600,13 +2708,43 @@ fn emit_variant_runtime_fill(
         memory_index: 0,
     };
 
+    // Stage the entry-slot address: Static folds the offset into
+    // memargs (slot_local = base, all field offsets baked); list-
+    // element stages slot_addr once and uses zero memarg offsets.
+    let (slot_local, slot_off) = match fill.slot_source {
+        VariantSlotSource::Static { entry_idx } => (base_local, entry_idx * info.entry_size),
+        VariantSlotSource::PerIteration {
+            entry_offset_in_elem,
+        } => {
+            let iter_base = lcl.list_elem_variant_base.expect(
+                "list_elem_variant_base unset — fn_has_list_elem_variant gate disagrees",
+            );
+            let dest = lcl.variant_slot_addr.expect(
+                "variant_slot_addr unset — fn_has_list_elem_variant gate disagrees \
+                 with the cells reaching emit_variant_runtime_fill",
+            );
+            // slot_addr = base + (iter_base + entry_offset_in_elem) * entry_size
+            f.instructions().local_get(iter_base);
+            if entry_offset_in_elem != 0 {
+                f.instructions().i32_const(entry_offset_in_elem as i32);
+                f.instructions().i32_add();
+            }
+            f.instructions().i32_const(info.entry_size as i32);
+            f.instructions().i32_mul();
+            f.instructions().local_get(base_local);
+            f.instructions().i32_add();
+            f.instructions().local_set(dest);
+            (dest, 0u32)
+        }
+    };
+
     // Write type-name (build-time-const).
+    let type_name_off = slot_off + info.type_name_off;
     let store_const = |f: &mut Function, off: u32, value: i32| {
-        f.instructions().local_get(base_local);
+        f.instructions().local_get(slot_local);
         f.instructions().i32_const(value);
         f.instructions().i32_store(store_i32(off));
     };
-    let type_name_off = entry_off + info.type_name_off;
     store_const(
         f,
         type_name_off + SLICE_PTR_OFFSET,
@@ -2618,17 +2756,15 @@ fn emit_variant_runtime_fill(
         fill.type_name.len as i32,
     );
 
-    let case_name_off = entry_off + info.case_name_off;
-    let payload_off = entry_off + info.payload_off;
+    let case_name_off = slot_off + info.case_name_off;
+    let payload_off = slot_off + info.payload_off;
     let payload_value_off = payload_off + info.payload_value_off;
 
     debug_assert_eq!(fill.case_names.len(), fill.per_case_payload.len());
 
     // Nested if/else: for each case `i`, `if disc == i { write case
     // i's data }` else recurse. The last arm has no else (canonical-
-    // ABI disc out of range is unreachable; wasm validators don't
-    // require unreachable for completeness since the ABI guarantees
-    // disc < N).
+    // ABI disc out of range is unreachable).
     for (i, name) in fill.case_names.iter().enumerate() {
         let is_last = i + 1 == fill.case_names.len();
         if !is_last {
@@ -2640,18 +2776,31 @@ fn emit_variant_runtime_fill(
         // case-name = case_names[i]
         store_const(f, case_name_off + SLICE_PTR_OFFSET, name.off as i32);
         store_const(f, case_name_off + SLICE_LEN_OFFSET, name.len as i32);
-        // payload = some(child_idx) or none
+        // payload = some(child_idx) or none. `child_idx` is plan-
+        // relative; static cells write it as a const, list-element
+        // cells resolve it to `elem_cell_base + child_pos` at runtime.
         match fill.per_case_payload[i] {
             Some(child_idx) => {
-                f.instructions().local_get(base_local);
+                f.instructions().local_get(slot_local);
                 f.instructions().i32_const(OPTION_SOME as i32);
                 f.instructions().i32_store8(store_i8(payload_off));
-                f.instructions().local_get(base_local);
-                f.instructions().i32_const(child_idx as i32);
+                f.instructions().local_get(slot_local);
+                match elem_cell_base {
+                    None => {
+                        f.instructions().i32_const(child_idx as i32);
+                    }
+                    Some(base) => {
+                        f.instructions().local_get(base);
+                        if child_idx != 0 {
+                            f.instructions().i32_const(child_idx as i32);
+                            f.instructions().i32_add();
+                        }
+                    }
+                }
                 f.instructions().i32_store(store_i32(payload_value_off));
             }
             None => {
-                f.instructions().local_get(base_local);
+                f.instructions().local_get(slot_local);
                 f.instructions().i32_const(OPTION_NONE as i32);
                 f.instructions().i32_store8(store_i8(payload_off));
                 // value slot left untouched (irrelevant when disc=0)
@@ -2664,6 +2813,37 @@ fn emit_variant_runtime_fill(
     // Close all the nested `if`s — N-1 ends.
     for _ in 0..fill.case_names.len().saturating_sub(1) {
         f.instructions().end();
+    }
+}
+
+/// Resolve a `Cell::Variant`'s `cell::variant-case(idx)` payload.
+/// Same shape as [`stage_record_cell_payload`].
+fn stage_variant_cell_payload(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    fill: &VariantRuntimeFill,
+) -> PayloadSource {
+    use super::sidetable::variant_info::VariantSlotSource;
+    match fill.slot_source {
+        VariantSlotSource::Static { entry_idx } => PayloadSource::ConstI32(entry_idx as i32),
+        VariantSlotSource::PerIteration {
+            entry_offset_in_elem,
+        } => {
+            let iter_base = lcl
+                .list_elem_variant_base
+                .expect("list_elem_variant_base unset — fn_has_list_elem_variant gate disagrees");
+            if entry_offset_in_elem == 0 {
+                return PayloadSource::Local(iter_base);
+            }
+            let dest = lcl
+                .variant_payload_idx
+                .expect("variant_payload_idx unset — fn_has_list_elem_variant gate disagrees");
+            f.instructions().local_get(iter_base);
+            f.instructions().i32_const(entry_offset_in_elem as i32);
+            f.instructions().i32_add();
+            f.instructions().local_set(dest);
+            PayloadSource::Local(dest)
+        }
     }
 }
 
