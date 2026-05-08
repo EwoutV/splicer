@@ -1005,7 +1005,12 @@ fn emit_single_slot_cell(
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
             emit_handle_runtime_fill(f, source, fill);
-            cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), fill.side_table_idx);
+            cell_layout.emit_handle_cell(
+                f,
+                addr,
+                kind.cell_disc_case(),
+                PayloadSource::ConstI32(fill.side_table_idx as i32),
+            );
         }
         Cell::Option { child_idx, .. } => {
             // Stage inside the `some` arm — none-iterations skip it

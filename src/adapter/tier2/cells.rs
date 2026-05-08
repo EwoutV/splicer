@@ -575,24 +575,26 @@ impl CellLayout {
         );
     }
 
-    /// `cell::{resource,stream,future}-handle(u32)` — build-time-known
-    /// index into `field-tree.handle-infos`. `disc_case` is the WIT
-    /// case-name picking which cell-disc to emit; the runtime-filled
-    /// `id` field on the pointed-at entry is written alongside this
-    /// by the wrapper.
+    /// `cell::{resource,stream,future,error-context}-handle(u32)` —
+    /// index into `field-tree.handle-infos`. `disc_case` picks which
+    /// cell-disc to emit. `side_table_idx_source` is `ConstI32` for
+    /// static cells (build-time-known idx) and `Local` for
+    /// list-element cells (per-iteration runtime idx). The pointed-at
+    /// entry's `id` (and possibly `type-name`) is filled alongside
+    /// this by the wrapper.
     pub(crate) fn emit_handle_cell(
         &self,
         f: &mut Function,
         addr_local: u32,
         disc_case: &str,
-        side_table_idx: u32,
+        side_table_idx_source: PayloadSource,
     ) {
         self.emit_cell(
             f,
             addr_local,
             self.disc_of(disc_case),
             &[PayloadPart {
-                source: PayloadSource::ConstI32(side_table_idx as i32),
+                source: side_table_idx_source,
                 kind: StoreKind::I32,
                 offset: 0,
             }],
@@ -986,10 +988,9 @@ mod tests {
 
     #[test]
     fn handle_cells_emit_valid_wasm() {
-        // params: (addr_local: i32). side_table_idx is an i32.const.
-        // All three handle disc-cases (resource / stream / future)
-        // share the same body — exercise each so a disc-name typo
-        // surfaces here.
+        // Static path: side_table_idx is an i32.const. All four
+        // handle disc-cases share the same body — exercise each so
+        // a disc-name typo surfaces here.
         let cl = synth_cell_layout();
         for disc_case in [
             "resource-handle",
@@ -997,8 +998,19 @@ mod tests {
             "future-handle",
             "error-context-handle",
         ] {
-            build_and_validate(&[ValType::I32], |f| cl.emit_handle_cell(f, 0, disc_case, 9));
+            build_and_validate(&[ValType::I32], |f| {
+                cl.emit_handle_cell(f, 0, disc_case, PayloadSource::ConstI32(9))
+            });
         }
+    }
+
+    #[test]
+    fn handle_cell_with_local_idx_emits_valid_wasm() {
+        // List-element path: caller stages runtime idx into a local.
+        let cl = synth_cell_layout();
+        build_and_validate(&[ValType::I32, ValType::I32], |f| {
+            cl.emit_handle_cell(f, 0, "resource-handle", PayloadSource::Local(1))
+        });
     }
 
     /// Structural fuzz over the primitive cell-emit helpers — for each
