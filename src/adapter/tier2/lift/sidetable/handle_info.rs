@@ -17,18 +17,26 @@ use super::super::classify::ResultSource;
 use super::super::plan::{Cell, LiftPlan};
 use super::PerCellIndices;
 
-/// Per-(plan-cell) emit-phase data for one `Cell::Handle`. Both
-/// fields are build-time-known; the runtime work is just writing
-/// `type-name` + `id` into the per-call buffer at offset
-/// `side_table_idx * sizeof(handle_info)`.
+/// Where a `Cell::Handle`'s slot lives in the per-(fn, param | result)
+/// handle-info buffer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum HandleSlotSource {
+    /// Build-time absolute index — outer-plan handles.
+    Static(u32),
+    /// List-element handle: idx = `list_elem_handle_base +
+    /// offset_in_elem` at runtime (the iter-base local is
+    /// `handle_slot_base + j * handles_per_elem`, staged by the
+    /// list-of-arm).
+    PerIteration { offset_in_elem: u32 },
+}
+
+/// Per-cell emit-phase data for one `Cell::Handle`: where in the
+/// handle-info buffer it lives, plus its build-time `type-name`
+/// blob slice. Cell payload is `cell::*-handle(idx)` with the same
+/// idx as `slot_source`.
 #[derive(Clone, Debug)]
 pub(crate) struct HandleRuntimeFill {
-    /// Range-relative position within this (fn, param | result)'s
-    /// handle-info buffer. The wrapper writes
-    /// `cell::*-handle(side_table_idx)` as the cell payload.
-    pub side_table_idx: u32,
-    /// `(off, len)` into the shared name blob. Build-time-const per
-    /// cell; the wrapper writes it into the per-call buffer slot.
+    pub slot_source: HandleSlotSource,
     pub type_name: BlobSlice,
 }
 
@@ -85,7 +93,7 @@ pub(crate) fn build_handle_info_maps(per_func: &[FuncClassified]) -> HandleInfoM
                         Vec::new(),
                         1,
                         Some(HandleRuntimeFill {
-                            side_table_idx: 0,
+                            slot_source: HandleSlotSource::Static(0),
                             type_name: *type_name,
                         }),
                     ),
@@ -109,8 +117,11 @@ pub(crate) fn build_handle_info_maps(per_func: &[FuncClassified]) -> HandleInfoM
     }
 }
 
-/// Walk one plan, allocating range-relative `side_table_idx` per
-/// `Cell::Handle` and pulling `type_name` off the cell.
+/// Walk one plan's outer cells, allocating range-relative
+/// `Static(side_table_idx)` per `Cell::Handle` and pulling
+/// `type_name` off the cell. List-element handles use `PerIteration`
+/// (assigned by [`super::super::emit::walk_element_plan`]) and don't
+/// participate in this static count.
 fn scan_plan(plan: &LiftPlan) -> (Vec<Option<HandleRuntimeFill>>, u32) {
     let mut fill_map: Vec<Option<HandleRuntimeFill>> =
         (0..plan.cells.len()).map(|_| None).collect();
@@ -118,7 +129,7 @@ fn scan_plan(plan: &LiftPlan) -> (Vec<Option<HandleRuntimeFill>>, u32) {
     for (cell_pos, cell) in plan.cells.iter().enumerate() {
         if let Cell::Handle { type_name, .. } = cell {
             fill_map[cell_pos] = Some(HandleRuntimeFill {
-                side_table_idx: count,
+                slot_source: HandleSlotSource::Static(count),
                 type_name: *type_name,
             });
             count += 1;

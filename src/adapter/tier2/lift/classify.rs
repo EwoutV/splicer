@@ -127,11 +127,12 @@ pub(crate) struct ParamLayout {
     /// holding the side-table bookkeeping the emit phase needs (idx,
     /// blob slice, runtime-fill, …) for cells whose kind has any.
     pub cell_side: Vec<CellSideData>,
-    /// `Cell::Handle` count in `lift.plan.cells`. Drives both the
-    /// static `field_tree.handle_infos.len` (baked at layout time) and
-    /// the wrapper-body's per-call `cabi_realloc` size for the same
-    /// buffer — single source of truth, sourced from
-    /// [`super::sidetable::handle_info::HandleInfoMaps::per_param_count`].
+    /// `Cell::Handle` count among the plan's outer cells (excludes
+    /// list-element handles, which fold in at runtime). Authoritative
+    /// for the static `field_tree.handle_infos.len` bake and the
+    /// static-count `cabi_realloc`; on plans with list-element
+    /// handles the static `len` is patched at runtime, and this is
+    /// the seed for the per-list bump in `emit_list_pre_pass`.
     pub handle_count: u32,
 }
 
@@ -143,12 +144,9 @@ pub(crate) struct ParamLayout {
 /// pre-layout `side_table` directly).
 pub(crate) struct ResultLayout {
     pub source: ResultSourceLayout,
-    /// `Cell::Handle` count in the result's plan: 1 for `Direct`
-    /// when the cell is a `Handle`, else the number of `Cell::Handle`
-    /// in `Compound::compound.plan.cells`. Drives the static
-    /// `field_tree.handle_infos.len` + the wrapper-body's per-call
-    /// `cabi_realloc` size — single source of truth, sourced from
-    /// [`super::sidetable::handle_info::HandleInfoMaps::per_result_count`].
+    /// Result-side counterpart of [`ParamLayout::handle_count`]:
+    /// 1 for a `Direct(Handle)` result, else the number of outer
+    /// `Cell::Handle` in `Compound::compound.plan.cells`.
     pub handle_count: u32,
 }
 

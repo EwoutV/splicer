@@ -278,7 +278,7 @@ payload is sourced from a wasm local or an `i32.const`:
 | `record-of` | allocated by the side-table builder — one entry per *plan cell* of kind `RecordOf` | `ConstI32(idx)` |
 | `flags-set` | allocated by the side-table builder — one entry per `Cell::Flags` cell; entries hold a per-call `set-flags` name list filled inline by the bit-walker | `ConstI32(idx)` |
 | `variant-case` | allocated by the side-table builder — one entry per `Cell::Variant` cell; entries hold runtime-filled `case-name` + `payload` | `ConstI32(idx)` |
-| `*-handle` (own/borrow/stream/future/error-context) | range-relative position inside the per-(fn, param \| result) `handle-info` buffer | `ConstI32(idx)` |
+| `*-handle` (own/borrow/stream/future/error-context) | range-relative position inside the per-(fn, param \| result) `handle-info` buffer; static for non-list-element handles, runtime-staged for `list<handle>` elements | `ConstI32(idx)` for static / `Local(list_elem_handle_base [+ offset_in_elem])` for list elements |
 
 `cells.rs::PayloadSource::{Local, ConstI32}` discriminates these at
 the byte-emission level — the lift-codegen layer chooses the source
@@ -299,17 +299,28 @@ kind:
 - **Per-call buffer, fully runtime-written.** `handle-info` entries
   live in a `cabi_realloc`'d slab the wrapper body allocates per call
   and writes both `type-name` (build-time-const) and `id` (runtime-
-  zero-extended) into. The `field-tree`'s `handle-infos.len` is baked
-  statically (count is known at build time per (fn, param | result));
-  `handle-infos.ptr` is patched per call.
+  zero-extended) into. Two sub-regimes per (fn, param | result):
+  - *Static-count*: no list-of-handle in this plan. Buffer size is
+    `static_count * sizeof(handle-info)`; the field-tree's
+    `handle-infos.len` is baked statically; only `.ptr` is patched.
+  - *Runtime-count*: at least one list element is `Cell::Handle`.
+    The pre-pass accumulates
+    `static_count + Σ_lists len * handles_per_elem` into
+    `lcl.next_handle_idx`; both `.ptr` and `.len` are patched per
+    call. Per-list `handle_slot_base` carves out the slice each
+    iteration writes into; per-iteration `list_elem_handle_base =
+    handle_slot_base + j * handles_per_elem` resolves the absolute
+    slot index for each element-plan handle cell.
 
 **Rule.** A side-table kind moves to the per-call policy as soon as
 *any* element-plan can introduce a list-of-that-kind: the entry count
 becomes len-dependent and a static segment can't size it. Today only
-`handle-info` is per-call (prep for `list<own<R>>` / `list<error-
-context>` etc.). When `list<flags>` lands the flags-info entries
-follow the same migration; same for any future list-of-side-tabled
-kind.
+`handle-info` supports the runtime-count sub-regime — `list<own<R>>`,
+`list<borrow<R>>`, `list<stream<T>>`, `list<future<T>>`, and
+`list<error-context>` all share the same codegen (only the
+`cell::*-handle` disc differs). When `list<flags>` lands the
+flags-info entries follow the same migration; same for any future
+list-of-side-tabled kind.
 
 Per-call storage costs ~7 wasm instructions and one extra
 `cabi_realloc` per (fn, param | result) with that kind, even when the

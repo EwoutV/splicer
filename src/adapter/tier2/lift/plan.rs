@@ -252,6 +252,11 @@ pub(crate) enum ListElementClass {
     /// `[elem_cell_base + child_pos[i]]` into a slot of a
     /// `cabi_realloc`'d tuple-indices buffer.
     PrestagedTupleIndices,
+    /// `Cell::Handle` (own/borrow/stream/future/error-context). Folds
+    /// to `CellSideData::Handle` with `HandleSlotSource::PerIteration`;
+    /// the per-(fn, param | result) handle-info buffer is grown at
+    /// runtime to fit `static_count + Σ_lists len * handles_per_elem`.
+    PrestagedHandle,
 }
 
 impl Cell {
@@ -265,6 +270,7 @@ impl Cell {
             Cell::Char { .. } => Some(ListElementClass::PrestagedChar),
             Cell::Option { .. } | Cell::Result { .. } => Some(ListElementClass::PrestagedChildIdx),
             Cell::TupleOf { .. } => Some(ListElementClass::PrestagedTupleIndices),
+            Cell::Handle { .. } => Some(ListElementClass::PrestagedHandle),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -275,7 +281,6 @@ impl Cell {
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
             Cell::Flags { .. }
-            | Cell::Handle { .. }
             | Cell::RecordOf { .. }
             | Cell::Variant { .. }
             | Cell::ListOf { .. } => None,
@@ -385,6 +390,20 @@ impl LiftPlan {
         self.walk_cells_recursive()
             .iter()
             .any(|c| matches!(c, Cell::Char { .. }))
+    }
+
+    /// True iff any list in `self` has a `Cell::Handle` directly in
+    /// its element plan. Drives the per-plan runtime-sized
+    /// handle-info-buffer choice in
+    /// [`super::super::wrapper_body::emit_alloc_handle_info_for_plan`]
+    /// — when false, the (smaller) static-count path is used.
+    pub(crate) fn has_list_elem_handle(&self) -> bool {
+        self.list_specs().any(|spec| {
+            spec.element_plan
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::Handle { .. }))
+        })
     }
 
     /// Iterator over every `Cell::EnumCase` in the plan tree
@@ -981,7 +1000,9 @@ impl LiftPlanBuilder {
                 "`list<T>` element type {elem:?} contains a cell shape that \
                  isn't yet supported as a list element (allowed today: bool, \
                  integers, floats, string, list<u8>, enum, char, option, \
-                 result with allowed inner cells). File a request at {ISSUES_URL} \
+                 result, tuple, own/borrow/stream/future/error-context handles \
+                 — with allowed inner cells throughout). Still gated: flags, \
+                 record, variant, nested list. File a request at {ISSUES_URL} \
                  to bump priority."
             ));
         }

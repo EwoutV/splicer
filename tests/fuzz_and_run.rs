@@ -532,7 +532,15 @@ impl Shape {
                 // `T` owned (e.g. `&[String]`, not `&[&str]`) regardless
                 // of outer mode. Force the element to Async-mode so a
                 // `string` element renders as `String::from(...)`.
-                format!("vec![{}]", inner.rust_literal(side, AsyncMode::Async))
+                // Exception: resource constructors stay tied to the
+                // outer mode — a `.await` in a sync `run()` is a
+                // compile error, and `&[Cat]` is the right shape for
+                // `list<own<R>>` regardless.
+                let elem_mode = match inner.as_ref() {
+                    Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. } => mode,
+                    _ => AsyncMode::Async,
+                };
+                format!("vec![{}]", inner.rust_literal(side, elem_mode))
             }
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -665,6 +673,15 @@ impl Shape {
         // so `is_copy_in` would otherwise force a borrow.
         if matches!(self, Shape::ResourceOwn { .. }) {
             return v_ident.to_string();
+        }
+        // `list<own<R>>` — wit-bindgen takes `Vec<R>` by value (the
+        // ownership transfer is in the elements; you can't borrow a
+        // slice of resources because each handle has to move into
+        // the call). Pass-by-value regardless of mode.
+        if let Shape::List(inner) = self {
+            if matches!(inner.as_ref(), Shape::ResourceOwn { .. }) {
+                return v_ident.to_string();
+            }
         }
         if matches!(mode, AsyncMode::Async) {
             return v_ident.to_string();
@@ -1715,6 +1732,17 @@ fn tier2_shapes() -> Vec<Shape> {
                 },
             ]),
         ]))),
+        // list<own<R>>: per-call handle-info buffer grown at runtime
+        // (size = len * sizeof(handle_info)); per-iteration
+        // `list_elem_handle_base` resolves the slot index. End-to-end
+        // smoke test for the `list<handle>` codegen — `list<borrow<R>>`,
+        // `list<stream<T>>`, `list<future<T>>`, `list<error-context>`
+        // all share the same emit path (only the cell-disc differs)
+        // and ride on the validator sweep.
+        Shape::List(Box::new(Shape::ResourceOwn {
+            wit_name: "cat",
+            rust_name: "Cat",
+        })),
     ]
 }
 
@@ -2973,11 +3001,11 @@ fn run_tier2_pipeline_for_shape(workspace: &Tier2Workspace, shape: &Shape) -> St
 /// `id`.
 fn predict_tier2_args_marker(shape: &Shape) -> Option<String> {
     let inner = predict_tier2_arg_inner(shape)?;
-    let open_ended = matches!(
-        shape,
-        Shape::ResourceOwn { .. } | Shape::ResourceBorrow { .. }
-    );
-    if open_ended {
+    // Inner ending in `,` is a permissive resource-handle anchor (the
+    // runtime appends ` id=N))…]` past it). Don't append the closing
+    // `]` — substring match needs to clear the comma without pinning
+    // the literal `,]` boundary.
+    if inner.ends_with(',') {
         Some(format!("args=[x: {inner}"))
     } else {
         Some(format!("args=[x: {inner}]"))
@@ -3088,9 +3116,16 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
         }
         // Single-element list — `Shape::List::rust_literal` produces
         // `vec![<one literal>]`, so the cell tree has one child cell.
+        // When the inner predictor ends with a permissive `,` anchor
+        // (resource-handle), drop the closing paren so the substring
+        // match doesn't pin the literal `,)` boundary.
         Shape::List(inner) => {
             let elem = predict_tier2_arg_inner(inner)?;
-            Some(format!("list({elem})"))
+            if elem.ends_with(',') {
+                Some(format!("list({elem}"))
+            } else {
+                Some(format!("list({elem})"))
+            }
         }
         Shape::Option { inner, is_some } => {
             if *is_some {

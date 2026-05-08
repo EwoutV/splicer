@@ -96,6 +96,14 @@ const TEST_WIT: &str = r#"
         f-list-tuple-u32-u32: func(xs: list<tuple<u32, u32>>);
         f-list-tuple-u32-string: func(xs: list<tuple<u32, string>>);
         f-list-tuple-of-tuple: func(xs: list<tuple<u32, tuple<s32, s32>>>);
+        f-list-handle-own: func(xs: list<own<my-res>>);
+        f-list-handle-borrow: func(xs: list<borrow<my-res>>);
+        f-list-error-context: func(xs: list<error-context>);
+        f-list-tuple-of-handles:
+            func(xs: list<tuple<own<my-res>, borrow<my-res>>>);
+        record handle-and-stuff { h: own<my-res>, x: u32 }
+        f-handles-mixed-with-list:
+            func(top: own<my-res>, xs: list<own<my-res>>);
         record list-char-pair { items: list<char>, scores: list<u32> }
         f-record-with-list-char: func(rcp: list-char-pair);
         f-result-list-u32: func() -> list<u32>;
@@ -453,8 +461,9 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 }
             }
             Cell::Handle { type_name, .. } => {
+                use super::sidetable::handle_info::HandleSlotSource;
                 let fill = HandleRuntimeFill {
-                    side_table_idx: handle_idx,
+                    slot_source: HandleSlotSource::Static(handle_idx),
                     type_name: *type_name,
                 };
                 handle_idx += 1;
@@ -516,6 +525,10 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let cells_base = builder.alloc_local(ValType::I32);
     let next_cell_idx = builder.alloc_local(ValType::I32);
     let handle_info_base = builder.alloc_local(ValType::I32);
+    let next_handle_idx = builder.alloc_local(ValType::I32);
+    let list_elem_handle_base = builder.alloc_local(ValType::I32);
+    let handle_slot_addr = builder.alloc_local(ValType::I32);
+    let handle_payload_idx = builder.alloc_local(ValType::I32);
     let list_locals = super::emit::alloc_list_emit_locals(plan, resolve, &sizes, &mut builder);
     let FrozenLocals { locals } = builder.freeze();
 
@@ -537,6 +550,10 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         cells_base,
         next_cell_idx,
         handle_info_base: Some(handle_info_base),
+        next_handle_idx: Some(next_handle_idx),
+        list_elem_handle_base: Some(list_elem_handle_base),
+        handle_slot_addr: Some(handle_slot_addr),
+        handle_payload_idx: Some(handle_payload_idx),
         result: None,
         tr_addr: None,
         id_local,
@@ -1125,14 +1142,18 @@ fn list_element_plan(plan: &LiftPlan, cell_idx: usize) -> &LiftPlan {
 fn walk_element_plan_counts_match_side_data_lockstep() {
     // Drift between counts (which size the per-list buffers) and
     // side-data offsets (which index into them) is the failure mode
-    // #5 flagged. Pin: counts.tuple_idx_slots == Σ(children.len())
-    // over PerIteration TupleOf cells, and offset_in_elem values
-    // are the cumulative byte prefix.
+    // #5 flagged. Pin: counts == Σ(per-cell offsets) for every kind
+    // that contributes both a count AND a build-time-relative
+    // offset_in_elem (TupleOf children, Handle slots).
+    use super::sidetable::handle_info::HandleSlotSource;
     let (r, mut names) = setup();
     for fn_name in [
         "f-list-tuple-u32-string",
         "f-list-tuple-of-tuple",
         "f-list-tuple-u32-u32",
+        "f-list-handle-own",
+        "f-list-tuple-of-handles",
+        "f-list-error-context",
     ] {
         let plan = plan_for_param(fn_name, &r, &mut names);
         let elem_plan = list_element_plan(&plan, 0);
@@ -1140,6 +1161,7 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         assert_eq!(side.len(), elem_plan.cells.len());
         let mut expected_chars = 0u32;
         let mut expected_tuple_slots = 0u32;
+        let mut expected_handles = 0u32;
         let mut running_tuple_off = 0u32;
         for (cell, sd) in elem_plan.cells.iter().zip(side.iter()) {
             match cell {
@@ -1161,6 +1183,23 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
                     running_tuple_off += children.len() as u32 * 4;
                     expected_tuple_slots += children.len() as u32;
                 }
+                Cell::Handle { .. } => {
+                    let CellSideData::Handle(fill) = sd else {
+                        panic!("expected Handle side data, got {sd:?}");
+                    };
+                    let HandleSlotSource::PerIteration { offset_in_elem } = fill.slot_source else {
+                        panic!(
+                            "list-element Handle must carry PerIteration slot source, \
+                             got {:?}",
+                            fill.slot_source,
+                        );
+                    };
+                    assert_eq!(
+                        offset_in_elem, expected_handles,
+                        "Handle offset_in_elem must be the cumulative count",
+                    );
+                    expected_handles += 1;
+                }
                 _ => assert!(matches!(sd, CellSideData::None)),
             }
         }
@@ -1171,6 +1210,10 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         assert_eq!(
             counts.tuple_idx_slots, expected_tuple_slots,
             "counts.tuple_idx_slots drift in {fn_name}",
+        );
+        assert_eq!(
+            counts.handles, expected_handles,
+            "counts.handles drift in {fn_name}",
         );
     }
 }
@@ -1189,6 +1232,7 @@ fn walk_element_plan_zero_counts_for_scalar_only() {
             counts.tuple_idx_slots, 0,
             "{fn_name} should have no tuple-idx slots",
         );
+        assert_eq!(counts.handles, 0, "{fn_name} should have no handle cells");
     }
 }
 
@@ -1409,12 +1453,24 @@ fn arm_guards_match_joined_arm_ancestry_for_every_list_fixture() {
         plan_for_param("f-list-result-u32-string", &r, &mut names),
         plan_for_param("f-list-tuple-u32-string", &r, &mut names),
         plan_for_param("f-list-tuple-of-tuple", &r, &mut names),
+        plan_for_param("f-list-handle-own", &r, &mut names),
+        plan_for_param("f-list-handle-borrow", &r, &mut names),
+        plan_for_param("f-list-error-context", &r, &mut names),
+        plan_for_param("f-list-tuple-of-handles", &r, &mut names),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
         plan_for_param("f-option-list", &r, &mut names),
         plan_for_param("f-result-list-list", &r, &mut names),
         plan_for_param("f-variant-list-arm", &r, &mut names),
         plan_for_param("f-result-of-variant-with-list", &r, &mut names),
+        // Mixed: `func(top: own<R>, xs: list<own<R>>)`. params[0] is
+        // a static handle (no list, no guards); params[1] is the
+        // list<own<R>> we actually want to pin.
+        plan_for(
+            &func_named(&r, "f-handles-mixed-with-list").params[1].ty,
+            &r,
+            &mut names,
+        ),
     ];
     for plan in &plans {
         assert_arm_guards_match_joined_ancestry(plan);
@@ -2121,6 +2177,26 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         // their per-iteration slots living adjacent in the per-call
         // tuple-idx buffer. Pins multi-tuple per-element offset math.
         plan_for_param("f-list-tuple-of-tuple", &r, &mut names),
+        // List-element handles: per-call handle-info buffer grown
+        // at runtime; per-iteration `list_elem_handle_base` stages
+        // the slot index. Covers all 5 handle kinds via the shared
+        // codegen — error-context routes through the same path.
+        plan_for_param("f-list-handle-own", &r, &mut names),
+        plan_for_param("f-list-handle-borrow", &r, &mut names),
+        plan_for_param("f-list-error-context", &r, &mut names),
+        // Multi-handle element: tuple<own, borrow> — exercises
+        // `handles_per_elem > 1` and `offset_in_elem` math in both
+        // `emit_handle_runtime_fill` and `stage_handle_cell_payload`.
+        plan_for_param("f-list-tuple-of-handles", &r, &mut names),
+        // `func(top: own<R>, xs: list<own<R>>)` params[1] — mixed
+        // wrapper with both a static handle (top) and a
+        // list-element handle (xs). Pins the
+        // `static_count → next_handle_idx` seed interaction.
+        plan_for(
+            &func_named(&r, "f-handles-mixed-with-list").params[1].ty,
+            &r,
+            &mut names,
+        ),
         plan_for_named("list-pair", &r, &mut names),
         plan_for_named("list-char-pair", &r, &mut names),
         // Lists nested in joined arms — guards on the bump pre-pass

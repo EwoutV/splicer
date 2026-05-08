@@ -122,6 +122,25 @@ pub(crate) struct WrapperLocals {
     /// Running cell-index counter driving the per-plan pre-pass;
     /// holds `total_cells` after the pass. Reused across plans.
     pub next_cell_idx: u32,
+    /// Per-iteration `handle_slot_base + j * handles_per_elem` —
+    /// staged once per list iteration; consumed by
+    /// [`emit_handle_runtime_fill`] and [`stage_handle_cell_payload`].
+    /// Stage-then-consume invariant, same shape as `tuple_slot_ptr`.
+    /// `Some` iff [`fn_has_list_elem_handle`].
+    pub list_elem_handle_base: Option<u32>,
+    /// Scratch for the runtime slot byte-address (list-element only;
+    /// static slots fold the offset into a memarg).
+    pub handle_slot_addr: Option<u32>,
+    /// Scratch for the runtime cell-payload idx (list-element with
+    /// `offset_in_elem != 0`; the zero-offset case reuses
+    /// `list_elem_handle_base` directly).
+    pub handle_payload_idx: Option<u32>,
+    /// Running handle-info entry count: pre-pass initializes to the
+    /// plan's static count, bumps by `len * handles_per_elem` per
+    /// list, ends at the runtime total. Sizes the `cabi_realloc` +
+    /// patches `handle_infos.len`. `Some` iff
+    /// [`fn_has_list_elem_handle`] (otherwise fully build-time).
+    pub next_handle_idx: Option<u32>,
     /// Base address of the active plan's handle-info buffer.
     /// `Some` iff [`fn_has_handle_cells`] holds; `None` for
     /// handle-free wrappers (saves the local).
@@ -292,6 +311,14 @@ pub(crate) struct ListEmitLocals {
     /// allocated — saves 1–2 instructions per cell per iteration vs
     /// recomputing `start_i + j*elem_count` at each use site.
     pub elem_cell_base: u32,
+    /// Starting slot in the handle-info buffer for this list's
+    /// elements; captured before the pre-pass bumps the running
+    /// total. `Some` iff `handles_per_elem > 0`.
+    pub handle_slot_base: Option<u32>,
+    /// `Cell::Handle` count in `element_plan`. Drives the per-list
+    /// bump (`len * handles_per_elem`) + the per-iteration stage
+    /// (`handle_slot_base + j * handles_per_elem`).
+    pub handles_per_elem: u32,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -343,6 +370,8 @@ fn build_one_list_emit_locals(
         (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
     let chars_per_elem = counts.chars;
     let tuple_idx_count_per_elem = counts.tuple_idx_slots;
+    let handle_slot_base = (counts.handles > 0).then(|| builder.alloc_local(ValType::I32));
+    let handles_per_elem = counts.handles;
     let elem_cell_base = builder.alloc_local(ValType::I32);
     ListEmitLocals {
         start_i,
@@ -359,6 +388,8 @@ fn build_one_list_emit_locals(
         tuple_idx_buf_base,
         tuple_idx_count_per_elem,
         elem_cell_base,
+        handle_slot_base,
+        handles_per_elem,
     }
 }
 
@@ -392,6 +423,10 @@ fn fn_has_list_elem_tuple(fd: &FuncDispatch) -> bool {
     fn_has_list_elem_class(fd, ListElementClass::PrestagedTupleIndices)
 }
 
+fn fn_has_list_elem_handle(fd: &FuncDispatch) -> bool {
+    fn_has_list_elem_class(fd, ListElementClass::PrestagedHandle)
+}
+
 /// Any `Cell::Char` in the wrapper (params or result, including
 /// list-element plans). Gates `char_len` + `char_scratch_addr`.
 fn fn_contains_char(fd: &FuncDispatch) -> bool {
@@ -408,13 +443,15 @@ fn fn_contains_char(fd: &FuncDispatch) -> bool {
     }
 }
 
-/// Any `Cell::Handle` in the wrapper (params or result). Gates
-/// `WrapperLocals.handle_info_base` so handle-free wrappers don't
-/// allocate the local. Reads the layout-phase `handle_count` —
-/// single source of truth (see `ParamLayout.handle_count` /
-/// `ResultLayout.handle_count`).
+/// Any `Cell::Handle` in the wrapper (params or result, including
+/// list-element plans). Gates `WrapperLocals.handle_info_base` so
+/// handle-free wrappers don't allocate the local. Static handles
+/// come from the layout-phase `handle_count` (single source of
+/// truth — see `ParamLayout.handle_count` / `ResultLayout.handle_count`);
+/// list-element handles route through [`fn_has_list_elem_handle`].
 fn fn_has_handle_cells(fd: &FuncDispatch) -> bool {
-    fd.params.iter().any(|p| p.handle_count > 0)
+    fn_has_list_elem_handle(fd)
+        || fd.params.iter().any(|p| p.handle_count > 0)
         || fd
             .result_lift
             .as_ref()
@@ -431,6 +468,9 @@ pub(super) struct ElementCounts {
     /// Sum of `children.len()` across `Cell::TupleOf` cells (sized
     /// via `len * tuple_idx_slots * 4`).
     pub tuple_idx_slots: u32,
+    /// `Cell::Handle` count in `element_plan` — slots per iteration
+    /// at `handle_slot_base + j * handles + offset_in_elem`.
+    pub handles: u32,
 }
 
 /// Single walk over `element_plan.cells` producing both the
@@ -474,6 +514,22 @@ pub(super) fn walk_element_plan(element_plan: &LiftPlan) -> (Vec<CellSideData>, 
                         },
                     }
                 }
+                ListElementClass::PrestagedHandle => {
+                    let Cell::Handle { type_name, .. } = cell else {
+                        unreachable!("PrestagedHandle class on non-Handle {cell:?}")
+                    };
+                    let offset_in_elem = counts.handles;
+                    counts.handles += 1;
+                    CellSideData::Handle(Box::new(
+                        super::sidetable::handle_info::HandleRuntimeFill {
+                            slot_source:
+                                super::sidetable::handle_info::HandleSlotSource::PerIteration {
+                                    offset_in_elem,
+                                },
+                            type_name: *type_name,
+                        },
+                    ))
+                }
             }
         })
         .collect();
@@ -512,6 +568,10 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let list_elem_child_idx =
         fn_has_list_elem_child_idx(fd).then(|| builder.alloc_local(ValType::I32));
     let tuple_slot_ptr = fn_has_list_elem_tuple(fd).then(|| builder.alloc_local(ValType::I32));
+    let needs_list_handle_locals = fn_has_list_elem_handle(fd);
+    let list_elem_handle_base = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
+    let handle_slot_addr = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
+    let handle_payload_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -632,6 +692,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let cells_base = builder.alloc_local(ValType::I32);
     let next_cell_idx = builder.alloc_local(ValType::I32);
     let handle_info_base = fn_has_handle_cells(fd).then(|| builder.alloc_local(ValType::I32));
+    let next_handle_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
 
     let frozen = builder.freeze();
     (
@@ -650,6 +711,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             char_scratch_addr,
             list_elem_child_idx,
             tuple_slot_ptr,
+            list_elem_handle_base,
+            handle_slot_addr,
+            handle_payload_idx,
             result,
             tr_addr,
             id_local,
@@ -659,6 +723,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             cells_base,
             next_cell_idx,
             handle_info_base,
+            next_handle_idx,
             param_list_locals,
         },
         result_emit,
@@ -854,10 +919,18 @@ fn emit_close_arm_guards(f: &mut Function, n: usize) {
 /// `ll.len` / `ll.start_i` defined on the inactive path. Per-list
 /// trap guards the `i32` mul + add against silent wrap; see
 /// `emit_trap_if_list_overflows_cell_slab`.
+///
+/// When `lcl.next_handle_idx` is `Some` (the plan or any of its
+/// element plans contains `Cell::Handle`), the same walk maintains
+/// a parallel running counter for handle-info entries: initialized
+/// to `static_handle_count`, captured into `ll.handle_slot_base`,
+/// then bumped by `len · handles_per_elem` for lists with element
+/// handles.
 pub(crate) fn emit_list_pre_pass(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
     plan: &LiftPlan,
+    static_handle_count: u32,
     list_locals: &[ListEmitLocals],
     local_base: u32,
     lcl: &WrapperLocals,
@@ -869,6 +942,10 @@ pub(crate) fn emit_list_pre_pass(
     );
     f.instructions().i32_const(plan.cell_count() as i32);
     f.instructions().local_set(lcl.next_cell_idx);
+    if let Some(next_handle_idx) = lcl.next_handle_idx {
+        f.instructions().i32_const(static_handle_count as i32);
+        f.instructions().local_set(next_handle_idx);
+    }
     for spec in plan.list_specs() {
         let ll = &list_locals[spec.list_idx as usize];
         emit_open_arm_guards(f, plan, local_base, spec.arm_guards);
@@ -892,6 +969,24 @@ pub(crate) fn emit_list_pre_pass(
         }
         f.instructions().i32_add();
         f.instructions().local_set(lcl.next_cell_idx);
+        // Mirror the per-list bump for the handle-info running
+        // counter when this list contributes element handles.
+        // `next_handle_idx` is `Some` iff any list in this plan (or
+        // a sibling plan in the same wrapper) does.
+        if let (Some(next_handle_idx), Some(handle_slot_base)) =
+            (lcl.next_handle_idx, ll.handle_slot_base)
+        {
+            f.instructions().local_get(next_handle_idx);
+            f.instructions().local_set(handle_slot_base);
+            f.instructions().local_get(next_handle_idx);
+            f.instructions().local_get(ll.len);
+            if ll.handles_per_elem != 1 {
+                f.instructions().i32_const(ll.handles_per_elem as i32);
+                f.instructions().i32_mul();
+            }
+            f.instructions().i32_add();
+            f.instructions().local_set(next_handle_idx);
+        }
         emit_close_arm_guards(f, spec.arm_guards.len());
     }
 }
@@ -1067,12 +1162,8 @@ fn emit_single_slot_cell(
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
             emit_handle_runtime_fill(f, source, fill, lcl, ctx.handle_info);
-            cell_layout.emit_handle_cell(
-                f,
-                addr,
-                kind.cell_disc_case(),
-                PayloadSource::ConstI32(fill.side_table_idx as i32),
-            );
+            let payload = stage_handle_cell_payload(f, lcl, fill);
+            cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), payload);
         }
         Cell::Option { child_idx, .. } => {
             // Stage inside the `some` arm — none-iterations skip it
@@ -1210,6 +1301,26 @@ fn emit_list_of_arm(
     }
     f.instructions().i32_add();
     f.instructions().local_set(ll.elem_cell_base);
+
+    // list_elem_handle_base = handle_slot_base + j * handles_per_elem
+    // Staged once per iteration so each element-plan handle cell
+    // resolves its absolute slot idx as
+    // `list_elem_handle_base + offset_in_elem` without recomputing.
+    if let Some(slot_base) = ll.handle_slot_base {
+        let dest = lcl.list_elem_handle_base.expect(
+            "list_elem_handle_base unset on a wrapper with list-element \
+             Cell::Handle — fn_has_list_elem_handle gate disagrees with \
+             ListEmitLocals.handle_slot_base",
+        );
+        f.instructions().local_get(slot_base);
+        f.instructions().local_get(ll.j);
+        if ll.handles_per_elem != 1 {
+            f.instructions().i32_const(ll.handles_per_elem as i32);
+            f.instructions().i32_mul();
+        }
+        f.instructions().i32_add();
+        f.instructions().local_set(dest);
+    }
 
     // Per element-plan cell: stage its absolute address (and any
     // per-iteration scratch), then dispatch to emit_cell_op.
@@ -1466,10 +1577,10 @@ fn emit_stage_char_scratch_addr(
 }
 
 /// Fill one `Cell::Handle`'s slot in the per-call handle-info buffer:
-/// write build-time-const `type-name` (off + len) and runtime
-/// zero-extended `id` at `handle_info_base + side_table_idx * sizeof`.
-/// Per-instance correlation (same bits → same id) — see `handle-info`
-/// in `wit/common/world.wit`.
+/// build-time-const `type-name` + runtime zero-extended `id`. Static
+/// slots fold the offset into a memarg; per-iteration slots stage
+/// `slot_addr = base + (iter_base + offset_in_elem) * sizeof` once
+/// and reuse for the three stores.
 fn emit_handle_runtime_fill(
     f: &mut Function,
     handle_local: u32,
@@ -1477,17 +1588,51 @@ fn emit_handle_runtime_fill(
     lcl: &WrapperLocals,
     info: HandleInfoOffsets,
 ) {
+    use super::sidetable::handle_info::HandleSlotSource;
     let base_local = lcl.handle_info_base.expect(
         "handle_info_base local unset on a wrapper containing Cell::Handle — \
          fn_has_handle_cells gate must agree with the cells reaching \
          emit_handle_runtime_fill",
     );
-    let entry_off = fill.side_table_idx * info.entry_size;
-    let type_name_off = entry_off + info.type_name_off;
-    let id_off = entry_off + info.id_off;
+    let (slot_local, type_name_off, id_off) = match fill.slot_source {
+        HandleSlotSource::Static(idx) => {
+            // Build-time-const byte offset: fold the multiply at build
+            // time and stage everything via `local_get base + offset`
+            // memargs (no runtime multiply, no scratch local needed).
+            let entry_off = idx * info.entry_size;
+            (
+                base_local,
+                entry_off + info.type_name_off,
+                entry_off + info.id_off,
+            )
+        }
+        HandleSlotSource::PerIteration { offset_in_elem } => {
+            // slot_addr = handle_info_base
+            //           + (list_elem_handle_base + offset_in_elem) * entry_size
+            let iter_base = lcl.list_elem_handle_base.expect(
+                "list_elem_handle_base unset — fn_has_list_elem_handle gate \
+                 disagrees with walk_element_plan",
+            );
+            let scratch = lcl.handle_slot_addr.expect(
+                "handle_slot_addr unset — fn_has_list_elem_handle gate \
+                 disagrees with the cells reaching emit_handle_runtime_fill",
+            );
+            f.instructions().local_get(iter_base);
+            if offset_in_elem != 0 {
+                f.instructions().i32_const(offset_in_elem as i32);
+                f.instructions().i32_add();
+            }
+            f.instructions().i32_const(info.entry_size as i32);
+            f.instructions().i32_mul();
+            f.instructions().local_get(base_local);
+            f.instructions().i32_add();
+            f.instructions().local_set(scratch);
+            (scratch, info.type_name_off, info.id_off)
+        }
+    };
 
     let store_i32 = |f: &mut Function, off: u32, value: i32| {
-        f.instructions().local_get(base_local);
+        f.instructions().local_get(slot_local);
         f.instructions().i32_const(value);
         f.instructions().i32_store(MemArg {
             offset: off as u64,
@@ -1506,7 +1651,7 @@ fn emit_handle_runtime_fill(
         fill.type_name.len as i32,
     );
 
-    f.instructions().local_get(base_local);
+    f.instructions().local_get(slot_local);
     f.instructions().local_get(handle_local);
     f.instructions().i64_extend_i32_u();
     f.instructions().i64_store(MemArg {
@@ -1514,6 +1659,39 @@ fn emit_handle_runtime_fill(
         align: I64_STORE_LOG2_ALIGN,
         memory_index: 0,
     });
+}
+
+/// Resolve a `Cell::Handle`'s `cell::*-handle(idx)` payload.
+/// Static → `ConstI32(idx)`; list-element → `iter_base +
+/// offset_in_elem` into `lcl.handle_payload_idx` (or `iter_base`
+/// itself when offset is zero). Mirrors [`stage_child_idx_source`].
+fn stage_handle_cell_payload(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    fill: &HandleRuntimeFill,
+) -> PayloadSource {
+    use super::sidetable::handle_info::HandleSlotSource;
+    match fill.slot_source {
+        HandleSlotSource::Static(idx) => PayloadSource::ConstI32(idx as i32),
+        HandleSlotSource::PerIteration { offset_in_elem } => {
+            let iter_base = lcl.list_elem_handle_base.expect(
+                "list_elem_handle_base unset — fn_has_list_elem_handle gate \
+                 disagrees with the cells reaching stage_handle_cell_payload",
+            );
+            if offset_in_elem == 0 {
+                return PayloadSource::Local(iter_base);
+            }
+            let dest = lcl.handle_payload_idx.expect(
+                "handle_payload_idx unset — fn_has_list_elem_handle gate \
+                 disagrees with the cells reaching stage_handle_cell_payload",
+            );
+            f.instructions().local_get(iter_base);
+            f.instructions().i32_const(offset_in_elem as i32);
+            f.instructions().i32_add();
+            f.instructions().local_set(dest);
+            PayloadSource::Local(dest)
+        }
+    }
 }
 
 /// Per-bit unrolled bit-walk filling the cell's scratch buffer with

@@ -8,9 +8,12 @@
 //! reentrancy:
 //!
 //! - Static side-table scratch (`flags-info.set-flags`,
-//!   `variant-info.case-name` + `payload`, `handle-info.id`,
-//!   per-cell char utf-8 scratch) — written per call; the cell
-//!   tree points into them.
+//!   `variant-info.case-name` + `payload`, per-cell char utf-8
+//!   scratch) — written per call; the cell tree points into them.
+//! - Per-call `handle-info` buffer — `cabi_realloc`'d per (fn, param
+//!   | result) with handle cells; the field-tree's
+//!   `handle-infos.ptr` (and `.len` for runtime-sized counts) is
+//!   patched to point at it.
 //! - Static field-tree `cells` slice — `ptr` and `len` patched
 //!   per call to point at the freshly-`cabi_realloc`'d slab.
 //! - Per-list indices buffer — `cabi_realloc`'d per call from the
@@ -95,16 +98,22 @@ struct OnCallCallSite {
     id_local: u32,
 }
 
-/// Where the patched `cells: list<cell>` slice lives in linear memory.
+/// Where the patched `cells: list<cell>` slice lives in linear memory,
+/// plus the per-plan handle-info-buffer pre-pass seed (`static_count`
+/// — the build-time-known number of `Cell::Handle` cells in the plan's
+/// outer cells; the pre-pass adds list-element handle counts on top).
 struct CellsTarget {
     fields_base_ptr: i32,
     cells_field_off: u32,
+    static_handle_count: u32,
 }
 
 /// Cells-slab allocation for one (param | result) plan. Runs the
 /// per-list pre-pass (disc-gated for joined-arm lists; see
 /// [`emit_list_pre_pass`]), then `cabi_realloc`s the slab and
-/// patches `cells.ptr` + `cells.len`.
+/// patches `cells.ptr` + `cells.len`. `target.static_handle_count`
+/// seeds the parallel handle-info running counter inside the
+/// pre-pass — noop when the wrapper has no list-element handles.
 fn emit_alloc_cells_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -114,7 +123,15 @@ fn emit_alloc_cells_for_plan(
     lcl: &WrapperLocals,
     target: CellsTarget,
 ) {
-    emit_list_pre_pass(f, ctx, plan, list_locals, local_base, lcl);
+    emit_list_pre_pass(
+        f,
+        ctx,
+        plan,
+        target.static_handle_count,
+        list_locals,
+        local_base,
+        lcl,
+    );
     emit_cabi_realloc_call_runtime(
         f,
         ctx.cabi_realloc_idx,
@@ -159,28 +176,56 @@ fn after_result_tree_slice_off(
 }
 
 /// Per-call handle-info buffer alloc + slice-ptr patch for one
-/// (param | result) plan. `count` is build-time-const (sourced from
-/// [`super::lift::ParamLayout::handle_count`] / [`super::lift::ResultLayout::handle_count`]
-/// — single source of truth shared with the static `len` baked in
-/// `build_fields_blob` / `build_after_params_blob`). No-op when
-/// `count == 0`; otherwise `lcl.handle_info_base` is required (the
-/// `fn_has_handle_cells` gate ensures it's allocated).
+/// (param | result) plan.
+///
+/// Two count regimes, picked per-plan (build-time-known):
+/// - **Runtime** (`runtime_sized = true`): this plan contains a
+///   `list<handle>` somewhere. The pre-pass accumulated
+///   `static_count + Σ_lists len * handles_per_elem` into
+///   `lcl.next_handle_idx`; the alloc uses that local and patches
+///   both `ptr` + `len`.
+/// - **Build-time-const** (`runtime_sized = false`): no list-element
+///   handles. Skipped entirely when `static_count == 0`; otherwise
+///   `cabi_realloc(static_count * entry_size)` + ptr patch (the
+///   slice's `len` was baked statically).
 fn emit_alloc_handle_info_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
-    count: u32,
+    static_count: u32,
+    runtime_sized: bool,
     base_ptr: i32,
     slice_field_off: u32,
     lcl: &WrapperLocals,
 ) {
-    if count == 0 {
+    if runtime_sized {
+        let count_local = lcl.next_handle_idx.expect(
+            "next_handle_idx unset — fn_has_list_elem_handle gate disagrees \
+             with the plan's list_specs",
+        );
+        let base_local = lcl.handle_info_base.expect(
+            "handle_info_base local unset — fn_has_handle_cells gate disagrees \
+             with fn_has_list_elem_handle",
+        );
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            ctx.handle_info.align,
+            count_local,
+            ctx.handle_info.entry_size,
+            base_local,
+        );
+        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
+        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
+        return;
+    }
+    if static_count == 0 {
         return;
     }
     let base_local = lcl.handle_info_base.expect(
         "handle_info_base local unset — fn_has_handle_cells gate disagrees \
          with the per-(param|result) handle_count",
     );
-    let buf_size = count
+    let buf_size = static_count
         .checked_mul(ctx.handle_info.entry_size)
         .expect("handle_info buffer size overflowed u32 — count * entry_size");
     emit_cabi_realloc_call(
@@ -273,12 +318,14 @@ pub(super) fn emit_wrapper_function(
                 CellsTarget {
                     fields_base_ptr: fd.fields_buf_offset as i32,
                     cells_field_off: field_off + cells_slice_off,
+                    static_handle_count: p.handle_count,
                 },
             );
             emit_alloc_handle_info_for_plan(
                 &mut f,
                 &lift_ctx,
                 p.handle_count,
+                p.lift.plan.has_list_elem_handle(),
                 fd.fields_buf_offset as i32,
                 field_off + handle_infos_slice_off,
                 &lcl,
@@ -412,12 +459,14 @@ pub(super) fn emit_wrapper_function(
                     CellsTarget {
                         fields_base_ptr: after_pf.params_offset,
                         cells_field_off,
+                        static_handle_count: result_handle_count,
                     },
                 );
                 emit_alloc_handle_info_for_plan(
                     &mut f,
                     &lift_ctx,
                     result_handle_count,
+                    plan.has_list_elem_handle(),
                     after_pf.params_offset,
                     handle_infos_field_off,
                     &lcl,
@@ -450,10 +499,13 @@ pub(super) fn emit_wrapper_function(
                     cells_field_off,
                     lcl.cells_base,
                 );
+                // Direct result is single-cell flat; lists never reach
+                // this branch, so list-element handles can't appear here.
                 emit_alloc_handle_info_for_plan(
                     &mut f,
                     &lift_ctx,
                     result_handle_count,
+                    false,
                     after_pf.params_offset,
                     handle_infos_field_off,
                     &lcl,
