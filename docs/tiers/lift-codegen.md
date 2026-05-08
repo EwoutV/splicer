@@ -290,16 +290,19 @@ Two storage policies exist for side-table entry data, picked per
 kind:
 
 - **Static segment, runtime-filled fields.** Most kinds (enum-info,
-  record-info, flags-info, variant-info) bake the entry records at
-  layout time into a data segment. Build-time-const fields (type-name,
-  case-name lists, child-cell indices) are written once; runtime-
-  varying fields (flags `set-flags`, variant `case-name` + `payload`,
-  …) get patched per call. The `field-tree`'s `<kind>-infos` slice is
-  baked statically with both `(ptr, len)` populated.
-- **Per-call buffer, fully runtime-written.** `handle-info` entries
-  live in a `cabi_realloc`'d slab the wrapper body allocates per call
-  and writes both `type-name` (build-time-const) and `id` (runtime-
-  zero-extended) into. Two sub-regimes per (fn, param | result):
+  record-info, variant-info) bake the entry records at layout time
+  into a data segment. Build-time-const fields (type-name, case-name
+  lists, child-cell indices) are written once; runtime-varying fields
+  (variant `case-name` + `payload`, …) get patched per call. The
+  `field-tree`'s `<kind>-infos` slice is baked statically with both
+  `(ptr, len)` populated.
+- **Per-call buffer, fully runtime-written.** `handle-info` and
+  `flags-info` entries live in a `cabi_realloc`'d slab the wrapper
+  body allocates per call. Each entry's build-time-const fields
+  (type-name, plus flags-info's `set-flags.ptr` pointing at the
+  per-cell scratch slab) are written from `i32.const`s; runtime
+  fields (handle's `id`, flags's `set-flags.len`) are written
+  from locals. Two sub-regimes per (fn, param | result):
   - *Static-count*: no list-of-handle in this plan. Buffer size is
     `static_count * sizeof(handle-info)`; the field-tree's
     `handle-infos.len` is baked statically; only `.ptr` is patched.
@@ -314,18 +317,21 @@ kind:
 
 **Rule.** A side-table kind moves to the per-call policy as soon as
 *any* element-plan can introduce a list-of-that-kind: the entry count
-becomes len-dependent and a static segment can't size it. Today only
-`handle-info` supports the runtime-count sub-regime — `list<own<R>>`,
-`list<borrow<R>>`, `list<stream<T>>`, `list<future<T>>`, and
-`list<error-context>` all share the same codegen (only the
-`cell::*-handle` disc differs). When `list<flags>` lands the
-flags-info entries follow the same migration; same for any future
-list-of-side-tabled kind.
+becomes len-dependent and a static segment can't size it.
+`handle-info` supports the runtime-count sub-regime today — the five
+handle kinds (own/borrow/stream/future/error-context) share the
+codegen, only the `cell::*-handle` disc differs. `flags-info` is
+migrated to per-call storage but only the static-count sub-regime
+fires today; the runtime-count sub-regime lands when `Cell::Flags`
+opens in `list_element_class`.
 
-Per-call storage costs ~7 wasm instructions and one extra
-`cabi_realloc` per (fn, param | result) with that kind, even when the
-list-of-form isn't in play. The tradeoff favors uniform shape over
-the few instructions saved by a hybrid path.
+Per-call storage costs ~7 wasm instructions + one extra
+`cabi_realloc` per (fn, param | result) with that kind, plus per-cell
+write-overhead from fields that used to be statically baked: 2
+i32 stores per handle cell (type-name `(off, len)`); 3 stores per
+flags cell (type-name + `set-flags.ptr`). Paid uniformly even when
+the list-of-form isn't in play. The tradeoff favors uniform shape
+over the few instructions saved by a hybrid path.
 
 ---
 

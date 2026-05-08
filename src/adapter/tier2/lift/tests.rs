@@ -318,10 +318,11 @@ fn synth_cell_layout() -> CellLayout {
     CellLayout::from_resolve(&sizes, &resolve, cell_id)
 }
 
-/// Synthesize the `record handle-info` `RecordLayout` from the live
-/// common WIT — same ergonomics as [`synth_cell_layout`]. Drives the
-/// validator fixture's `LiftEmitCtx.handle_info_layout`.
-fn synth_handle_info_layout() -> RecordLayout {
+/// Synthesize a per-call info-record `RecordLayout` (handle-info or
+/// flags-info) from the live common WIT — same ergonomics as
+/// [`synth_cell_layout`]. Drives the validator fixture's
+/// `LiftEmitCtx.{handle_info, flags_info}`.
+fn synth_info_layout(record_name: &str) -> RecordLayout {
     let common_wit = include_str!("../../../../wit/common/world.wit");
     let mut resolve = Resolve::new();
     resolve
@@ -329,14 +330,14 @@ fn synth_handle_info_layout() -> RecordLayout {
         .expect("wit/common/world.wit must parse");
     let common_id =
         super::super::test_utils::iface_by_unversioned_qname(&resolve, "splicer:common/types");
-    let handle_info_id = resolve.interfaces[common_id]
+    let record_id = resolve.interfaces[common_id]
         .types
-        .get("handle-info")
+        .get(record_name)
         .copied()
-        .expect("splicer:common/types must export `handle-info`");
+        .unwrap_or_else(|| panic!("splicer:common/types must export `{record_name}`"));
     let mut sizes = SizeAlign::default();
     sizes.fill(&resolve);
-    RecordLayout::for_record_typedef(&sizes, &resolve, handle_info_id)
+    RecordLayout::for_record_typedef(&sizes, &resolve, record_id)
 }
 
 /// Wasm `ValType` per flat slot — sourced from the canonical-ABI
@@ -398,14 +399,15 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 }
             }
             Cell::Flags { info, .. } => {
+                use super::sidetable::flags_info::FlagsSlotSource;
                 let scratch_addr = flags_cursor;
                 flags_cursor += info.item_names.len() as u32 * STRING_FLAT_BYTES;
-                let set_flags_len_addr = flags_cursor;
-                flags_cursor += U32_BYTES;
                 let fill = FlagsRuntimeFill {
-                    side_table_idx: flags_idx,
-                    entry_seg_off: 0, // not exercised by the validator fixture
-                    set_flags_len_addr: Some(set_flags_len_addr as i32),
+                    slot_source: FlagsSlotSource::Static(flags_idx),
+                    type_name: BlobSlice {
+                        off: 0,
+                        len: STUB_FLAG_NAME_LEN,
+                    },
                     scratch_addr: scratch_addr as i32,
                     flag_names: info
                         .item_names
@@ -498,7 +500,8 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let mut sizes = SizeAlign::default();
     sizes.fill(resolve);
     let cell_layout = synth_cell_layout();
-    let handle_info_layout = synth_handle_info_layout();
+    let handle_info_layout = synth_info_layout("handle-info");
+    let flags_info_layout = synth_info_layout("flags-info");
     let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan, resolve);
     let n = plan.flat_slot_count;
@@ -525,6 +528,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let cells_base = builder.alloc_local(ValType::I32);
     let next_cell_idx = builder.alloc_local(ValType::I32);
     let handle_info_base = builder.alloc_local(ValType::I32);
+    let flags_info_base = builder.alloc_local(ValType::I32);
     let next_handle_idx = builder.alloc_local(ValType::I32);
     let list_elem_handle_base = builder.alloc_local(ValType::I32);
     let handle_slot_addr = builder.alloc_local(ValType::I32);
@@ -550,6 +554,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         cells_base,
         next_cell_idx,
         handle_info_base: Some(handle_info_base),
+        flags_info_base: Some(flags_info_base),
         next_handle_idx: Some(next_handle_idx),
         list_elem_handle_base: Some(list_elem_handle_base),
         handle_slot_addr: Some(handle_slot_addr),
@@ -602,6 +607,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         cell_layout: &cell_layout,
         cabi_realloc_idx: 0,
         handle_info: super::emit::HandleInfoOffsets::from_layout(&handle_info_layout),
+        flags_info: super::emit::FlagsInfoOffsets::from_layout(&flags_info_layout),
     };
     emit_lift_plan(
         &mut f,
@@ -1994,7 +2000,7 @@ fn char_scratch_sizes_count_single_cell_char_result() {
 #[test]
 fn flags_scratch_sizes_count_both_param_and_result_cells() {
     // Regression: `flags_scratch_sizes` must walk per-fn params AND
-    // the compound result plan, in the order `build_flags_info_blob`
+    // the compound result plan, in the order `build_flags_info_maps`
     // consumes addresses — otherwise a record-result-with-flags
     // crashes the builder's `scratch_addrs.next()` expect.
     use super::classify::{CompoundResult, SideTableInfo};

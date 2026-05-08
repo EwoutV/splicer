@@ -141,6 +141,10 @@ pub(crate) struct WrapperLocals {
     /// patches `handle_infos.len`. `Some` iff
     /// [`fn_has_list_elem_handle`] (otherwise fully build-time).
     pub next_handle_idx: Option<u32>,
+    /// Base address of the active plan's flags-info buffer.
+    /// `Some` iff [`fn_has_flags_cells`]. Same stage-then-consume
+    /// invariant as [`Self::handle_info_base`].
+    pub flags_info_base: Option<u32>,
     /// Base address of the active plan's handle-info buffer.
     /// `Some` iff [`fn_has_handle_cells`] holds; `None` for
     /// handle-free wrappers (saves the local).
@@ -206,22 +210,17 @@ pub(crate) struct CellSideRefs<'a> {
 }
 
 /// Per-build context shared across every lift emit in a wrapper.
-/// Bundles `cell_layout` + `cabi_realloc_idx` + handle-info offsets
-/// so per-call helpers don't repeat them in every signature.
+/// Bundles `cell_layout` + `cabi_realloc_idx` + per-call buffer
+/// geometries so per-cell helpers don't pay `offset_of` per emit.
 #[derive(Clone, Copy)]
 pub(crate) struct LiftEmitCtx<'a> {
     pub cell_layout: &'a CellLayout,
     pub cabi_realloc_idx: u32,
-    /// Pre-resolved handle-info entry geometry. Hoisted out of
-    /// [`emit_handle_runtime_fill`] so the per-cell emit doesn't pay
-    /// `RecordLayout::offset_of` (linear field-name walk) per call —
-    /// resolved once per wrapper from `schema.handle_info_layout`.
     pub handle_info: HandleInfoOffsets,
+    pub flags_info: FlagsInfoOffsets,
 }
 
 /// Build-time-resolved geometry of one `record handle-info` entry.
-/// `entry_size` drives the per-call buffer alloc; `type_name_off` /
-/// `id_off` drive the per-cell field writes inside the slot.
 #[derive(Clone, Copy)]
 pub(crate) struct HandleInfoOffsets {
     pub entry_size: u32,
@@ -238,6 +237,29 @@ impl HandleInfoOffsets {
             align: layout.align,
             type_name_off: layout.offset_of(HANDLE_INFO_TYPE_NAME),
             id_off: layout.offset_of(HANDLE_INFO_ID),
+        }
+    }
+}
+
+/// Build-time-resolved geometry of one `record flags-info` entry.
+/// Same shape as [`HandleInfoOffsets`] for the flags-info side.
+#[derive(Clone, Copy)]
+pub(crate) struct FlagsInfoOffsets {
+    pub entry_size: u32,
+    pub align: u32,
+    pub type_name_off: u32,
+    pub set_flags_off: u32,
+}
+
+impl FlagsInfoOffsets {
+    pub(crate) fn from_layout(layout: &RecordLayout) -> Self {
+        use super::super::schema::FLAGS_INFO_SET_FLAGS;
+        use super::sidetable::INFO_TYPE_NAME;
+        Self {
+            entry_size: layout.size,
+            align: layout.align,
+            type_name_off: layout.offset_of(INFO_TYPE_NAME),
+            set_flags_off: layout.offset_of(FLAGS_INFO_SET_FLAGS),
         }
     }
 }
@@ -456,6 +478,16 @@ fn fn_has_handle_cells(fd: &FuncDispatch) -> bool {
             .result_lift
             .as_ref()
             .is_some_and(|rl| rl.handle_count > 0)
+}
+
+/// Any `Cell::Flags` in the wrapper. Gates
+/// `WrapperLocals.flags_info_base`.
+fn fn_has_flags_cells(fd: &FuncDispatch) -> bool {
+    fd.params.iter().any(|p| p.flags_count > 0)
+        || fd
+            .result_lift
+            .as_ref()
+            .is_some_and(|rl| rl.flags_count > 0)
 }
 
 /// Per-class counts collected by [`walk_element_plan`]. Drives the
@@ -692,6 +724,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let cells_base = builder.alloc_local(ValType::I32);
     let next_cell_idx = builder.alloc_local(ValType::I32);
     let handle_info_base = fn_has_handle_cells(fd).then(|| builder.alloc_local(ValType::I32));
+    let flags_info_base = fn_has_flags_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let next_handle_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
 
     let frozen = builder.freeze();
@@ -723,6 +756,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             cells_base,
             next_cell_idx,
             handle_info_base,
+            flags_info_base,
             next_handle_idx,
             param_list_locals,
         },
@@ -1133,8 +1167,12 @@ fn emit_single_slot_cell(
             let CellSideData::Flags(fill) = side_data else {
                 panic!("Flags cell paired with non-Flags side data {side_data:?}");
             };
-            emit_flags_runtime_fill(f, source, fill, lcl);
-            cell_layout.emit_flags_set(f, addr, fill.side_table_idx);
+            emit_flags_runtime_fill(f, source, fill, lcl, ctx.flags_info);
+            // Migration commit: every flags cell is `Static`. When
+            // PerIteration lands this `let` becomes refutable and
+            // rustc forces the per-iter wiring before recompiling.
+            let super::sidetable::flags_info::FlagsSlotSource::Static(idx) = fill.slot_source;
+            cell_layout.emit_flags_set(f, addr, idx);
         }
         Cell::Char { .. } => {
             let CellSideData::Char { scratch } = side_data else {
@@ -1694,24 +1732,53 @@ fn stage_handle_cell_payload(
     }
 }
 
-/// Per-bit unrolled bit-walk filling the cell's scratch buffer with
-/// `(name_ptr, name_len)` pairs and patching `set-flags.len`. Unrolled
-/// rather than looped — at ≤ 8 bits per typical flag type the
-/// overhead of a counter + `br_if` outweighs the static instructions.
-/// Single-threaded today; the static buffer is unsafe under concurrent
-/// calls (revisit when tier-2 grows concurrency).
+/// Fill one `Cell::Flags`'s slot in the per-call flags-info buffer +
+/// scratch slab: write `type-name` + `set-flags.ptr` (build-time-const)
+/// into the entry, bit-walk the bitmask to write `(name_ptr, name_len)`
+/// pairs into scratch + count, then write `set-flags.len`. Bit-walk
+/// is unrolled — at ≤ 8 bits per typical flag type the overhead of a
+/// counter + `br_if` outweighs the static instructions. Single-threaded;
+/// the per-cell scratch slab is unsafe under concurrent calls.
 fn emit_flags_runtime_fill(
     f: &mut Function,
     bitmask_local: u32,
     fill: &FlagsRuntimeFill,
     lcl: &WrapperLocals,
+    info: FlagsInfoOffsets,
 ) {
+    use super::sidetable::flags_info::FlagsSlotSource;
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
         memory_index: 0,
     };
 
+    let base_local = lcl.flags_info_base.expect(
+        "flags_info_base local unset on a wrapper containing Cell::Flags — \
+         fn_has_flags_cells gate must agree with the cells reaching \
+         emit_flags_runtime_fill",
+    );
+    // Migration commit: only `Static` slots are constructed. When
+    // PerIteration lands this let becomes refutable, forcing the
+    // per-iter slot-addr stage to be wired before recompiling.
+    let FlagsSlotSource::Static(idx) = fill.slot_source;
+    let entry_off = idx * info.entry_size;
+    let type_name_off = entry_off + info.type_name_off;
+    let set_flags_off = entry_off + info.set_flags_off;
+
+    // Write type-name (build-time-const).
+    let store_const = |f: &mut Function, off: u32, value: i32| {
+        f.instructions().local_get(base_local);
+        f.instructions().i32_const(value);
+        f.instructions().i32_store(store_i32(off));
+    };
+    store_const(f, type_name_off + SLICE_PTR_OFFSET, fill.type_name.off as i32);
+    store_const(f, type_name_off + SLICE_LEN_OFFSET, fill.type_name.len as i32);
+    // Write set-flags.ptr = scratch_addr (build-time-const per cell;
+    // list-element variant will replace this with a per-iter slot).
+    store_const(f, set_flags_off + SLICE_PTR_OFFSET, fill.scratch_addr);
+
+    // Bit-walk: cursor + count, write each set bit's name pair.
     f.instructions().i32_const(fill.scratch_addr);
     f.instructions().local_set(lcl.flags_addr);
     f.instructions().i32_const(0);
@@ -1744,12 +1811,11 @@ fn emit_flags_runtime_fill(
         f.instructions().end();
     }
 
-    let len_addr = fill
-        .set_flags_len_addr
-        .expect("set_flags_len_addr unset — layout must run back_fill_flags_len_addrs");
-    f.instructions().i32_const(len_addr);
+    // Write set-flags.len = flags_count (runtime).
+    f.instructions().local_get(base_local);
     f.instructions().local_get(lcl.flags_count);
-    f.instructions().i32_store(store_i32(0));
+    f.instructions()
+        .i32_store(store_i32(set_flags_off + SLICE_LEN_OFFSET));
 }
 
 /// N-way disc dispatch for one `Cell::Variant` cell. For each case

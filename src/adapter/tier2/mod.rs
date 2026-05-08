@@ -853,6 +853,50 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// `flags` param **and** `flags` result on the same fn — pins the
+    /// shared `WrapperLocals.flags_info_base` getting reset across
+    /// the param-side and result-side plans (mirrors the handle-side
+    /// `dispatch_module_with_handle_param_and_handle_result_roundtrips`).
+    #[test]
+    fn dispatch_module_with_flags_param_and_flags_result_roundtrips() {
+        let wat = r#"(component
+            (component $inner
+                (core module $m
+                    (func (export "thru") (param i32) (result i32) local.get 0)
+                )
+                (core instance $i (instantiate $m))
+                (alias core export $i "thru" (core func $thru))
+                (type $perms (flags "read" "write" "exec"))
+                (export $perms-export "fperms" (type $perms))
+                (type $thru-ty (func (param "p" $perms-export) (result $perms-export)))
+                (func $thru-lifted (type $thru-ty) (canon lift (core func $thru)))
+                (instance $api-inst
+                    (export "fperms" (type $perms-export))
+                    (export "thru" (func $thru-lifted)))
+                (export "my:flio/api@1.0.0" (instance $api-inst))
+            )
+            (instance $api (instantiate $inner))
+            (export "my:flio/api@1.0.0" (instance $api "my:flio/api@1.0.0"))
+        )"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let bytes = build_tier2_adapter(
+            "my:flio/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect(
+            "tier-2 adapter generation should succeed for flags param + flags result on the same fn",
+        );
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Char` as a param. Drives the
     /// utf-8 encoder + per-cell scratch reservation + cell::text emit.
     /// `char` flattens to a single i32 (the code point).

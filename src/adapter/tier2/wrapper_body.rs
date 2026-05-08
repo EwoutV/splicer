@@ -37,12 +37,12 @@ use super::super::indices::LocalsBuilder;
 use super::lift::plan::LiftPlan;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    emit_list_pre_pass, CellSideRefs, HandleInfoOffsets, LiftEmitCtx, ListEmitLocals,
-    ResultEmitPlan, WrapperLocals,
+    emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, LiftEmitCtx,
+    ListEmitLocals, ResultEmitPlan, WrapperLocals,
 };
 use super::schema::{
     SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
-    TREE_HANDLE_INFOS,
+    TREE_FLAGS_INFOS, TREE_HANDLE_INFOS,
 };
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
@@ -238,6 +238,38 @@ fn emit_alloc_handle_info_for_plan(
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
+/// Per-call flags-info buffer alloc + slice-ptr patch. Mirrors
+/// [`emit_alloc_handle_info_for_plan`]'s static-count branch — runtime
+/// count lands with `list<flags>`. Field-tree's `flags_infos.len`
+/// was baked statically in `build_fields_blob`.
+fn emit_alloc_flags_info_for_plan(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    static_count: u32,
+    base_ptr: i32,
+    slice_field_off: u32,
+    lcl: &WrapperLocals,
+) {
+    if static_count == 0 {
+        return;
+    }
+    let base_local = lcl.flags_info_base.expect(
+        "flags_info_base local unset — fn_has_flags_cells gate disagrees \
+         with the per-(param|result) flags_count",
+    );
+    let buf_size = static_count
+        .checked_mul(ctx.flags_info.entry_size)
+        .expect("flags_info buffer size overflowed u32 — count * entry_size");
+    emit_cabi_realloc_call(
+        f,
+        ctx.cabi_realloc_idx,
+        ctx.flags_info.align,
+        buf_size,
+        base_local,
+    );
+    emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
+}
+
 /// Write the call-id record + per-call `list<field>` args pointer/len
 /// into the indirect-params buffer at `base_ptr`.
 fn emit_populate_hook_params(
@@ -295,6 +327,7 @@ pub(super) fn emit_wrapper_function(
         cell_layout: &schema.cell_layout,
         cabi_realloc_idx: func_idx.cabi_realloc_idx,
         handle_info: HandleInfoOffsets::from_layout(&schema.handle_info_layout),
+        flags_info: FlagsInfoOffsets::from_layout(&schema.flags_info_layout),
     };
 
     // ── Phase 1: on-call (only if before-hook wired) ──
@@ -305,6 +338,7 @@ pub(super) fn emit_wrapper_function(
         let mut local_base: u32 = 0;
         let cells_slice_off = field_tree_slice_off(schema, TREE_CELLS);
         let handle_infos_slice_off = field_tree_slice_off(schema, TREE_HANDLE_INFOS);
+        let flags_infos_slice_off = field_tree_slice_off(schema, TREE_FLAGS_INFOS);
         for (i, p) in fd.params.iter().enumerate() {
             let field_off = i as u32 * schema.field_layout.size;
             let list_locals = &lcl.param_list_locals[i];
@@ -328,6 +362,14 @@ pub(super) fn emit_wrapper_function(
                 p.lift.plan.has_list_elem_handle(),
                 fd.fields_buf_offset as i32,
                 field_off + handle_infos_slice_off,
+                &lcl,
+            );
+            emit_alloc_flags_info_for_plan(
+                &mut f,
+                &lift_ctx,
+                p.flags_count,
+                fd.fields_buf_offset as i32,
+                field_off + flags_infos_slice_off,
                 &lcl,
             );
             emit_lift_plan(
@@ -423,10 +465,17 @@ pub(super) fn emit_wrapper_function(
         let cells_field_off = after_result_tree_slice_off(schema, after_static.layout, TREE_CELLS);
         let handle_infos_field_off =
             after_result_tree_slice_off(schema, after_static.layout, TREE_HANDLE_INFOS);
+        let flags_infos_field_off =
+            after_result_tree_slice_off(schema, after_static.layout, TREE_FLAGS_INFOS);
         let result_handle_count = fd
             .result_lift
             .as_ref()
             .map(|rl| rl.handle_count)
+            .unwrap_or(0);
+        let result_flags_count = fd
+            .result_lift
+            .as_ref()
+            .map(|rl| rl.flags_count)
             .unwrap_or(0);
         match &result_emit {
             ResultEmitPlan::Compound {
@@ -471,6 +520,14 @@ pub(super) fn emit_wrapper_function(
                     handle_infos_field_off,
                     &lcl,
                 );
+                emit_alloc_flags_info_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    result_flags_count,
+                    after_pf.params_offset,
+                    flags_infos_field_off,
+                    &lcl,
+                );
                 // Synth locals are contiguous; `synth_locals[0]`
                 // is the plan's `local_base`.
                 emit_lift_plan(
@@ -508,6 +565,14 @@ pub(super) fn emit_wrapper_function(
                     false,
                     after_pf.params_offset,
                     handle_infos_field_off,
+                    &lcl,
+                );
+                emit_alloc_flags_info_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    result_flags_count,
+                    after_pf.params_offset,
+                    flags_infos_field_off,
                     &lcl,
                 );
                 f.instructions().local_get(lcl.cells_base);

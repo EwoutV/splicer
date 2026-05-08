@@ -43,16 +43,16 @@ pub(super) use classify::{
 };
 pub(super) use emit::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    emit_list_pre_pass, CellSideRefs, HandleInfoOffsets, LiftEmitCtx, ListEmitLocals,
-    ResultEmitPlan, WrapperLocals,
+    emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, LiftEmitCtx,
+    ListEmitLocals, ResultEmitPlan, WrapperLocals,
 };
 pub(super) use sidetable::char_info::{
     build_char_scratch_map, char_scratch_sizes, CharScratchMaps,
 };
 pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
 pub(super) use sidetable::flags_info::{
-    back_fill_len_addrs as back_fill_flags_len_addrs, build_flags_info_blob, flags_scratch_sizes,
-    register_flags_strings, FlagsInfoBlobs, FlagsRuntimeFill,
+    build_flags_info_maps, flags_scratch_sizes, register_flags_strings, FlagsInfoMaps,
+    FlagsRuntimeFill,
 };
 pub(super) use sidetable::handle_info::{
     build_handle_info_maps, HandleInfoMaps, HandleRuntimeFill,

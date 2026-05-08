@@ -17,11 +17,11 @@ use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, Segment, SymRef, SymbolBases};
 use super::lift::plan::Cell;
 use super::lift::{
-    back_fill_flags_len_addrs, back_fill_variant_entry_addrs, build_char_scratch_map,
-    build_enum_info_blob, build_flags_info_blob, build_handle_info_maps, build_record_info_blob,
+    back_fill_variant_entry_addrs, build_char_scratch_map, build_enum_info_blob,
+    build_flags_info_maps, build_handle_info_maps, build_record_info_blob,
     build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes,
     fold_cell_side_data, register_enum_strings, register_flags_strings, register_variant_strings,
-    CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoBlobs, FlagsRuntimeFill,
+    CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoMaps, FlagsRuntimeFill,
     HandleInfoMaps, HandleRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
     ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
 };
@@ -414,7 +414,6 @@ pub(super) fn lay_out_static_memory(
     // every cross-segment ptr is a queued reloc, not a write that
     // gets patched after the fact.
     let enum_info_id = symbols.alloc();
-    let flags_info_id = symbols.alloc();
     let record_entries_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
@@ -430,20 +429,19 @@ pub(super) fn lay_out_static_memory(
         per_param: enum_per_param_sym,
         per_result: enum_per_result_sym,
     } = enum_info;
+    // Flags-info doesn't pre-bake a static segment — the wrapper body
+    // allocates a per-(fn, param | result) buffer per call, writes
+    // type-name + set-flags.ptr (build-time-const) + set-flags.len
+    // (runtime bit-walked), and patches `field_tree.flags_infos`.
+    // The set-flags scratch slabs (per-cell static today) are still
+    // baked into the data segment.
     let mut flags_scratch_iter = flags_scratch_addrs.iter().copied();
-    let FlagsInfoBlobs {
-        entries: flags_entries_seg,
-        per_param_range: flags_per_param_range_sym,
-        per_result_range: flags_per_result_range_sym,
-        per_cell_fill: mut flags_per_cell_fill,
-        per_result_single_fill: mut flags_per_result_single_fill,
-    } = build_flags_info_blob(
-        &per_func,
-        &flags_strings,
-        &schema.flags_info_layout,
-        flags_info_id,
-        &mut flags_scratch_iter,
-    );
+    let FlagsInfoMaps {
+        per_cell_fill: flags_per_cell_fill,
+        per_result_single_fill: flags_per_result_single_fill,
+        per_param_count: flags_per_param_count,
+        per_result_count: flags_per_result_count,
+    } = build_flags_info_maps(&per_func, &flags_strings, &mut flags_scratch_iter);
     debug_assert!(
         flags_scratch_iter.next().is_none(),
         "flags scratch reservations must be consumed exactly once per Cell::Flags",
@@ -494,16 +492,8 @@ pub(super) fn lay_out_static_memory(
     place_segment(&mut layout, &mut symbols, &mut relocs, enum_segment);
     place_segment(&mut layout, &mut symbols, &mut relocs, tuple_indices_seg);
 
-    // Runtime-filled entry segments: place, then back-fill per-cell
-    // slot addresses (only knowable after placement).
-    let flags_entries_base =
-        place_segment(&mut layout, &mut symbols, &mut relocs, flags_entries_seg);
-    back_fill_flags_len_addrs(
-        &mut flags_per_cell_fill,
-        &mut flags_per_result_single_fill,
-        flags_entries_base,
-        &schema.flags_info_layout,
-    );
+    // Runtime-filled variant entries: place + back-fill the per-cell
+    // case-name / payload-value slot addresses.
     let variant_entries_base =
         place_segment(&mut layout, &mut symbols, &mut relocs, variant_entries_seg);
     back_fill_variant_entry_addrs(
@@ -522,11 +512,6 @@ pub(super) fn lay_out_static_memory(
     // per (fn, param | result) via `PerCellIndices::resolve_*`.
     let (enum_per_param, enum_per_result) =
         resolve_param_result_ranges(&symbols, enum_per_param_sym, enum_per_result_sym);
-    let (flags_per_param_range, flags_per_result_range) = resolve_param_result_ranges(
-        &symbols,
-        flags_per_param_range_sym,
-        flags_per_result_range_sym,
-    );
     let (record_per_param_range, record_per_result_range) = resolve_param_result_ranges(
         &symbols,
         record_per_param_range_sym,
@@ -550,7 +535,10 @@ pub(super) fn lay_out_static_memory(
             (0..per_func[fn_idx].params.len())
                 .map(|p_idx| FieldSideTables {
                     enum_infos: enum_per_param[fn_idx][p_idx],
-                    flags_infos: flags_per_param_range[fn_idx][p_idx],
+                    flags_infos: BlobSlice {
+                        off: 0,
+                        len: flags_per_param_count[fn_idx][p_idx],
+                    },
                     record_infos: record_per_param_range[fn_idx][p_idx],
                     variant_infos: variant_per_param_range[fn_idx][p_idx],
                     handle_infos: BlobSlice {
@@ -564,7 +552,10 @@ pub(super) fn lay_out_static_memory(
     let result_side_tables: Vec<FieldSideTables> = (0..n_funcs)
         .map(|fn_idx| FieldSideTables {
             enum_infos: enum_per_result[fn_idx],
-            flags_infos: flags_per_result_range[fn_idx],
+            flags_infos: BlobSlice {
+                off: 0,
+                len: flags_per_result_count[fn_idx],
+            },
             record_infos: record_per_result_range[fn_idx],
             variant_infos: variant_per_result_range[fn_idx],
             handle_infos: BlobSlice {
@@ -692,6 +683,7 @@ pub(super) fn lay_out_static_memory(
                         lift,
                         cell_side,
                         handle_count: handle_per_param_count[i][p_idx],
+                        flags_count: flags_per_param_count[i][p_idx],
                     }
                 })
                 .collect();
@@ -731,6 +723,7 @@ pub(super) fn lay_out_static_memory(
                 ResultLayout {
                     source: layout_source,
                     handle_count: handle_per_result_count[i],
+                    flags_count: flags_per_result_count[i],
                 }
             });
 

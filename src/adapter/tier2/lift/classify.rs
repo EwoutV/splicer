@@ -134,6 +134,13 @@ pub(crate) struct ParamLayout {
     /// handles the static `len` is patched at runtime, and this is
     /// the seed for the per-list bump in `emit_list_pre_pass`.
     pub handle_count: u32,
+    /// `Cell::Flags` count among the plan's outer cells. Authoritative
+    /// for the static `field_tree.flags_infos.len` bake and the
+    /// static-count `cabi_realloc`. Mirrors [`Self::handle_count`]'s
+    /// shape; the runtime-count regime (with list-element flags
+    /// patching `len` per call) lands when `Cell::Flags` opens in
+    /// `list_element_class`.
+    pub flags_count: u32,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -148,6 +155,11 @@ pub(crate) struct ResultLayout {
     /// 1 for a `Direct(Handle)` result, else the number of outer
     /// `Cell::Handle` in `Compound::compound.plan.cells`.
     pub handle_count: u32,
+    /// Result-side counterpart of [`ParamLayout::flags_count`]:
+    /// 1 for a `Direct(Flags)` result, else the number of outer
+    /// `Cell::Flags` in the compound plan. Same static-vs-runtime
+    /// distinction as [`ParamLayout::flags_count`].
+    pub flags_count: u32,
 }
 
 pub(crate) enum ResultSourceLayout {
