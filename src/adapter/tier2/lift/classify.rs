@@ -127,6 +127,12 @@ pub(crate) struct ParamLayout {
     /// holding the side-table bookkeeping the emit phase needs (idx,
     /// blob slice, runtime-fill, …) for cells whose kind has any.
     pub cell_side: Vec<CellSideData>,
+    /// `Cell::Handle` count in `lift.plan.cells`. Drives both the
+    /// static `field_tree.handle_infos.len` (baked at layout time) and
+    /// the wrapper-body's per-call `cabi_realloc` size for the same
+    /// buffer — single source of truth, sourced from
+    /// [`super::sidetable::handle_info::HandleInfoMaps::per_param_count`].
+    pub handle_count: u32,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -137,6 +143,13 @@ pub(crate) struct ParamLayout {
 /// pre-layout `side_table` directly).
 pub(crate) struct ResultLayout {
     pub source: ResultSourceLayout,
+    /// `Cell::Handle` count in the result's plan: 1 for `Direct`
+    /// when the cell is a `Handle`, else the number of `Cell::Handle`
+    /// in `Compound::compound.plan.cells`. Drives the static
+    /// `field_tree.handle_infos.len` + the wrapper-body's per-call
+    /// `cabi_realloc` size — single source of truth, sourced from
+    /// [`super::sidetable::handle_info::HandleInfoMaps::per_result_count`].
+    pub handle_count: u32,
 }
 
 pub(crate) enum ResultSourceLayout {

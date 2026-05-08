@@ -17,14 +17,13 @@ use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, Segment, SymRef, SymbolBases};
 use super::lift::plan::Cell;
 use super::lift::{
-    back_fill_flags_len_addrs, back_fill_handle_id_addrs, back_fill_variant_entry_addrs,
-    build_char_scratch_map, build_enum_info_blob, build_flags_info_blob, build_handle_info_blob,
-    build_record_info_blob, build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes,
-    flags_scratch_sizes, fold_cell_side_data, register_enum_strings, register_flags_strings,
-    register_variant_strings, CellFillSources, CellSideData, CharScratch, CharScratchMaps,
-    FlagsInfoBlobs, FlagsRuntimeFill, HandleInfoBlobs, HandleRuntimeFill, ParamLayout,
-    RecordInfoBlobs, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
-    TupleIndicesBlob, VariantInfoBlobs,
+    back_fill_flags_len_addrs, back_fill_variant_entry_addrs, build_char_scratch_map,
+    build_enum_info_blob, build_flags_info_blob, build_handle_info_maps, build_record_info_blob,
+    build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes,
+    fold_cell_side_data, register_enum_strings, register_flags_strings, register_variant_strings,
+    CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoBlobs, FlagsRuntimeFill,
+    HandleInfoMaps, HandleRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
+    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -420,7 +419,6 @@ pub(super) fn lay_out_static_memory(
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
     let variant_info_id = symbols.alloc();
-    let handle_info_id = symbols.alloc();
     let enum_info = build_enum_info_blob(
         &per_func,
         &enum_strings,
@@ -478,13 +476,15 @@ pub(super) fn lay_out_static_memory(
         &schema.variant_info_layout,
         variant_info_id,
     );
-    let HandleInfoBlobs {
-        entries: handle_entries_seg,
-        per_param_range: handle_per_param_range_sym,
-        per_result_range: handle_per_result_range_sym,
-        per_cell_fill: mut handle_per_cell_fill,
-        per_result_single_fill: mut handle_per_result_single_fill,
-    } = build_handle_info_blob(&per_func, &schema.handle_info_layout, handle_info_id);
+    // Handle-info doesn't pre-bake a static segment — the wrapper
+    // body allocates a per-(fn, param | result) buffer per call,
+    // writes type-name + id, and patches `field_tree.handle_infos`.
+    let HandleInfoMaps {
+        per_cell_fill: handle_per_cell_fill,
+        per_result_single_fill: handle_per_result_single_fill,
+        per_param_count: handle_per_param_count,
+        per_result_count: handle_per_result_count,
+    } = build_handle_info_maps(&per_func);
 
     // Order doesn't matter for correctness — each placement assigns
     // a base, relocs land later. Coalesced same-alignment segments
@@ -512,14 +512,9 @@ pub(super) fn lay_out_static_memory(
         &schema.variant_info_layout,
         schema.variant_info_payload_value_off,
     );
-    let handle_entries_base =
-        place_segment(&mut layout, &mut symbols, &mut relocs, handle_entries_seg);
-    back_fill_handle_id_addrs(
-        &mut handle_per_cell_fill,
-        &mut handle_per_result_single_fill,
-        handle_entries_base,
-        &schema.handle_info_layout,
-    );
+    // Handle-info: no static segment to place; fills already carry
+    // their (range-relative) `side_table_idx` and per-cell `type-name`,
+    // and the per-call buffer is allocated in the wrapper body.
 
     // Resolve per-(fn, param) and per-fn `SymRef`s to absolute
     // `BlobSlice`s now that every segment has a base. Tuple-indices
@@ -542,11 +537,10 @@ pub(super) fn lay_out_static_memory(
         variant_per_param_range_sym,
         variant_per_result_range_sym,
     );
-    let (handle_per_param_range, handle_per_result_range) = resolve_param_result_ranges(
-        &symbols,
-        handle_per_param_range_sym,
-        handle_per_result_range_sym,
-    );
+    // handle-infos has no static entries segment — the wrapper body
+    // allocates a per-call buffer and patches `handle_infos.ptr`. The
+    // `len` is build-time-const (entry count per (fn, param | result)),
+    // baked into the static field-tree below.
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
@@ -559,7 +553,10 @@ pub(super) fn lay_out_static_memory(
                     flags_infos: flags_per_param_range[fn_idx][p_idx],
                     record_infos: record_per_param_range[fn_idx][p_idx],
                     variant_infos: variant_per_param_range[fn_idx][p_idx],
-                    handle_infos: handle_per_param_range[fn_idx][p_idx],
+                    handle_infos: BlobSlice {
+                        off: 0,
+                        len: handle_per_param_count[fn_idx][p_idx],
+                    },
                 })
                 .collect()
         })
@@ -570,7 +567,10 @@ pub(super) fn lay_out_static_memory(
             flags_infos: flags_per_result_range[fn_idx],
             record_infos: record_per_result_range[fn_idx],
             variant_infos: variant_per_result_range[fn_idx],
-            handle_infos: handle_per_result_range[fn_idx],
+            handle_infos: BlobSlice {
+                off: 0,
+                len: handle_per_result_count[fn_idx],
+            },
         })
         .collect();
 
@@ -688,7 +688,11 @@ pub(super) fn lay_out_static_memory(
                         handle_fill: handle_per_cell_fill.for_param(i, p_idx),
                     };
                     let cell_side = fold_cell_side_data(&lift.plan, &sources);
-                    ParamLayout { lift, cell_side }
+                    ParamLayout {
+                        lift,
+                        cell_side,
+                        handle_count: handle_per_param_count[i][p_idx],
+                    }
                 })
                 .collect();
 
@@ -726,6 +730,7 @@ pub(super) fn lay_out_static_memory(
                 };
                 ResultLayout {
                     source: layout_source,
+                    handle_count: handle_per_result_count[i],
                 }
             });
 

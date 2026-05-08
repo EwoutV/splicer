@@ -51,8 +51,10 @@ pub(super) const FLAGS_INFO_SET_FLAGS: &str = "set-flags";
 /// `payload` are runtime-filled per call.
 pub(super) const VARIANT_INFO_CASE_NAME: &str = "case-name";
 pub(super) const VARIANT_INFO_PAYLOAD: &str = "payload";
-/// Field name on `record handle-info { … }` for the (runtime-filled)
-/// opaque correlation id. `type-name` is baked at build time.
+/// Field names on `record handle-info { … }`. `type-name` is
+/// build-time-const (one BlobSlice per `Cell::Handle`); `id` is
+/// runtime-zero-extended from the i32 handle bits per call.
+pub(super) const HANDLE_INFO_TYPE_NAME: &str = "type-name";
 pub(super) const HANDLE_INFO_ID: &str = "id";
 /// Field name on `record record-info { … }` for the (name, cell-idx)
 /// tuple list.

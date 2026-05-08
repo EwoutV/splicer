@@ -9,8 +9,8 @@ use wit_parser::{Resolve, SizeAlign};
 use super::super::super::abi::cast;
 use super::super::super::abi::emit::{
     direct_return_type, emit_bitcast, emit_cabi_realloc_call_runtime, wasm_type_to_val,
-    I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, MAX_UTF8_LEN, OPTION_NONE,
-    OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
+    RecordLayout, I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, MAX_UTF8_LEN,
+    OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
 use super::super::super::abi::flat_types;
 use super::super::super::abi::WasmEncoderBindgen;
@@ -122,6 +122,24 @@ pub(crate) struct WrapperLocals {
     /// Running cell-index counter driving the per-plan pre-pass;
     /// holds `total_cells` after the pass. Reused across plans.
     pub next_cell_idx: u32,
+    /// Base address of the active plan's handle-info buffer.
+    /// `Some` iff [`fn_has_handle_cells`] holds; `None` for
+    /// handle-free wrappers (saves the local).
+    ///
+    /// **Stage-then-consume invariant.** Single shared local, set by
+    /// the wrapper body via `emit_alloc_handle_info_for_plan`
+    /// immediately before that plan's [`emit_lift_plan`] /
+    /// [`emit_lift_result`] runs, and consumed only by
+    /// [`emit_handle_runtime_fill`]. The "leave the local stale
+    /// between plans" claim is load-bearing on (1) only `Cell::Handle`
+    /// reads it — no other cell variant in `emit_cell_op` /
+    /// `emit_single_slot_cell` touches `lcl.handle_info_base`; and
+    /// (2) per-plan alloc happens immediately before the plan's lift
+    /// body — no interleaved emit between alloc and use. A future
+    /// refactor that interleaves handle-fills outside `emit_lift_plan`,
+    /// or adds a non-handle reader, must restage (or split into one
+    /// local per plan).
+    pub handle_info_base: Option<u32>,
     /// Per-param list emit locals. `param_list_locals[i]` is parallel
     /// to `params[i].lift.plan.list_specs()`; empty for list-free params.
     pub param_list_locals: Vec<Vec<ListEmitLocals>>,
@@ -169,12 +187,40 @@ pub(crate) struct CellSideRefs<'a> {
 }
 
 /// Per-build context shared across every lift emit in a wrapper.
-/// Bundles `cell_layout` + `cabi_realloc_idx` so per-call helpers
-/// don't repeat them in every signature.
+/// Bundles `cell_layout` + `cabi_realloc_idx` + handle-info offsets
+/// so per-call helpers don't repeat them in every signature.
 #[derive(Clone, Copy)]
 pub(crate) struct LiftEmitCtx<'a> {
     pub cell_layout: &'a CellLayout,
     pub cabi_realloc_idx: u32,
+    /// Pre-resolved handle-info entry geometry. Hoisted out of
+    /// [`emit_handle_runtime_fill`] so the per-cell emit doesn't pay
+    /// `RecordLayout::offset_of` (linear field-name walk) per call —
+    /// resolved once per wrapper from `schema.handle_info_layout`.
+    pub handle_info: HandleInfoOffsets,
+}
+
+/// Build-time-resolved geometry of one `record handle-info` entry.
+/// `entry_size` drives the per-call buffer alloc; `type_name_off` /
+/// `id_off` drive the per-cell field writes inside the slot.
+#[derive(Clone, Copy)]
+pub(crate) struct HandleInfoOffsets {
+    pub entry_size: u32,
+    pub align: u32,
+    pub type_name_off: u32,
+    pub id_off: u32,
+}
+
+impl HandleInfoOffsets {
+    pub(crate) fn from_layout(layout: &RecordLayout) -> Self {
+        use super::super::schema::{HANDLE_INFO_ID, HANDLE_INFO_TYPE_NAME};
+        Self {
+            entry_size: layout.size,
+            align: layout.align,
+            type_name_off: layout.offset_of(HANDLE_INFO_TYPE_NAME),
+            id_off: layout.offset_of(HANDLE_INFO_ID),
+        }
+    }
 }
 
 /// Per-plan-walk cursor: the plan being emitted and the wrapper-local
@@ -360,6 +406,19 @@ fn fn_contains_char(fd: &FuncDispatch) -> bool {
     } else {
         false
     }
+}
+
+/// Any `Cell::Handle` in the wrapper (params or result). Gates
+/// `WrapperLocals.handle_info_base` so handle-free wrappers don't
+/// allocate the local. Reads the layout-phase `handle_count` —
+/// single source of truth (see `ParamLayout.handle_count` /
+/// `ResultLayout.handle_count`).
+fn fn_has_handle_cells(fd: &FuncDispatch) -> bool {
+    fd.params.iter().any(|p| p.handle_count > 0)
+        || fd
+            .result_lift
+            .as_ref()
+            .is_some_and(|rl| rl.handle_count > 0)
 }
 
 /// Per-class counts collected by [`walk_element_plan`]. Drives the
@@ -572,6 +631,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
     let next_cell_idx = builder.alloc_local(ValType::I32);
+    let handle_info_base = fn_has_handle_cells(fd).then(|| builder.alloc_local(ValType::I32));
 
     let frozen = builder.freeze();
     (
@@ -598,6 +658,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             saved_bump,
             cells_base,
             next_cell_idx,
+            handle_info_base,
             param_list_locals,
         },
         result_emit,
@@ -872,25 +933,25 @@ fn emit_cell_op(
         | Cell::Char { flat_slot }
         | Cell::Handle { flat_slot, .. } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I32, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
+            emit_single_slot_cell(f, ctx, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::Integer64 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::I64, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
+            emit_single_slot_cell(f, ctx, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::FloatingF32 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F32, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
+            emit_single_slot_cell(f, ctx, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::FloatingF64 { flat_slot } => {
             let src = pin_leaf_flat(f, plan, local_base, *flat_slot, WasmType::F64, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
+            emit_single_slot_cell(f, ctx, op, side_data, src, lcl, elem_cell_base);
         }
         Cell::Option { disc_slot, .. }
         | Cell::Result { disc_slot, .. }
         | Cell::Variant { disc_slot, .. } => {
             let src = pin_leaf_flat(f, plan, local_base, *disc_slot, WasmType::I32, lcl);
-            emit_single_slot_cell(f, cell_layout, op, side_data, src, lcl, elem_cell_base);
+            emit_single_slot_cell(f, ctx, op, side_data, src, lcl, elem_cell_base);
         }
         // Two-flat-slot kinds.
         Cell::Text { ptr_slot, len_slot } => {
@@ -941,7 +1002,7 @@ fn emit_cell_op(
 /// Option/Result child indices via `stage_child_idx_source`.
 fn emit_single_slot_cell(
     f: &mut Function,
-    cell_layout: &CellLayout,
+    ctx: &LiftEmitCtx<'_>,
     cell: &Cell,
     side_data: &CellSideData,
     source: u32,
@@ -949,6 +1010,7 @@ fn emit_single_slot_cell(
     elem_cell_base: Option<u32>,
 ) {
     let addr = lcl.addr;
+    let cell_layout = ctx.cell_layout;
     match cell {
         Cell::Bool { .. } => cell_layout.emit_bool(f, addr, source),
         Cell::IntegerSignExt { .. } => {
@@ -1004,7 +1066,7 @@ fn emit_single_slot_cell(
             let CellSideData::Handle(fill) = side_data else {
                 panic!("Handle cell paired with non-Handle side data {side_data:?}");
             };
-            emit_handle_runtime_fill(f, source, fill);
+            emit_handle_runtime_fill(f, source, fill, lcl, ctx.handle_info);
             cell_layout.emit_handle_cell(
                 f,
                 addr,
@@ -1403,18 +1465,52 @@ fn emit_stage_char_scratch_addr(
     f.instructions().local_set(scratch_addr_local);
 }
 
-/// Patch one `Cell::Handle`'s `id: u64` slot per call: zero-extend
-/// the i32 handle bits. Per-instance correlation (same bits → same
-/// id) — see `handle-info` in `wit/common/world.wit`.
-fn emit_handle_runtime_fill(f: &mut Function, handle_local: u32, fill: &HandleRuntimeFill) {
-    let id_addr = fill
-        .id_addr
-        .expect("id_addr unset — layout must run back_fill_handle_id_addrs");
-    f.instructions().i32_const(id_addr);
+/// Fill one `Cell::Handle`'s slot in the per-call handle-info buffer:
+/// write build-time-const `type-name` (off + len) and runtime
+/// zero-extended `id` at `handle_info_base + side_table_idx * sizeof`.
+/// Per-instance correlation (same bits → same id) — see `handle-info`
+/// in `wit/common/world.wit`.
+fn emit_handle_runtime_fill(
+    f: &mut Function,
+    handle_local: u32,
+    fill: &HandleRuntimeFill,
+    lcl: &WrapperLocals,
+    info: HandleInfoOffsets,
+) {
+    let base_local = lcl.handle_info_base.expect(
+        "handle_info_base local unset on a wrapper containing Cell::Handle — \
+         fn_has_handle_cells gate must agree with the cells reaching \
+         emit_handle_runtime_fill",
+    );
+    let entry_off = fill.side_table_idx * info.entry_size;
+    let type_name_off = entry_off + info.type_name_off;
+    let id_off = entry_off + info.id_off;
+
+    let store_i32 = |f: &mut Function, off: u32, value: i32| {
+        f.instructions().local_get(base_local);
+        f.instructions().i32_const(value);
+        f.instructions().i32_store(MemArg {
+            offset: off as u64,
+            align: I32_STORE_LOG2_ALIGN,
+            memory_index: 0,
+        });
+    };
+    store_i32(
+        f,
+        type_name_off + SLICE_PTR_OFFSET,
+        fill.type_name.off as i32,
+    );
+    store_i32(
+        f,
+        type_name_off + SLICE_LEN_OFFSET,
+        fill.type_name.len as i32,
+    );
+
+    f.instructions().local_get(base_local);
     f.instructions().local_get(handle_local);
     f.instructions().i64_extend_i32_u();
     f.instructions().i64_store(MemArg {
-        offset: 0,
+        offset: id_off as u64,
         align: I64_STORE_LOG2_ALIGN,
         memory_index: 0,
     });
@@ -1571,7 +1667,7 @@ fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRu
 /// into synthetic locals.
 pub(crate) fn emit_lift_result(
     f: &mut Function,
-    cell_layout: &CellLayout,
+    ctx: &LiftEmitCtx<'_>,
     plan: &ResultEmitPlan<'_>,
     lcl: &WrapperLocals,
 ) {
@@ -1590,7 +1686,7 @@ pub(crate) fn emit_lift_result(
                 ),
                 "Direct result reached emit_lift_result with Compound-only cell {cell:?}",
             );
-            emit_single_slot_cell(f, cell_layout, cell, side_data, *source_local, lcl, None);
+            emit_single_slot_cell(f, ctx, cell, side_data, *source_local, lcl, None);
         }
         ResultEmitPlan::Compound { .. } | ResultEmitPlan::None => unreachable!(
             "Compound is emitted via emit_lift_compound_prefix + emit_lift_plan; \

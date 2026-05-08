@@ -276,13 +276,45 @@ payload is sourced from a wasm local or an `i32.const`:
 |---|---|---|
 | `enum-case` | the runtime disc — N entries laid out per type, one per case, in disc order | `Local(disc)` |
 | `record-of` | allocated by the side-table builder — one entry per *plan cell* of kind `RecordOf` | `ConstI32(idx)` |
-| `flags-set` | one entry per *runtime value* (set-bits-by-name); per-call cabi_realloc | TBD when flags lands |
-| `variant-case` | the runtime disc — entries laid out per type, one per case | `Local(disc)` (probably) |
-| `resource-handle` etc. | one entry per *handle id* observed at runtime | TBD when handles land |
+| `flags-set` | allocated by the side-table builder — one entry per `Cell::Flags` cell; entries hold a per-call `set-flags` name list filled inline by the bit-walker | `ConstI32(idx)` |
+| `variant-case` | allocated by the side-table builder — one entry per `Cell::Variant` cell; entries hold runtime-filled `case-name` + `payload` | `ConstI32(idx)` |
+| `*-handle` (own/borrow/stream/future/error-context) | range-relative position inside the per-(fn, param \| result) `handle-info` buffer | `ConstI32(idx)` |
 
 `cells.rs::PayloadSource::{Local, ConstI32}` discriminates these at
 the byte-emission level — the lift-codegen layer chooses the source
 based on the `CellOp`'s static-vs-dynamic semantics.
+
+### Where side-table entries live: static vs per-call
+
+Two storage policies exist for side-table entry data, picked per
+kind:
+
+- **Static segment, runtime-filled fields.** Most kinds (enum-info,
+  record-info, flags-info, variant-info) bake the entry records at
+  layout time into a data segment. Build-time-const fields (type-name,
+  case-name lists, child-cell indices) are written once; runtime-
+  varying fields (flags `set-flags`, variant `case-name` + `payload`,
+  …) get patched per call. The `field-tree`'s `<kind>-infos` slice is
+  baked statically with both `(ptr, len)` populated.
+- **Per-call buffer, fully runtime-written.** `handle-info` entries
+  live in a `cabi_realloc`'d slab the wrapper body allocates per call
+  and writes both `type-name` (build-time-const) and `id` (runtime-
+  zero-extended) into. The `field-tree`'s `handle-infos.len` is baked
+  statically (count is known at build time per (fn, param | result));
+  `handle-infos.ptr` is patched per call.
+
+**Rule.** A side-table kind moves to the per-call policy as soon as
+*any* element-plan can introduce a list-of-that-kind: the entry count
+becomes len-dependent and a static segment can't size it. Today only
+`handle-info` is per-call (prep for `list<own<R>>` / `list<error-
+context>` etc.). When `list<flags>` lands the flags-info entries
+follow the same migration; same for any future list-of-side-tabled
+kind.
+
+Per-call storage costs ~7 wasm instructions and one extra
+`cabi_realloc` per (fn, param | result) with that kind, even when the
+list-of-form isn't in play. The tradeoff favors uniform shape over
+the few instructions saved by a hybrid path.
 
 ---
 

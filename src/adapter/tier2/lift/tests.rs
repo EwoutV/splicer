@@ -310,6 +310,27 @@ fn synth_cell_layout() -> CellLayout {
     CellLayout::from_resolve(&sizes, &resolve, cell_id)
 }
 
+/// Synthesize the `record handle-info` `RecordLayout` from the live
+/// common WIT — same ergonomics as [`synth_cell_layout`]. Drives the
+/// validator fixture's `LiftEmitCtx.handle_info_layout`.
+fn synth_handle_info_layout() -> RecordLayout {
+    let common_wit = include_str!("../../../../wit/common/world.wit");
+    let mut resolve = Resolve::new();
+    resolve
+        .push_str("common.wit", common_wit)
+        .expect("wit/common/world.wit must parse");
+    let common_id =
+        super::super::test_utils::iface_by_unversioned_qname(&resolve, "splicer:common/types");
+    let handle_info_id = resolve.interfaces[common_id]
+        .types
+        .get("handle-info")
+        .copied()
+        .expect("splicer:common/types must export `handle-info`");
+    let mut sizes = SizeAlign::default();
+    sizes.fill(&resolve);
+    RecordLayout::for_record_typedef(&sizes, &resolve, handle_info_id)
+}
+
 /// Wasm `ValType` per flat slot — sourced from the canonical-ABI
 /// `flat_types(plan.source_ty)`, the same computation canon-lower runs
 /// to produce the wrapper's flat-param signature. Joined-flat widening
@@ -352,7 +373,6 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     let mut variant_idx: u32 = 0;
     let mut char_cursor: u32 = 0x3000;
     let mut handle_idx: u32 = 0;
-    let mut handle_id_cursor: u32 = 0x4000;
     plan.cells
         .iter()
         .map(|op| match op {
@@ -432,15 +452,10 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                     },
                 }
             }
-            Cell::Handle { .. } => {
-                /// Bytes per `handle-info.id` (u64, 8-aligned).
-                const U64_BYTES: u32 = 8;
-                let id_addr = handle_id_cursor;
-                handle_id_cursor += U64_BYTES;
+            Cell::Handle { type_name, .. } => {
                 let fill = HandleRuntimeFill {
                     side_table_idx: handle_idx,
-                    entry_seg_off: 0, // not exercised by the validator fixture
-                    id_addr: Some(id_addr as i32),
+                    type_name: *type_name,
                 };
                 handle_idx += 1;
                 CellSideData::Handle(Box::new(fill))
@@ -474,6 +489,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let mut sizes = SizeAlign::default();
     sizes.fill(resolve);
     let cell_layout = synth_cell_layout();
+    let handle_info_layout = synth_handle_info_layout();
     let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan, resolve);
     let n = plan.flat_slot_count;
@@ -499,6 +515,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
     let next_cell_idx = builder.alloc_local(ValType::I32);
+    let handle_info_base = builder.alloc_local(ValType::I32);
     let list_locals = super::emit::alloc_list_emit_locals(plan, resolve, &sizes, &mut builder);
     let FrozenLocals { locals } = builder.freeze();
 
@@ -519,6 +536,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         tuple_slot_ptr: Some(tuple_slot_ptr),
         cells_base,
         next_cell_idx,
+        handle_info_base: Some(handle_info_base),
         result: None,
         tr_addr: None,
         id_local,
@@ -566,6 +584,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let lift_ctx = super::emit::LiftEmitCtx {
         cell_layout: &cell_layout,
         cabi_realloc_idx: 0,
+        handle_info: super::emit::HandleInfoOffsets::from_layout(&handle_info_layout),
     };
     emit_lift_plan(
         &mut f,

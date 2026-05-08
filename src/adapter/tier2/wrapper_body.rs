@@ -34,10 +34,12 @@ use super::super::indices::LocalsBuilder;
 use super::lift::plan::LiftPlan;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    emit_list_pre_pass, CellSideRefs, LiftEmitCtx, ListEmitLocals, ResultEmitPlan, WrapperLocals,
+    emit_list_pre_pass, CellSideRefs, HandleInfoOffsets, LiftEmitCtx, ListEmitLocals,
+    ResultEmitPlan, WrapperLocals,
 };
 use super::schema::{
     SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
+    TREE_HANDLE_INFOS,
 };
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
@@ -135,18 +137,60 @@ fn emit_alloc_cells_for_plan(
     );
 }
 
-/// Byte offset of the `cells: list<cell>` slice within a `field`
-/// record (relative to the field's base).
-fn field_cells_slice_off(schema: &SchemaLayouts) -> u32 {
-    schema.field_layout.offset_of(FIELD_TREE) + schema.tree_layout.offset_of(TREE_CELLS)
+/// Byte offset of `field.tree.<field_name>` (a `list<...>` slice)
+/// within a `field` record. Pass the field-tree slice constant
+/// (`TREE_CELLS`, `TREE_HANDLE_INFOS`, …); used to address the slice
+/// the wrapper patches per call.
+fn field_tree_slice_off(schema: &SchemaLayouts, tree_field: &str) -> u32 {
+    schema.field_layout.offset_of(FIELD_TREE) + schema.tree_layout.offset_of(tree_field)
 }
 
-/// Byte offset of the `cells: list<cell>` slice within the on-return
-/// params record (relative to the record's base).
-fn after_result_cells_slice_off(schema: &SchemaLayouts, after_layout: &RecordLayout) -> u32 {
+/// Byte offset of `result.<some>.tree.<field_name>` within the
+/// on-return params record. Twin of [`field_tree_slice_off`] for the
+/// after-hook side.
+fn after_result_tree_slice_off(
+    schema: &SchemaLayouts,
+    after_layout: &RecordLayout,
+    tree_field: &str,
+) -> u32 {
     after_layout.offset_of(ON_RET_RESULT)
         + schema.option_payload_off
-        + schema.tree_layout.offset_of(TREE_CELLS)
+        + schema.tree_layout.offset_of(tree_field)
+}
+
+/// Per-call handle-info buffer alloc + slice-ptr patch for one
+/// (param | result) plan. `count` is build-time-const (sourced from
+/// [`super::lift::ParamLayout::handle_count`] / [`super::lift::ResultLayout::handle_count`]
+/// — single source of truth shared with the static `len` baked in
+/// `build_fields_blob` / `build_after_params_blob`). No-op when
+/// `count == 0`; otherwise `lcl.handle_info_base` is required (the
+/// `fn_has_handle_cells` gate ensures it's allocated).
+fn emit_alloc_handle_info_for_plan(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    count: u32,
+    base_ptr: i32,
+    slice_field_off: u32,
+    lcl: &WrapperLocals,
+) {
+    if count == 0 {
+        return;
+    }
+    let base_local = lcl.handle_info_base.expect(
+        "handle_info_base local unset — fn_has_handle_cells gate disagrees \
+         with the per-(param|result) handle_count",
+    );
+    let buf_size = count
+        .checked_mul(ctx.handle_info.entry_size)
+        .expect("handle_info buffer size overflowed u32 — count * entry_size");
+    emit_cabi_realloc_call(
+        f,
+        ctx.cabi_realloc_idx,
+        ctx.handle_info.align,
+        buf_size,
+        base_local,
+    );
+    emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
 /// Write the call-id record + per-call `list<field>` args pointer/len
@@ -205,6 +249,7 @@ pub(super) fn emit_wrapper_function(
     let lift_ctx = LiftEmitCtx {
         cell_layout: &schema.cell_layout,
         cabi_realloc_idx: func_idx.cabi_realloc_idx,
+        handle_info: HandleInfoOffsets::from_layout(&schema.handle_info_layout),
     };
 
     // ── Phase 1: on-call (only if before-hook wired) ──
@@ -213,7 +258,8 @@ pub(super) fn emit_wrapper_function(
         // cumulative cursor as the per-param `local_base` so cell N
         // resolves to absolute wasm-local `local_base + N`.
         let mut local_base: u32 = 0;
-        let cells_slice_off = field_cells_slice_off(schema);
+        let cells_slice_off = field_tree_slice_off(schema, TREE_CELLS);
+        let handle_infos_slice_off = field_tree_slice_off(schema, TREE_HANDLE_INFOS);
         for (i, p) in fd.params.iter().enumerate() {
             let field_off = i as u32 * schema.field_layout.size;
             let list_locals = &lcl.param_list_locals[i];
@@ -228,6 +274,14 @@ pub(super) fn emit_wrapper_function(
                     fields_base_ptr: fd.fields_buf_offset as i32,
                     cells_field_off: field_off + cells_slice_off,
                 },
+            );
+            emit_alloc_handle_info_for_plan(
+                &mut f,
+                &lift_ctx,
+                p.handle_count,
+                fd.fields_buf_offset as i32,
+                field_off + handle_infos_slice_off,
+                &lcl,
             );
             emit_lift_plan(
                 &mut f,
@@ -319,7 +373,14 @@ pub(super) fn emit_wrapper_function(
         _ => unreachable!("after-hook ctx and per-fn data are wired in lockstep"),
     };
     if let Some((after_static, after_pf)) = after_zip {
-        let cells_field_off = after_result_cells_slice_off(schema, after_static.layout);
+        let cells_field_off = after_result_tree_slice_off(schema, after_static.layout, TREE_CELLS);
+        let handle_infos_field_off =
+            after_result_tree_slice_off(schema, after_static.layout, TREE_HANDLE_INFOS);
+        let result_handle_count = fd
+            .result_lift
+            .as_ref()
+            .map(|rl| rl.handle_count)
+            .unwrap_or(0);
         match &result_emit {
             ResultEmitPlan::Compound {
                 plan,
@@ -353,6 +414,14 @@ pub(super) fn emit_wrapper_function(
                         cells_field_off,
                     },
                 );
+                emit_alloc_handle_info_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    result_handle_count,
+                    after_pf.params_offset,
+                    handle_infos_field_off,
+                    &lcl,
+                );
                 // Synth locals are contiguous; `synth_locals[0]`
                 // is the plan's `local_base`.
                 emit_lift_plan(
@@ -381,9 +450,17 @@ pub(super) fn emit_wrapper_function(
                     cells_field_off,
                     lcl.cells_base,
                 );
+                emit_alloc_handle_info_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    result_handle_count,
+                    after_pf.params_offset,
+                    handle_infos_field_off,
+                    &lcl,
+                );
                 f.instructions().local_get(lcl.cells_base);
                 f.instructions().local_set(lcl.addr);
-                emit_lift_result(&mut f, &schema.cell_layout, &result_emit, &lcl);
+                emit_lift_result(&mut f, &lift_ctx, &result_emit, &lcl);
             }
             ResultEmitPlan::None => {}
         }

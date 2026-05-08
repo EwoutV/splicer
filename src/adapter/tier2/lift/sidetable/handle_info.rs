@@ -1,139 +1,128 @@
-//! Handle-info side-table builder. One entry per `Cell::Handle`
-//! appearance (own/borrow/stream/future all share this side-table —
-//! only the cell-disc differs). `type-name` is baked at plan-build
-//! time; only `id: u64` is runtime-filled (zero-extension of the
-//! i32 handle bits).
+//! Handle-info layout. One entry per `Cell::Handle` appearance
+//! (own/borrow/stream/future/error-context all share — only the
+//! cell-disc differs). Entries live in a per-(fn, param | result)
+//! buffer the wrapper allocates per call via `cabi_realloc`; the
+//! emitter writes the build-time-const `type-name` and the
+//! runtime-zero-extended `id` into each slot.
+//! `field_tree.handle_infos` is patched at runtime to point at the
+//! buffer.
+//!
+//! Per-call (vs. baked-in-static) is forced by `list<own<R>>` /
+//! `list<error-context>` etc.: the count is len-dependent and
+//! `field_tree.handle_infos` must span all entries contiguously.
 
-use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
-use super::super::super::schema::HANDLE_INFO_ID;
+use super::super::super::super::abi::emit::BlobSlice;
 use super::super::super::FuncClassified;
 use super::super::classify::ResultSource;
-use super::super::plan::Cell;
-use super::{
-    back_fill_per_cell, build_per_cell_side_table, CellEntryWriter, PerCellIndices,
-    PerCellSideTableBlob, INFO_TYPE_NAME,
-};
+use super::super::plan::{Cell, LiftPlan};
+use super::PerCellIndices;
 
-/// Per-(plan-cell) emit-phase data for one `Cell::Handle`.
+/// Per-(plan-cell) emit-phase data for one `Cell::Handle`. Both
+/// fields are build-time-known; the runtime work is just writing
+/// `type-name` + `id` into the per-call buffer at offset
+/// `side_table_idx * sizeof(handle_info)`.
 #[derive(Clone, Debug)]
 pub(crate) struct HandleRuntimeFill {
-    /// Range-relative index — the `cell::{resource,stream,future}-handle(u32)`
-    /// payload. Which cell-disc emits is picked from the cell's
-    /// `kind` at emit time.
+    /// Range-relative position within this (fn, param | result)'s
+    /// handle-info buffer. The wrapper writes
+    /// `cell::*-handle(side_table_idx)` as the cell payload.
     pub side_table_idx: u32,
-    /// Entry's byte offset within the entries segment. Combined with
-    /// `entries_base` by [`back_fill_id_addrs`] (range-relative
-    /// `side_table_idx` alone won't recover the absolute slot).
-    pub entry_seg_off: u32,
-    /// Absolute address of the `id: u64` slot. `None` until back-fill;
-    /// emit-time `expect` turns missed back-fill into a build panic.
-    pub id_addr: Option<i32>,
+    /// `(off, len)` into the shared name blob. Build-time-const per
+    /// cell; the wrapper writes it into the per-call buffer slot.
+    pub type_name: BlobSlice,
 }
 
-pub(crate) struct HandleInfoBlobs {
-    pub entries: Segment,
-    pub per_param_range: Vec<Vec<Option<SymRef>>>,
-    pub per_result_range: Vec<Option<SymRef>>,
+pub(crate) struct HandleInfoMaps {
+    /// Per-cell fills for plan walks (param + compound result).
     pub per_cell_fill: PerCellIndices<HandleRuntimeFill>,
-    /// Per-fn fill for a Direct (sync flat) `Cell::Handle` result —
-    /// no plan to attach it to since `lcl.result` is the source.
-    /// Retptr-loaded handle results route through Compound and
-    /// register via `per_cell_fill`.
+    /// Per-fn fill for a Direct (sync flat) `Cell::Handle` result.
+    /// `Some` exactly when the fn's result classifies as
+    /// `Direct(Cell::Handle)`.
     pub per_result_single_fill: Vec<Option<HandleRuntimeFill>>,
+    /// Number of handle entries per (fn, param). `0` when the param
+    /// has no handle cells. Drives the per-call buffer size.
+    pub per_param_count: Vec<Vec<u32>>,
+    /// Number of handle entries in each fn's result buffer (compound
+    /// or single-cell direct). `0` when no handle cells in the
+    /// result lift.
+    pub per_result_count: Vec<u32>,
 }
 
-/// One `handle-info` entry per `Cell::Handle` (param plan, compound
-/// result plan, or Direct sync-flat handle result).
-pub(crate) fn build_handle_info_blob(
-    per_func: &[FuncClassified],
-    entry_layout: &RecordLayout,
-    entries_id: SymbolId,
-) -> HandleInfoBlobs {
-    let mut writer = HandleEntryWriter { entry_layout };
-    let PerCellSideTableBlob {
-        entries,
-        per_param_range,
-        per_result_range,
-        per_cell_fill,
+/// Walk every (fn, param | compound-result | direct-handle-result)
+/// to collect per-cell `HandleRuntimeFill`s and per-(fn, param | result)
+/// entry counts. No segment is built — entries are written into a
+/// per-call `cabi_realloc`'d buffer at emit time.
+pub(crate) fn build_handle_info_maps(per_func: &[FuncClassified]) -> HandleInfoMaps {
+    let mut per_param_fill: Vec<Vec<Vec<Option<HandleRuntimeFill>>>> =
+        Vec::with_capacity(per_func.len());
+    let mut per_param_count: Vec<Vec<u32>> = Vec::with_capacity(per_func.len());
+    let mut per_result_fill: Vec<Vec<Option<HandleRuntimeFill>>> =
+        Vec::with_capacity(per_func.len());
+    let mut per_result_count: Vec<u32> = Vec::with_capacity(per_func.len());
+    let mut per_result_single_fill: Vec<Option<HandleRuntimeFill>> =
+        Vec::with_capacity(per_func.len());
+    for fd in per_func {
+        let mut params_fill = Vec::with_capacity(fd.params.len());
+        let mut params_count = Vec::with_capacity(fd.params.len());
+        for p in &fd.params {
+            let (fill, count) = scan_plan(&p.plan);
+            params_fill.push(fill);
+            params_count.push(count);
+        }
+        per_param_fill.push(params_fill);
+        per_param_count.push(params_count);
+        let (result_fill, result_count, single) = match fd.result_lift.as_ref() {
+            Some(rl) => match rl.compound() {
+                Some(c) => {
+                    let (fill, count) = scan_plan(&c.plan);
+                    (fill, count, None)
+                }
+                None => match &rl.source {
+                    // A `ResultSource::Direct(Cell::Handle)` is always exactly
+                    // one entry: a single flat result lifts into a single cell.
+                    // Multi-handle direct returns aren't representable today.
+                    ResultSource::Direct(Cell::Handle { type_name, .. }) => (
+                        Vec::new(),
+                        1,
+                        Some(HandleRuntimeFill {
+                            side_table_idx: 0,
+                            type_name: *type_name,
+                        }),
+                    ),
+                    _ => (Vec::new(), 0, None),
+                },
+            },
+            None => (Vec::new(), 0, None),
+        };
+        per_result_fill.push(result_fill);
+        per_result_count.push(result_count);
+        per_result_single_fill.push(single);
+    }
+    HandleInfoMaps {
+        per_cell_fill: PerCellIndices {
+            per_param: per_param_fill,
+            per_result: per_result_fill,
+        },
         per_result_single_fill,
-    } = build_per_cell_side_table(per_func, entry_layout, entries_id, &mut writer);
-    HandleInfoBlobs {
-        entries,
-        per_param_range,
-        per_result_range,
-        per_cell_fill,
-        per_result_single_fill,
+        per_param_count,
+        per_result_count,
     }
 }
 
-struct HandleEntryWriter<'a> {
-    entry_layout: &'a RecordLayout,
-}
-
-impl<'a> HandleEntryWriter<'a> {
-    /// Write one zeroed entry: `type-name` baked, `id` patched per
-    /// call. Returns the matching [`HandleRuntimeFill`].
-    fn append_one(
-        &mut self,
-        entries: &mut Vec<u8>,
-        type_name: BlobSlice,
-        idx: u32,
-    ) -> HandleRuntimeFill {
-        let entry_seg_off = entries.len() as u32;
-        let entry = RecordWriter::extend_zero(entries, self.entry_layout);
-        entry.write_slice(entries, INFO_TYPE_NAME, type_name);
-        HandleRuntimeFill {
-            side_table_idx: idx,
-            entry_seg_off,
-            id_addr: None,
+/// Walk one plan, allocating range-relative `side_table_idx` per
+/// `Cell::Handle` and pulling `type_name` off the cell.
+fn scan_plan(plan: &LiftPlan) -> (Vec<Option<HandleRuntimeFill>>, u32) {
+    let mut fill_map: Vec<Option<HandleRuntimeFill>> =
+        (0..plan.cells.len()).map(|_| None).collect();
+    let mut count: u32 = 0;
+    for (cell_pos, cell) in plan.cells.iter().enumerate() {
+        if let Cell::Handle { type_name, .. } = cell {
+            fill_map[cell_pos] = Some(HandleRuntimeFill {
+                side_table_idx: count,
+                type_name: *type_name,
+            });
+            count += 1;
         }
     }
-}
-
-impl<'a> CellEntryWriter for HandleEntryWriter<'a> {
-    type Fill = HandleRuntimeFill;
-
-    fn step_cell(
-        &mut self,
-        entries: &mut Vec<u8>,
-        cell: &Cell,
-        side_table_idx: u32,
-    ) -> Option<HandleRuntimeFill> {
-        let Cell::Handle { type_name, .. } = cell else {
-            return None;
-        };
-        Some(self.append_one(entries, *type_name, side_table_idx))
-    }
-
-    fn direct_for(
-        &mut self,
-        entries: &mut Vec<u8>,
-        fd: &FuncClassified,
-    ) -> Option<HandleRuntimeFill> {
-        let type_name = match &fd.result_lift.as_ref()?.source {
-            ResultSource::Direct(Cell::Handle { type_name, .. }) => *type_name,
-            _ => return None,
-        };
-        Some(self.append_one(entries, type_name, 0))
-    }
-}
-
-/// Patch each per-cell `id_addr = entries_base + entry_seg_off +
-/// offset_of(id)` once the entries segment has a base.
-pub(crate) fn back_fill_id_addrs(
-    fill: &mut PerCellIndices<HandleRuntimeFill>,
-    single_fill: &mut [Option<HandleRuntimeFill>],
-    entries_base: u32,
-    entry_layout: &RecordLayout,
-) {
-    let id_off = entry_layout.offset_of(HANDLE_INFO_ID);
-    back_fill_per_cell(fill, single_fill, |f| {
-        // Always-on — see flags_info::back_fill_len_addrs.
-        assert!(
-            f.id_addr.is_none(),
-            "back_fill_id_addrs called twice on the same HandleRuntimeFill",
-        );
-        f.id_addr = Some((entries_base + f.entry_seg_off + id_off) as i32);
-    });
+    (fill_map, count)
 }

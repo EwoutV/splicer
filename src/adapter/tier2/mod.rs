@@ -1181,6 +1181,73 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
+    /// `own<R>` param **and** `own<R>` result on the same fn — pins the
+    /// shared `WrapperLocals.handle_info_base` getting reset across the
+    /// param-side and result-side plans. Two per-call buffers; the
+    /// param-side write must not survive into the result-side read.
+    #[test]
+    fn dispatch_module_with_handle_param_and_handle_result_roundtrips() {
+        let wat = r#"(component
+  (core module $main
+    (func (export "my:rhio/api@1.0.0#thru") (param i32) (result i32) local.get 0)
+    (func (export "my:rhio/types@1.0.0#[resource-drop]my-res") (param i32))
+    (memory (export "memory") 1)
+    (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) i32.const 0)
+  )
+  (type $my-res (resource (rep i32)))
+  (core instance $main (instantiate $main))
+  (alias core export $main "memory" (core memory $memory))
+  (component $types-shim
+    (import "import-type-my-res" (type $r (sub resource)))
+    (export "my-res" (type $r))
+  )
+  (instance $types-inst (instantiate $types-shim
+    (with "import-type-my-res" (type $my-res))
+  ))
+  (export $types-export "my:rhio/types@1.0.0" (instance $types-inst))
+  (type $own-r (own $my-res))
+  (type $thru-ty (func (param "h" $own-r) (result $own-r)))
+  (alias core export $main "my:rhio/api@1.0.0#thru" (core func $thru-core))
+  (alias core export $main "cabi_realloc" (core func $cabi_realloc))
+  (func $thru (type $thru-ty) (canon lift (core func $thru-core)))
+  (alias export $types-export "my-res" (type $r-aliased))
+  (component $api-shim
+    (import "import-type-my-res" (type $r (sub resource)))
+    (import "import-type-my-res0" (type $r0 (eq 0)))
+    (type $own-r0 (own 1))
+    (type $f-thru (func (param "h" $own-r0) (result $own-r0)))
+    (import "import-func-thru" (func $thru (type $f-thru)))
+    (export $r-export "my-res" (type $r))
+    (type $own-out (own $r-export))
+    (type $f-thru-out (func (param "h" $own-out) (result $own-out)))
+    (export "thru" (func $thru) (func (type $f-thru-out)))
+  )
+  (instance $api-inst (instantiate $api-shim
+    (with "import-func-thru" (func $thru))
+    (with "import-type-my-res" (type $r-aliased))
+    (with "import-type-my-res0" (type $my-res))
+  ))
+  (export "my:rhio/api@1.0.0" (instance $api-inst))
+)"#;
+        let split_bytes = wat::parse_str(wat).expect("WAT must parse");
+        let common_wit = include_str!("../../../wit/common/world.wit");
+        let tier2_wit = include_str!("../../../wit/tier2/world.wit");
+        let bytes = build_tier2_adapter(
+            "my:rhio/api@1.0.0",
+            true,
+            true,
+            &split_bytes,
+            common_wit,
+            tier2_wit,
+        )
+        .expect(
+            "tier-2 adapter generation should succeed for handle param + handle result on the same fn",
+        );
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::all())
+            .validate_all(&bytes)
+            .expect("emitted tier-2 adapter component should validate");
+    }
+
     /// End-to-end test for `Cell::Char` as a Direct result. Drives
     /// `is_supported_direct_result(Char) → Direct` + the per-result
     /// scratch reservation + utf-8 encoder + cell::text emit. Sync
