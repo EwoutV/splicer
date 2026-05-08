@@ -15,7 +15,7 @@ use super::super::blob::NameInterner;
 use super::super::cells::CellLayout;
 use super::super::schema::{RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS};
 use super::super::{FuncClassified, FuncShape};
-use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan, NamedListInfo};
+use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
@@ -30,11 +30,13 @@ const TEST_WIT: &str = r#"
     package test:lift@0.0.1;
     interface t {
         enum color { red, green, blue }
+        enum mood { happy, sad }
         flags fperms { read, write, exec }
         flags fcaps { net, fs, time, env, rand }
         variant shape { circle, sq(u32), tri(u32) }
         record point { x: u32, y: s32 }
         record nested { p: point, c: color }
+        record two-enums { c: color, m: mood }
         record pair { a: u8, b: u8 }
         record point-and-tuple { p: point, t: tuple<u8, s32> }
         record perms-pair { primary: fperms, secondary: fperms }
@@ -211,14 +213,6 @@ fn assert_plan_no_root(plan: &LiftPlan, cells: Vec<Cell>, slot_count: u32) {
     assert_eq!(plan.flat_slot_count, slot_count);
 }
 
-/// `NamedListInfo { type_name, item_names }` shorthand for fixtures.
-fn enum_info(type_name: &str, items: &[&str]) -> NamedListInfo {
-    NamedListInfo {
-        type_name: type_name.into(),
-        item_names: items.iter().map(|s| (*s).to_string()).collect(),
-    }
-}
-
 /// `Cell::Flags` shorthand for fixtures. Interns `type_name` and
 /// each item name; mirrors plan-build's interning so [`BlobSlice`]s
 /// match by-value regardless of which side ran first.
@@ -234,6 +228,43 @@ fn flags_cell(
         flat_slot,
         type_name,
         flag_names,
+    }
+}
+
+/// `Cell::EnumCase` shorthand for fixtures. Same shape as
+/// [`flags_cell`] — interns through `names` so fixture and plan
+/// converge on the same [`BlobSlice`]s.
+fn enum_cell(
+    names: &mut NameInterner,
+    flat_slot: u32,
+    type_name: &str,
+    cases: &[&str],
+) -> Cell {
+    let type_name = names.intern(type_name);
+    let case_names = cases.iter().map(|n| names.intern(n)).collect();
+    Cell::EnumCase {
+        flat_slot,
+        type_name,
+        case_names,
+    }
+}
+
+/// `Cell::Variant` shorthand for fixtures. Like [`enum_cell`] but
+/// also carries the disc slot and per-case payload child indices.
+fn variant_cell(
+    names: &mut NameInterner,
+    disc_slot: u32,
+    type_name: &str,
+    cases: &[&str],
+    per_case_payload: Vec<Option<u32>>,
+) -> Cell {
+    let type_name = names.intern(type_name);
+    let case_names = cases.iter().map(|n| names.intern(n)).collect();
+    Cell::Variant {
+        disc_slot,
+        per_case_payload,
+        type_name,
+        case_names,
     }
 }
 
@@ -449,7 +480,7 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 CellSideData::Flags(Box::new(fill))
             }
             Cell::Variant {
-                info,
+                case_names,
                 per_case_payload,
                 ..
             } => {
@@ -465,12 +496,9 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                     case_name_addr: Some(case_name_addr as i32),
                     payload_disc_addr: Some(payload_disc_addr as i32),
                     payload_value_addr: Some(payload_value_addr as i32),
-                    case_names: info
-                        .item_names
-                        .iter()
-                        .enumerate()
-                        .map(|(i, _)| BlobSlice {
-                            off: i as u32 * STUB_FLAG_NAME_STRIDE,
+                    case_names: (0..case_names.len() as u32)
+                        .map(|i| BlobSlice {
+                            off: i * STUB_FLAG_NAME_STRIDE,
                             len: STUB_FLAG_NAME_LEN,
                         })
                         .collect(),
@@ -729,10 +757,7 @@ fn enum_carries_named_list_info() {
     let (r, mut names) = setup();
     assert_eq!(
         plan_for_named("color", &r, &mut names).cells,
-        vec![Cell::EnumCase {
-            flat_slot: 0,
-            info: enum_info("color", &["red", "green", "blue"]),
-        }],
+        vec![enum_cell(&mut names, 0, "color", &["red", "green", "blue"])],
     );
 }
 
@@ -764,11 +789,13 @@ fn variant_lays_disc_first_then_arms_share_slots() {
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::IntegerZeroExt { flat_slot: 1 },
-            Cell::Variant {
-                disc_slot: 0,
-                per_case_payload: vec![None, Some(0), Some(1)],
-                info: enum_info("shape", &["circle", "sq", "tri"]),
-            },
+            variant_cell(
+                &mut names,
+                0,
+                "shape",
+                &["circle", "sq", "tri"],
+                vec![None, Some(0), Some(1)],
+            ),
         ],
         2,
         2,
@@ -782,24 +809,28 @@ fn record_with_variant_field_recurses_into_variant() {
     // variant but lhs and rhs occupy independent slots.
     let (r, mut names) = setup();
     let plan = plan_for_named("shape-pair", &r, &mut names);
-    let shape_info = enum_info("shape", &["circle", "sq", "tri"]);
+    let shape_cases: &[&str] = &["circle", "sq", "tri"];
     assert_plan(
         &plan,
         vec![
             Cell::IntegerZeroExt { flat_slot: 1 },
             Cell::IntegerZeroExt { flat_slot: 1 },
-            Cell::Variant {
-                disc_slot: 0,
-                per_case_payload: vec![None, Some(0), Some(1)],
-                info: shape_info.clone(),
-            },
+            variant_cell(
+                &mut names,
+                0,
+                "shape",
+                shape_cases,
+                vec![None, Some(0), Some(1)],
+            ),
             Cell::IntegerZeroExt { flat_slot: 3 },
             Cell::IntegerZeroExt { flat_slot: 3 },
-            Cell::Variant {
-                disc_slot: 2,
-                per_case_payload: vec![None, Some(3), Some(4)],
-                info: shape_info,
-            },
+            variant_cell(
+                &mut names,
+                2,
+                "shape",
+                shape_cases,
+                vec![None, Some(3), Some(4)],
+            ),
             record_of(&mut names, "shape-pair", &[("lhs", 2), ("rhs", 5)]),
         ],
         6,
@@ -1692,10 +1723,7 @@ fn nested_record_walks_depth_first() {
             Cell::IntegerZeroExt { flat_slot: 0 },
             Cell::IntegerSignExt { flat_slot: 1 },
             record_of(&mut names, "point", &[("x", 0), ("y", 1)]),
-            Cell::EnumCase {
-                flat_slot: 2,
-                info: enum_info("color", &["red", "green", "blue"]),
-            },
+            enum_cell(&mut names, 2, "color", &["red", "green", "blue"]),
             record_of(&mut names, "nested", &[("p", 2), ("c", 3)]),
         ],
         4,
@@ -2094,14 +2122,12 @@ fn char_scratch_sizes_count_single_cell_char_result() {
     // Regression: `char_scratch_sizes` must pick up a single-cell
     // char result by checking the classified `Cell::Char` (not the
     // raw `result_ty`), so a `type my-char = char` alias works.
-    use super::classify::SideTableInfo;
     use super::sidetable::char_info::char_scratch_sizes;
     let (r, mut names) = setup();
     let mut fd = func_with_params(&r, &mut names, &[]);
     fd.result_ty = Some(Type::Char);
     fd.result_lift = Some(ResultLift {
         source: ResultSource::Direct(Cell::Char { flat_slot: 0 }),
-        side_table: SideTableInfo::default(),
     });
     // 1 char-result × 4 bytes scratch.
     assert_eq!(char_scratch_sizes(&[fd]), vec![MAX_UTF8_LEN]);
@@ -2113,7 +2139,7 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
     // the compound result plan, in the order `build_flags_info_maps`
     // consumes addresses — otherwise a record-result-with-flags
     // crashes the builder's `scratch_addrs.next()` expect.
-    use super::classify::{CompoundResult, SideTableInfo};
+    use super::classify::CompoundResult;
     use super::sidetable::flags_info::flags_scratch_sizes;
     let (r, mut names) = setup();
     let fd_param = func_with_params(&r, &mut names, &["fperms"]);
@@ -2123,7 +2149,6 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
             ty: type_named(&r, "perms-pair"),
             plan: plan_for_named("perms-pair", &r, &mut names),
         }),
-        side_table: SideTableInfo::default(),
     });
     // 1 flags param + 2 flags inside the record result → 3 slabs of
     // 3 flags × 8 bytes each.
@@ -2133,17 +2158,42 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
     );
 }
 
+// ─── Side-table N=1 invariant ─────────────────────────────────
+
+#[test]
+#[should_panic(expected = "plan has multiple Cell::EnumCase entries")]
+fn build_enum_info_blob_panics_on_multi_enum_plan() {
+    // Pin the structural N=1 invariant in `build_enum_info_blob`:
+    // a record with two distinct enum fields (`two-enums { c: color,
+    // m: mood }`) produces two `Cell::EnumCase` cells in one plan,
+    // which the per-cell `cell::enum-case(disc)` payload encoding
+    // can't disambiguate within a single per-(fn, param) range.
+    // Documented in build_enum_info_blob's doc; this test fails the
+    // build the moment a future change makes the plan-builder
+    // produce multi-enum plans without first introducing a per-cell
+    // side-table-idx scheme.
+    use super::sidetable::enum_info::build_enum_info_blob;
+    let (r, mut names) = setup();
+    let fd = func_with_params(&r, &mut names, &["two-enums"]);
+    let entry_layout = synth_info_layout("enum-info");
+    let segment_id = super::super::blob::SymbolBases::new().alloc();
+    let _ = build_enum_info_blob(&[fd], &entry_layout, segment_id);
+}
+
 // ─── Side-table dedup ─────────────────────────────────────────
 
 #[test]
 fn enum_strings_dedup_across_funcs() {
+    // Enum type-name + case-names are interned at plan-build via the
+    // shared NameInterner. Two funcs sharing the same enum type
+    // produce one copy of every string — dedup is the interner's job.
+    // Plan-build interns in WIT order: type-name first, then cases in
+    // declaration order. A single `color` enum used twice → exactly
+    // `colorredgreenblue` (substring matching would false-positive on
+    // a future case named e.g. "reduce" containing "red").
     let (r, mut names) = setup();
-    let funcs = vec![
-        func_with_params(&r, &mut names, &["color"]),
-        func_with_params(&r, &mut names, &["color"]),
-    ];
-    let table = register_enum_strings(&funcs, &mut names);
-    assert_eq!(table.len(), 1);
+    func_with_params(&r, &mut names, &["color"]);
+    func_with_params(&r, &mut names, &["color"]);
     assert_eq!(names.into_bytes(), b"colorredgreenblue");
 }
 

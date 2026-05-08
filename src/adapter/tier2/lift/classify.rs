@@ -19,7 +19,7 @@ use wit_parser::{Function as WitFunction, Resolve, Type};
 
 use super::super::super::abi::emit::BlobSlice;
 use super::super::blob::NameInterner;
-use super::plan::{Cell, LiftPlan, NamedListInfo};
+use super::plan::{Cell, LiftPlan};
 use super::sidetable::CellSideData;
 
 // ─── Result-lift descriptors (classify-time, immutable) ───────────
@@ -51,7 +51,6 @@ use super::sidetable::CellSideData;
 /// side-table contributions inline on the plan's `Cell`s instead.
 pub(crate) struct ResultLift {
     pub source: ResultSource,
-    pub(super) side_table: SideTableInfo,
 }
 
 pub(crate) enum ResultSource {
@@ -183,18 +182,6 @@ pub(crate) enum ResultSourceLayout {
     },
 }
 
-/// Result-side per-kind info. Populated when a single-cell direct
-/// result needs side-table entries (enum cases). Flags-typed
-/// direct results carry their interned BlobSlices on the cell
-/// itself ([`Cell::Flags`]); the layout phase picks them up by
-/// matching `ResultSource::Direct(Cell::Flags {..})` instead of
-/// going through this struct.
-#[derive(Default, Clone)]
-pub(super) struct SideTableInfo {
-    /// `Some` for enum-typed result lifts: type-name + case names in
-    /// disc order.
-    pub(super) enum_info: Option<NamedListInfo>,
-}
 
 // ─── Classifiers ──────────────────────────────────────────────────
 
@@ -257,7 +244,6 @@ pub(crate) fn classify_result_lift(
         let plan = LiftPlan::for_type(ty, resolve, names)?;
         return Ok(Some(ResultLift {
             source: ResultSource::Compound(CompoundResult { ty: *ty, plan }),
-            side_table: SideTableInfo::default(),
         }));
     }
 
@@ -268,10 +254,8 @@ pub(crate) fn classify_result_lift(
     let Some(cell) = single_cell_for_result(ty, resolve, names)? else {
         return Ok(None);
     };
-    let side_table = side_table_info_for_cell(&cell);
     Ok(Some(ResultLift {
         source: ResultSource::Direct(cell),
-        side_table,
     }))
 }
 
@@ -355,16 +339,3 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
     }
 }
 
-/// Build the `SideTableInfo` for a single-cell result. Empty for
-/// primitive lifts; populated for enum direct results (flags direct
-/// results read interned slices off the cell — see [`SideTableInfo`]).
-fn side_table_info_for_cell(cell: &Cell) -> SideTableInfo {
-    let mut info = SideTableInfo::default();
-    if let Cell::EnumCase {
-        info: enum_info, ..
-    } = cell
-    {
-        info.enum_info = Some(enum_info.clone());
-    }
-    info
-}

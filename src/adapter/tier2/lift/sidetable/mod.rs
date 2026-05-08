@@ -13,21 +13,16 @@
 //!      phase resolves them to absolute [`BlobSlice`]s after every
 //!      segment has a base.
 //!
-//! The kind-specific bits (where to find the info on `SideTableInfo`,
-//! which `RecordLayout` to use, what the item-name field is called)
-//! are passed in via [`SideTableSpec`] + an extractor closure for the
-//! enum-style kinds in [`enum_info`]; record-info has its own builder
-//! shape (entries + tuples arena) in [`record_info`].
-
-use std::collections::HashMap;
+//! Each side-table kind has its own builder under the matching
+//! sub-module ([`enum_info`], [`flags_info`], etc.). Type-name +
+//! item-name [`BlobSlice`]s are interned at plan-build time and
+//! live on each `Cell::*` directly — the builders here just walk
+//! cells and stitch entries.
 
 use super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::blob::{
-    resolve, NameInterner, RecordWriter, Segment, SymRef, SymbolBases, SymbolId,
-};
+use super::super::blob::{resolve, Segment, SymRef, SymbolBases, SymbolId};
 use super::super::FuncClassified;
-use super::classify::SideTableInfo;
-use super::plan::{Cell, LiftPlan, NamedListInfo};
+use super::plan::{Cell, LiftPlan};
 
 pub(super) mod char_info;
 pub(super) mod enum_info;
@@ -442,34 +437,13 @@ fn resolve_cell_syms(syms: &[Option<SymRef>], symbols: &SymbolBases) -> Vec<Opti
 // ─── WIT names referenced by lift codegen ─────────────────────────
 //
 // Side-table-info records in `splicer:common/types` share the same
-// shape: `record { type-name: string, <item>-name: string }`. Field
-// names for each kind are passed to [`SideTableSpec`].
+// shape: `record { type-name: string, <item>-name: string }`. The
+// per-kind item-name field name (e.g. `"case-name"` for enum-info,
+// `"flag-name"` for flags-info) is hard-coded in each kind's blob
+// builder.
 pub(super) const INFO_TYPE_NAME: &str = "type-name";
 
-/// Per-side-table-kind configuration. Plug-in points for adding a
-/// new kind: provide the `RecordLayout` for one entry record + the
-/// item-name field name, and pass an extractor closure that pulls
-/// this kind's info off `SideTableInfo`.
-pub(super) struct SideTableSpec<'a> {
-    /// Layout of one entry record (e.g. `splicer:common/types.enum-info`).
-    pub entry_layout: &'a RecordLayout,
-    /// Field name on the entry record for the per-item identifier
-    /// (e.g. `"case-name"` for enum-info, `"flag-name"` for flags-info).
-    pub item_name_field: &'static str,
-}
-
-/// Where each registered type's strings live in the name blob.
-/// Keyed by type-name to dedupe across multiple uses of the same
-/// type across params / results / functions.
-pub(crate) type StringTable = HashMap<String, NamedListStrings>;
-
-pub(crate) struct NamedListStrings {
-    pub(super) type_name: BlobSlice,
-    pub(super) items: Vec<BlobSlice>, // per item, in declaration order
-}
-
-/// Output of [`build_side_table_blob`]: the entry-record [`Segment`]
-/// plus per-(fn, param) and per-(fn, result) [`SymRef`]s into it.
+/// Output of the per-(fn, param | result) side-table blob builders.
 /// `None` marks "no entries for this slot" — params/results that
 /// don't carry this side-table kind. Resolution to absolute
 /// [`BlobSlice`]s happens once the segment's base is known.
@@ -479,144 +453,3 @@ pub(crate) struct SideTableBlob {
     pub per_result: Vec<Option<SymRef>>,
 }
 
-/// Intern this kind's `NamedListInfo` strings (the interner dedupes
-/// across funcs / params / results). Returns the per-type string
-/// offsets so the side-table builder can stitch entries without
-/// re-scanning the blob.
-///
-/// `visit_plan_infos` calls its callback per info in the plan —
-/// visitor lets callers pipe `plan.flags_infos()` etc. through
-/// without an interim `Vec`. `from_result` covers sync-flat Direct
-/// results whose cell never made it into a plan.
-pub(super) fn register_side_table_strings(
-    per_func: &[FuncClassified],
-    names: &mut NameInterner,
-    visit_plan_infos: impl Fn(&LiftPlan, &mut dyn FnMut(&NamedListInfo)),
-    from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
-) -> StringTable {
-    let mut table = StringTable::new();
-    for fd in per_func {
-        for p in &fd.params {
-            visit_plan_infos(&p.plan, &mut |info| {
-                ensure_registered(&mut table, names, info)
-            });
-        }
-        if let Some(rl) = &fd.result_lift {
-            // Compound results: walk the plan (catches infos nested
-            // inside list element plans, etc., symmetric with params).
-            // Direct results: side-table info already carries the cell.
-            match rl.compound() {
-                Some(c) => visit_plan_infos(&c.plan, &mut |info| {
-                    ensure_registered(&mut table, names, info)
-                }),
-                None => {
-                    if let Some(info) = from_result(&rl.side_table) {
-                        ensure_registered(&mut table, names, info);
-                    }
-                }
-            }
-        }
-    }
-    table
-}
-
-pub(super) fn ensure_registered(
-    table: &mut StringTable,
-    names: &mut NameInterner,
-    info: &NamedListInfo,
-) {
-    if table.contains_key(&info.type_name) {
-        return;
-    }
-    let type_name = names.intern(&info.type_name);
-    let items = info.item_names.iter().map(|n| names.intern(n)).collect();
-    table.insert(
-        info.type_name.clone(),
-        NamedListStrings { type_name, items },
-    );
-}
-
-/// Lay out one per-case-kind side table. For per-case kinds (enum,
-/// variant) the side-table index is the runtime disc, so entries
-/// are laid out one-per-case in WIT declaration order. The cell at
-/// runtime points at the contiguous per-(param|result) range via
-/// `(blob_off, len)`.
-///
-/// `from_plan` returns the (at most one for enum) info for a param's
-/// plan that contributes to this side table. (When records of enums
-/// land, this may yield multiple infos per plan — the builder
-/// handles that by appending one contiguous range per plan-cell.)
-pub(super) fn build_side_table_blob(
-    per_func: &[FuncClassified],
-    strings: &StringTable,
-    spec: &SideTableSpec<'_>,
-    segment_id: SymbolId,
-    from_plan: impl Fn(&LiftPlan) -> Option<&NamedListInfo>,
-    from_result: impl Fn(&SideTableInfo) -> Option<&NamedListInfo>,
-) -> SideTableBlob {
-    let mut bytes: Vec<u8> = Vec::new();
-    let mut per_param: Vec<Vec<Option<SymRef>>> = Vec::with_capacity(per_func.len());
-    let mut per_result: Vec<Option<SymRef>> = Vec::with_capacity(per_func.len());
-    for fd in per_func {
-        let mut params = Vec::with_capacity(fd.params.len());
-        for p in &fd.params {
-            params.push(append_entries(
-                &mut bytes,
-                strings,
-                spec,
-                segment_id,
-                from_plan(&p.plan),
-            ));
-        }
-        per_param.push(params);
-        // Compound results: derive from the plan (catches infos nested
-        // inside list element plans). Direct results: side-table info
-        // carries the single cell. Mirrors register_side_table_strings.
-        let result_info = fd.result_lift.as_ref().and_then(|r| match r.compound() {
-            Some(c) => from_plan(&c.plan),
-            None => from_result(&r.side_table),
-        });
-        per_result.push(append_entries(
-            &mut bytes,
-            strings,
-            spec,
-            segment_id,
-            result_info,
-        ));
-    }
-    SideTableBlob {
-        segment: Segment {
-            id: segment_id,
-            align: spec.entry_layout.align,
-            bytes,
-            relocs: Vec::new(),
-        },
-        per_param,
-        per_result,
-    }
-}
-
-fn append_entries(
-    blob: &mut Vec<u8>,
-    strings: &StringTable,
-    spec: &SideTableSpec<'_>,
-    segment_id: SymbolId,
-    info: Option<&NamedListInfo>,
-) -> Option<SymRef> {
-    let info = info?;
-    let s = strings
-        .get(&info.type_name)
-        .expect("register_side_table_strings ran for every info");
-    let blob_off = blob.len() as u32;
-    let len = info.item_names.len() as u32;
-    for item_idx in 0..info.item_names.len() {
-        let entry = RecordWriter::extend_zero(blob, spec.entry_layout);
-        entry.write_slice(blob, INFO_TYPE_NAME, s.type_name);
-        entry.write_slice(blob, spec.item_name_field, s.items[item_idx]);
-    }
-    Some(SymRef {
-        target: segment_id,
-        off: blob_off,
-        len,
-    })
-}

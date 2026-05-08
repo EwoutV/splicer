@@ -49,7 +49,7 @@ pub(super) use emit::{
 pub(super) use sidetable::char_info::{
     build_char_scratch_map, char_scratch_sizes, CharScratchMaps,
 };
-pub(super) use sidetable::enum_info::{build_enum_info_blob, register_enum_strings};
+pub(super) use sidetable::enum_info::build_enum_info_blob;
 pub(super) use sidetable::flags_info::{
     build_flags_info_maps, flags_scratch_sizes, FlagsInfoMaps, FlagsRuntimeFill,
 };
@@ -60,7 +60,7 @@ pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs}
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
 pub(super) use sidetable::variant_info::{
     back_fill_entry_addrs as back_fill_variant_entry_addrs, build_variant_info_blob,
-    register_variant_strings, VariantInfoBlobs,
+    VariantInfoBlobs,
 };
 pub(super) use sidetable::{
     fold_cell_side_data, CellFillSources, CellSideData, CharScratch, SideTableBlob,

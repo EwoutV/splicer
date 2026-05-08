@@ -77,9 +77,16 @@ pub(crate) enum Cell {
     /// scratch buffer (1–4 bytes), then write `cell::text(ptr, len)`
     /// referencing the scratch.
     Char { flat_slot: u32 },
-    /// `enum { ... }` → `cell::enum-case(u32)`. Carries the type-name +
-    /// case-names so the side-table builder can register them.
-    EnumCase { flat_slot: u32, info: NamedListInfo },
+    /// `enum { ... }` → `cell::enum-case(u32)`. `type_name` and each
+    /// case-name are pre-interned [`BlobSlice`]s into the shared name
+    /// blob (mirrors [`Cell::Handle`] and [`Cell::Flags`]) — the
+    /// side-table builder writes them straight into the `enum-info`
+    /// segment without re-interning.
+    EnumCase {
+        flat_slot: u32,
+        type_name: BlobSlice,
+        case_names: Vec<BlobSlice>,
+    },
     /// `record { ... }` → `cell::record-of(u32)` (side-table index).
     /// Children live elsewhere in the same plan; `fields` references
     /// them by `LiftPlan::cells` position. `type_name` and each
@@ -157,7 +164,8 @@ pub(crate) enum Cell {
     Variant {
         disc_slot: u32,
         per_case_payload: Vec<Option<u32>>,
-        info: NamedListInfo,
+        type_name: BlobSlice,
+        case_names: Vec<BlobSlice>,
     },
 
     /// `own<R>` / `borrow<R>` / `stream<T>` / `future<T>` →
@@ -428,30 +436,6 @@ impl LiftPlan {
         })
     }
 
-    /// Iterator over every `Cell::EnumCase` in the plan tree
-    /// (including list element plans). Used by the side-table builder
-    /// to register enum strings.
-    pub(super) fn enum_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
-        self.walk_cells_recursive()
-            .into_iter()
-            .filter_map(|op| match op {
-                Cell::EnumCase { info, .. } => Some(info),
-                _ => None,
-            })
-    }
-
-    /// Iterator over every `Cell::Variant` in the plan tree. Used by
-    /// the side-table builder to register variant-type and case-name
-    /// strings.
-    pub(super) fn variant_infos(&self) -> impl Iterator<Item = &NamedListInfo> {
-        self.walk_cells_recursive()
-            .into_iter()
-            .filter_map(|op| match op {
-                Cell::Variant { info, .. } => Some(info),
-                _ => None,
-            })
-    }
-
     /// Placeholder plan after a sub-`for_type` error; never reaches emit.
     pub(super) fn stub_for(source_ty: Type) -> Self {
         Self {
@@ -617,8 +601,14 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Enum(_) => {
                     let info = enum_lift_info_for_type(ty, resolve)
                         .expect("Enum kind implies enum-info available");
+                    let type_name = names.intern(&info.type_name);
+                    let case_names = info.item_names.iter().map(|n| names.intern(n)).collect();
                     let flat_slot = self.bump_flat_slot();
-                    self.push_cell(Cell::EnumCase { flat_slot, info })
+                    self.push_cell(Cell::EnumCase {
+                        flat_slot,
+                        type_name,
+                        case_names,
+                    })
                 }
                 wit_parser::TypeDefKind::Record(_) => self.push_record(ty, resolve, names),
                 wit_parser::TypeDefKind::Tuple(_) => self.push_tuple(ty, resolve, names),
@@ -870,6 +860,8 @@ impl LiftPlanBuilder {
         let v = v.clone();
         let info = variant_lift_info_for_type(ty, resolve)
             .expect("Variant kind implies variant-info available");
+        let type_name = names.intern(&info.type_name);
+        let case_names = info.item_names.iter().map(|n| names.intern(n)).collect();
         let joined =
             flat_types(resolve, ty, None).expect("variant must flatten within MAX_FLAT_PARAMS");
 
@@ -886,7 +878,8 @@ impl LiftPlanBuilder {
         self.push_cell(Cell::Variant {
             disc_slot,
             per_case_payload,
-            info,
+            type_name,
+            case_names,
         })
     }
 

@@ -7,13 +7,13 @@
 //! write per call.
 
 use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::super::blob::{NameInterner, RecordWriter, Segment, SymRef, SymbolId};
+use super::super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
 use super::super::super::schema::{VARIANT_INFO_CASE_NAME, VARIANT_INFO_PAYLOAD};
 use super::super::super::FuncClassified;
 use super::super::plan::Cell;
 use super::{
-    back_fill_per_cell, build_per_cell_side_table, register_side_table_strings, CellEntryWriter,
-    PerCellIndices, PerCellSideTableBlob, StringTable, INFO_TYPE_NAME,
+    back_fill_per_cell, build_per_cell_side_table, CellEntryWriter, PerCellIndices,
+    PerCellSideTableBlob, INFO_TYPE_NAME,
 };
 
 /// Per-(plan-cell) emit-phase data for one `Cell::Variant`.
@@ -48,36 +48,17 @@ pub(crate) struct VariantInfoBlobs {
     pub per_cell_fill: PerCellIndices<VariantRuntimeFill>,
 }
 
-/// Intern type-name + case-names for every `Cell::Variant` across all
-/// param plans + compound result plans. Direct variant-result is
-/// Phase 3.
-pub(crate) fn register_variant_strings(
-    per_func: &[FuncClassified],
-    names: &mut NameInterner,
-) -> StringTable {
-    register_side_table_strings(
-        per_func,
-        names,
-        |plan, visit| plan.variant_infos().for_each(visit),
-        // No Direct variant result today — compound walk catches every
-        // info via the plan.
-        |_| None,
-    )
-}
-
 /// One variant-info entry per `Cell::Variant`. Runtime-filled
 /// fields (`case-name`, `payload`) stay zeroed in the segment;
-/// the wrapper patches them per call.
+/// the wrapper patches them per call. Type-name + case-name slices
+/// are read off the cell (interned at plan-build time, mirroring
+/// [`Cell::EnumCase`] / [`Cell::Flags`] / [`Cell::Handle`]).
 pub(crate) fn build_variant_info_blob(
     per_func: &[FuncClassified],
-    strings: &StringTable,
     entry_layout: &RecordLayout,
     entries_id: SymbolId,
 ) -> VariantInfoBlobs {
-    let mut writer = VariantEntryWriter {
-        entry_layout,
-        strings,
-    };
+    let mut writer = VariantEntryWriter { entry_layout };
     let PerCellSideTableBlob {
         entries,
         per_param_range,
@@ -97,7 +78,6 @@ pub(crate) fn build_variant_info_blob(
 
 struct VariantEntryWriter<'a> {
     entry_layout: &'a RecordLayout,
-    strings: &'a StringTable,
 }
 
 impl<'a> CellEntryWriter for VariantEntryWriter<'a> {
@@ -112,24 +92,20 @@ impl<'a> CellEntryWriter for VariantEntryWriter<'a> {
         side_table_idx: u32,
     ) -> Option<VariantRuntimeFill> {
         let Cell::Variant {
-            info,
+            type_name,
+            case_names,
             per_case_payload,
             ..
         } = cell
         else {
             return None;
         };
-        let s = self
-            .strings
-            .get(&info.type_name)
-            .expect("register_variant_strings ran for every info");
-        debug_assert_eq!(info.item_names.len(), s.items.len());
 
         let entry_seg_off = entries.len() as u32;
         // `case-name.*` and `payload.*` stay zero — the wrapper
         // patches them per call.
         let entry = RecordWriter::extend_zero(entries, self.entry_layout);
-        entry.write_slice(entries, INFO_TYPE_NAME, s.type_name);
+        entry.write_slice(entries, INFO_TYPE_NAME, *type_name);
 
         Some(VariantRuntimeFill {
             side_table_idx,
@@ -137,7 +113,7 @@ impl<'a> CellEntryWriter for VariantEntryWriter<'a> {
             case_name_addr: None,
             payload_disc_addr: None,
             payload_value_addr: None,
-            case_names: s.items.clone(),
+            case_names: case_names.clone(),
             per_case_payload: per_case_payload.clone(),
         })
     }

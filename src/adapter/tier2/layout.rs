@@ -20,7 +20,7 @@ use super::lift::{
     back_fill_variant_entry_addrs, build_char_scratch_map, build_enum_info_blob,
     build_flags_info_maps, build_handle_info_maps, build_record_info_blob,
     build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes,
-    fold_cell_side_data, register_enum_strings, register_variant_strings,
+    fold_cell_side_data,
     CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoMaps, FlagsRuntimeFill,
     HandleInfoMaps, HandleRuntimeFill, ParamLayout, RecordInfoBlobs, ResultLayout, ResultLift,
     ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoBlobs,
@@ -355,7 +355,7 @@ pub(super) fn lay_out_static_memory(
     per_func: Vec<FuncClassified>,
     funcs: &[&WitFunction],
     schema: &SchemaLayouts,
-    mut names: NameInterner,
+    names: NameInterner,
     iface_name: BlobSlice,
 ) -> Result<(Vec<FuncDispatch>, StaticDataPlan)> {
     let n_funcs = per_func.len();
@@ -367,14 +367,11 @@ pub(super) fn lay_out_static_memory(
 
     check_layout_budget(&per_func)?;
 
-    // Side-table strings get appended to the name interner BEFORE we
-    // place it — every side-table-info entry references these string
-    // offsets, so they have to land in the data segment first.
-    // Record-info, flags-info, and handle-info strings are already
-    // interned at plan-build time and live on their cells; enum-info
-    // and variant-info still need a registration pass here.
-    let enum_strings = register_enum_strings(&per_func, &mut names);
-    let variant_strings = register_variant_strings(&per_func, &mut names);
+    // All side-table strings (record-, enum-, flags-, handle-,
+    // variant-info) are interned at plan-build time and live on their
+    // cells. The shared name blob below picks them up via the
+    // already-populated `NameInterner`; no per-kind registration
+    // pass needed here.
 
     let mut layout = StaticLayout::new();
     let mut symbols = SymbolBases::new();
@@ -418,12 +415,7 @@ pub(super) fn lay_out_static_memory(
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
     let variant_info_id = symbols.alloc();
-    let enum_info = build_enum_info_blob(
-        &per_func,
-        &enum_strings,
-        &schema.enum_info_layout,
-        enum_info_id,
-    );
+    let enum_info = build_enum_info_blob(&per_func, &schema.enum_info_layout, enum_info_id);
     let SideTableBlob {
         segment: enum_segment,
         per_param: enum_per_param_sym,
@@ -468,12 +460,7 @@ pub(super) fn lay_out_static_memory(
         per_param_range: variant_per_param_range_sym,
         per_result_range: variant_per_result_range_sym,
         per_cell_fill: mut variant_per_cell_fill,
-    } = build_variant_info_blob(
-        &per_func,
-        &variant_strings,
-        &schema.variant_info_layout,
-        variant_info_id,
-    );
+    } = build_variant_info_blob(&per_func, &schema.variant_info_layout, variant_info_id);
     // Handle-info doesn't pre-bake a static segment — the wrapper
     // body allocates a per-(fn, param | result) buffer per call,
     // writes type-name + id, and patches `field_tree.handle_infos`.
