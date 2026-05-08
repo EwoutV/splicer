@@ -509,15 +509,21 @@ impl CellLayout {
     }
 
     /// `cell::record-of(u32)` — index into `field-tree.record-infos`.
-    /// The side-table index is adapter-build-time-known, so we emit it
-    /// as an `i32.const` rather than a local-load.
-    pub(crate) fn emit_record_of(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
+    /// `payload` is `ConstI32(idx)` for static cells (build-time idx)
+    /// or `Local(local)` for list-element cells (runtime-staged idx
+    /// off `list_elem_record_base`).
+    pub(crate) fn emit_record_of(
+        &self,
+        f: &mut Function,
+        addr_local: u32,
+        payload: PayloadSource,
+    ) {
         self.emit_cell(
             f,
             addr_local,
             self.disc_of("record-of"),
             &[PayloadPart {
-                source: PayloadSource::ConstI32(side_table_idx as i32),
+                source: payload,
                 kind: StoreKind::I32,
                 offset: 0,
             }],

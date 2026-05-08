@@ -8,7 +8,7 @@ use wit_parser::{Resolve, SizeAlign};
 
 use super::super::super::abi::cast;
 use super::super::super::abi::emit::{
-    direct_return_type, emit_bitcast, emit_cabi_realloc_call_runtime, wasm_type_to_val,
+    direct_return_type, emit_bitcast, emit_cabi_realloc_call_runtime, wasm_type_to_val, BlobSlice,
     RecordLayout, I32_STORE_LOG2_ALIGN, I64_STORE_LOG2_ALIGN, I8_STORE_LOG2_ALIGN, MAX_UTF8_LEN,
     OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET, STRING_FLAT_BYTES,
 };
@@ -157,6 +157,25 @@ pub(crate) struct WrapperLocals {
     /// Companion to [`Self::next_handle_idx`] for flags-info entries.
     /// `Some` iff [`fn_has_list_elem_flags`].
     pub next_flags_idx: Option<u32>,
+    /// Companion to [`Self::next_handle_idx`] for record-info entries.
+    /// `Some` iff [`fn_has_list_elem_record`].
+    pub next_record_idx: Option<u32>,
+    /// Per-iteration `record_slot_base + j * records_per_elem` (entry
+    /// idx) and `record_tuples_buf_base + j * record_tuples_bytes_per_elem`
+    /// (tuples sub-region base). Both staged once per iter by the
+    /// list-of-arm; `Some` iff [`fn_has_list_elem_record`].
+    pub list_elem_record_base: Option<u32>,
+    pub list_elem_record_tuples_base: Option<u32>,
+    /// Scratch for the runtime entry-address (list-element records
+    /// only; static slots fold the offset into a memarg).
+    pub record_slot_addr: Option<u32>,
+    /// Scratch for the runtime cell-payload entry idx
+    /// (`list_elem_record_base + entry_offset_in_elem`).
+    pub record_payload_idx: Option<u32>,
+    /// Scratch for the runtime per-record field-tuples sub-slice base
+    /// (`list_elem_record_tuples_base + tuples_offset_in_elem`).
+    /// Reused across the per-tuple field writes.
+    pub record_tuples_slice_addr: Option<u32>,
     /// Base address of the active plan's record-info buffer.
     /// `Some` iff [`fn_has_record_cells`]. Same stage-then-consume
     /// invariant as [`Self::handle_info_base`].
@@ -285,25 +304,40 @@ impl FlagsInfoOffsets {
     }
 }
 
-/// Build-time-resolved geometry of one `record record-info` entry.
-/// Same shape as [`HandleInfoOffsets`] for the record-info side.
+/// Build-time-resolved geometry of one `record record-info` entry +
+/// the inner `tuple<string, u32>` field-tuple shape that
+/// `record-info.fields` points at. Bundled so list-element
+/// `emit_record_runtime_fill` can write per-iteration tuples without
+/// re-resolving offsets. The tuple geometry is also constant across
+/// every call site, so the layout pays a single `offset_of` walk in
+/// `from_layout`.
 #[derive(Clone, Copy)]
 pub(crate) struct RecordInfoOffsets {
     pub entry_size: u32,
     pub align: u32,
     pub type_name_off: u32,
     pub fields_off: u32,
+    pub tuple_size: u32,
+    pub tuple_align: u32,
+    pub tuple_name_off: u32,
+    pub tuple_idx_off: u32,
 }
 
 impl RecordInfoOffsets {
-    pub(crate) fn from_layout(layout: &RecordLayout) -> Self {
-        use super::super::schema::RECORD_INFO_FIELDS;
+    pub(crate) fn from_layout(layout: &RecordLayout, tuple_layout: &RecordLayout) -> Self {
+        use super::super::schema::{
+            RECORD_FIELD_TUPLE_IDX, RECORD_FIELD_TUPLE_NAME, RECORD_INFO_FIELDS,
+        };
         use super::sidetable::INFO_TYPE_NAME;
         Self {
             entry_size: layout.size,
             align: layout.align,
             type_name_off: layout.offset_of(INFO_TYPE_NAME),
             fields_off: layout.offset_of(RECORD_INFO_FIELDS),
+            tuple_size: tuple_layout.size,
+            tuple_align: tuple_layout.align,
+            tuple_name_off: tuple_layout.offset_of(RECORD_FIELD_TUPLE_NAME),
+            tuple_idx_off: tuple_layout.offset_of(RECORD_FIELD_TUPLE_IDX),
         }
     }
 }
@@ -398,6 +432,21 @@ pub(crate) struct ListEmitLocals {
     /// each cell carries its own `scratch_offset_in_elem` and the
     /// stride is the sum.
     pub flags_scratch_bytes_per_elem: u32,
+    /// Starting slot in the record-info buffer for this list's
+    /// elements; captured before the pre-pass bumps the running total.
+    /// `Some` iff `records_per_elem > 0`.
+    pub record_slot_base: Option<u32>,
+    /// `Cell::RecordOf` count in `element_plan`. Drives the per-list
+    /// bump (`len * records_per_elem`) + the per-iteration stage
+    /// (`record_slot_base + j * records_per_elem`).
+    pub records_per_elem: u32,
+    /// Per-call field-tuples scratch buffer base for this list — sized
+    /// at `len * record_tuples_bytes_per_elem`. `Some` iff
+    /// `record_tuples_bytes_per_elem > 0`.
+    pub record_tuples_buf_base: Option<u32>,
+    /// `Σ fields.len() * tuple_size` over all `Cell::RecordOf` cells
+    /// in `element_plan` — variable per cell.
+    pub record_tuples_bytes_per_elem: u32,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
@@ -408,10 +457,13 @@ pub(super) fn alloc_list_emit_locals(
     plan: &LiftPlan,
     resolve: &Resolve,
     size_align: &SizeAlign,
+    record_tuple_size: u32,
     builder: &mut LocalsBuilder,
 ) -> Vec<ListEmitLocals> {
     plan.list_specs()
-        .map(|spec: ListSpec<'_>| build_one_list_emit_locals(spec, resolve, size_align, builder))
+        .map(|spec: ListSpec<'_>| {
+            build_one_list_emit_locals(spec, resolve, size_align, record_tuple_size, builder)
+        })
         .collect()
 }
 
@@ -419,6 +471,7 @@ fn build_one_list_emit_locals(
     spec: ListSpec<'_>,
     resolve: &Resolve,
     size_align: &SizeAlign,
+    record_tuple_size: u32,
     builder: &mut LocalsBuilder,
 ) -> ListEmitLocals {
     let start_i = builder.alloc_local(ValType::I32);
@@ -443,7 +496,7 @@ fn build_one_list_emit_locals(
     lift_from_memory(resolve, &mut bindgen, (), &elem_ty);
     let elem_loads = bindgen.into_instructions();
     let elem_byte_size = size_align.size(&elem_ty).size_wasm32() as u32;
-    let (elem_cell_side, counts) = walk_element_plan(spec.element_plan);
+    let (elem_cell_side, counts) = walk_element_plan(spec.element_plan, record_tuple_size);
     let char_scratch_base = (counts.chars > 0).then(|| builder.alloc_local(ValType::I32));
     let tuple_idx_buf_base =
         (counts.tuple_idx_slots > 0).then(|| builder.alloc_local(ValType::I32));
@@ -456,6 +509,11 @@ fn build_one_list_emit_locals(
         (counts.flags_scratch_bytes > 0).then(|| builder.alloc_local(ValType::I32));
     let flags_per_elem = counts.flags;
     let flags_scratch_bytes_per_elem = counts.flags_scratch_bytes;
+    let record_slot_base = (counts.records > 0).then(|| builder.alloc_local(ValType::I32));
+    let records_per_elem = counts.records;
+    let record_tuples_buf_base =
+        (counts.record_tuples_bytes > 0).then(|| builder.alloc_local(ValType::I32));
+    let record_tuples_bytes_per_elem = counts.record_tuples_bytes;
     let elem_cell_base = builder.alloc_local(ValType::I32);
     ListEmitLocals {
         start_i,
@@ -478,6 +536,10 @@ fn build_one_list_emit_locals(
         flags_per_elem,
         flags_scratch_buf_base,
         flags_scratch_bytes_per_elem,
+        record_slot_base,
+        records_per_elem,
+        record_tuples_buf_base,
+        record_tuples_bytes_per_elem,
     }
 }
 
@@ -519,6 +581,10 @@ fn fn_has_list_elem_flags(fd: &FuncDispatch) -> bool {
     fn_has_list_elem_class(fd, ListElementClass::PrestagedFlags)
 }
 
+fn fn_has_list_elem_record(fd: &FuncDispatch) -> bool {
+    fn_has_list_elem_class(fd, ListElementClass::PrestagedRecord)
+}
+
 /// Any `Cell::Char` in the wrapper (params or result, including
 /// list-element plans). Gates `char_len` + `char_scratch_addr`.
 fn fn_contains_char(fd: &FuncDispatch) -> bool {
@@ -558,12 +624,11 @@ fn fn_has_flags_cells(fd: &FuncDispatch) -> bool {
         || fd.result_lift.as_ref().is_some_and(|rl| rl.flags_count > 0)
 }
 
-/// Any `Cell::RecordOf` in the wrapper. Gates
-/// `WrapperLocals.record_info_base`. List-element record support
-/// (commit-2) will fold in here when `Cell::RecordOf` opens in
-/// `list_element_class`.
+/// Any `Cell::RecordOf` in the wrapper (params or result, including
+/// list-element plans). Gates `WrapperLocals.record_info_base`.
 fn fn_has_record_cells(fd: &FuncDispatch) -> bool {
-    fd.params.iter().any(|p| p.record_count > 0)
+    fn_has_list_elem_record(fd)
+        || fd.params.iter().any(|p| p.record_count > 0)
         || fd
             .result_lift
             .as_ref()
@@ -592,6 +657,17 @@ pub(super) struct ElementCounts {
     /// each cell's slab lives at `flags_scratch_base + j * scratch_bytes
     /// + scratch_offset_in_elem`.
     pub flags_scratch_bytes: u32,
+    /// `Cell::RecordOf` count in `element_plan` — uniform-stride
+    /// entry slots at `record_slot_base + j * records +
+    /// entry_offset_in_elem`.
+    pub records: u32,
+    /// Total field-tuples bytes across all `Cell::RecordOf` cells in
+    /// `element_plan` — variable-stride per cell, sized at
+    /// `Σ fields.len() * record_field_tuple_layout.size`. Per
+    /// iteration each cell's tuples sub-slice lives at
+    /// `record_tuples_buf_base + j * record_tuples_bytes
+    /// + tuples_offset_in_elem`.
+    pub record_tuples_bytes: u32,
 }
 
 /// Single walk over `element_plan.cells` producing both the
@@ -605,7 +681,10 @@ pub(super) struct ElementCounts {
 /// BlobSlices) is read directly off the cell — no layout-phase
 /// strings table is needed; the slices were interned at plan-build
 /// time (see [`Cell::Flags`]).
-pub(super) fn walk_element_plan(element_plan: &LiftPlan) -> (Vec<CellSideData>, ElementCounts) {
+pub(super) fn walk_element_plan(
+    element_plan: &LiftPlan,
+    record_tuple_size: u32,
+) -> (Vec<CellSideData>, ElementCounts) {
     let mut counts = ElementCounts::default();
     let side: Vec<CellSideData> = element_plan
         .cells
@@ -678,6 +757,26 @@ pub(super) fn walk_element_plan(element_plan: &LiftPlan) -> (Vec<CellSideData>, 
                         flag_names: flag_names.clone(),
                     }))
                 }
+                ListElementClass::PrestagedRecord => {
+                    let Cell::RecordOf { type_name, fields } = cell else {
+                        unreachable!("PrestagedRecord class on non-RecordOf {cell:?}")
+                    };
+                    let entry_offset_in_elem = counts.records;
+                    let tuples_offset_in_elem = counts.record_tuples_bytes;
+                    counts.records += 1;
+                    counts.record_tuples_bytes += fields.len() as u32 * record_tuple_size;
+                    CellSideData::Record(Box::new(
+                        super::sidetable::record_info::RecordRuntimeFill {
+                            slot_source:
+                                super::sidetable::record_info::RecordSlotSource::PerIteration {
+                                    entry_offset_in_elem,
+                                    tuples_offset_in_elem,
+                                },
+                            type_name: *type_name,
+                            fields_len: fields.len() as u32,
+                        },
+                    ))
+                }
             }
         })
         .collect();
@@ -696,6 +795,7 @@ pub(super) fn walk_element_plan(element_plan: &LiftPlan) -> (Vec<CellSideData>, 
 pub(crate) fn alloc_wrapper_locals<'a>(
     resolve: &Resolve,
     size_align: &SizeAlign,
+    record_tuple_size: u32,
     mut builder: LocalsBuilder,
     fd: &'a FuncDispatch,
     func: &wit_parser::Function,
@@ -726,6 +826,15 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
     let flags_slot_addr = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
     let flags_payload_idx = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
+    let needs_list_record_locals = fn_has_list_elem_record(fd);
+    let list_elem_record_base =
+        needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let list_elem_record_tuples_base =
+        needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let record_slot_addr = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let record_payload_idx = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let record_tuples_slice_addr =
+        needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
     // Async with a non-retptr-passthrough task.return needs an
     // i32 addr local so `lift_from_memory` can flat-load result
@@ -785,8 +894,13 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
                 lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
                 let loads = bindgen.into_instructions();
-                let list_locals =
-                    alloc_list_emit_locals(&compound.plan, resolve, size_align, &mut builder);
+                let list_locals = alloc_list_emit_locals(
+                    &compound.plan,
+                    resolve,
+                    size_align,
+                    record_tuple_size,
+                    &mut builder,
+                );
                 ResultEmitPlan::Compound {
                     plan: &compound.plan,
                     retptr_offset: *retptr_offset,
@@ -805,7 +919,15 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let param_list_locals: Vec<Vec<ListEmitLocals>> = fd
         .params
         .iter()
-        .map(|p| alloc_list_emit_locals(&p.lift.plan, resolve, size_align, &mut builder))
+        .map(|p| {
+            alloc_list_emit_locals(
+                &p.lift.plan,
+                resolve,
+                size_align,
+                record_tuple_size,
+                &mut builder,
+            )
+        })
         .collect();
 
     // Async task.return flat-loads run a second `lift_from_memory`
@@ -850,6 +972,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let record_info_base = fn_has_record_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let next_handle_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
     let next_flags_idx = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
+    let next_record_idx = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
 
     let frozen = builder.freeze();
     (
@@ -875,6 +998,11 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             list_elem_flags_scratch_base,
             flags_slot_addr,
             flags_payload_idx,
+            list_elem_record_base,
+            list_elem_record_tuples_base,
+            record_slot_addr,
+            record_payload_idx,
+            record_tuples_slice_addr,
             result,
             tr_addr,
             id_local,
@@ -888,6 +1016,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             record_info_base,
             next_handle_idx,
             next_flags_idx,
+            next_record_idx,
             param_list_locals,
         },
         result_emit,
@@ -1096,6 +1225,7 @@ pub(crate) fn emit_list_pre_pass(
     plan: &LiftPlan,
     static_handle_count: u32,
     static_flags_count: u32,
+    static_record_count: u32,
     list_locals: &[ListEmitLocals],
     local_base: u32,
     lcl: &WrapperLocals,
@@ -1114,6 +1244,10 @@ pub(crate) fn emit_list_pre_pass(
     if let Some(next_flags_idx) = lcl.next_flags_idx {
         f.instructions().i32_const(static_flags_count as i32);
         f.instructions().local_set(next_flags_idx);
+    }
+    if let Some(next_record_idx) = lcl.next_record_idx {
+        f.instructions().i32_const(static_record_count as i32);
+        f.instructions().local_set(next_record_idx);
     }
     for spec in plan.list_specs() {
         let ll = &list_locals[spec.list_idx as usize];
@@ -1169,6 +1303,20 @@ pub(crate) fn emit_list_pre_pass(
             }
             f.instructions().i32_add();
             f.instructions().local_set(next_flags_idx);
+        }
+        if let (Some(next_record_idx), Some(record_slot_base)) =
+            (lcl.next_record_idx, ll.record_slot_base)
+        {
+            f.instructions().local_get(next_record_idx);
+            f.instructions().local_set(record_slot_base);
+            f.instructions().local_get(next_record_idx);
+            f.instructions().local_get(ll.len);
+            if ll.records_per_elem != 1 {
+                f.instructions().i32_const(ll.records_per_elem as i32);
+                f.instructions().i32_mul();
+            }
+            f.instructions().i32_add();
+            f.instructions().local_set(next_record_idx);
         }
         emit_close_arm_guards(f, spec.arm_guards.len());
     }
@@ -1240,17 +1388,13 @@ fn emit_cell_op(
             let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
             cell_layout.emit_bytes(f, addr, ptr, len);
         }
-        Cell::RecordOf { .. } => {
+        Cell::RecordOf { fields, .. } => {
             let CellSideData::Record(fill) = side_data else {
                 panic!("RecordOf cell paired with non-Record side data {side_data:?}");
             };
-            emit_record_runtime_fill(f, fill, lcl, ctx.record_info);
-            // Migration commit: every record cell is `Static`. When
-            // PerIteration lands this `let` becomes refutable and
-            // rustc forces the per-iter wiring before recompiling.
-            let super::sidetable::record_info::RecordSlotSource::Static { entry_idx } =
-                fill.slot_source;
-            cell_layout.emit_record_of(f, addr, entry_idx);
+            emit_record_runtime_fill(f, fill, fields, elem_cell_base, lcl, ctx.record_info);
+            let payload = stage_record_cell_payload(f, lcl, fill);
+            cell_layout.emit_record_of(f, addr, payload);
         }
         Cell::TupleOf { children } => {
             let CellSideData::Tuple { source: src_kind } = side_data else {
@@ -1462,6 +1606,20 @@ fn emit_list_of_arm(
             buf_base,
         );
     }
+    // Per-element record field-tuples scratch:
+    // `record_tuples_bytes_per_elem` bytes per iteration. Each
+    // Cell::RecordOf element has its own tuples sub-slice
+    // (`tuples_offset_in_elem`), allowing multi-record elements.
+    if let Some(buf_base) = ll.record_tuples_buf_base {
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            ctx.record_info.tuple_align,
+            ll.len,
+            ll.record_tuples_bytes_per_elem,
+            buf_base,
+        );
+    }
     cell_layout.emit_list_of(f, lcl.addr, ll.indices_ptr, ll.len);
 
     // for (j = 0; j < len; j++) { ... }
@@ -1562,6 +1720,39 @@ fn emit_list_of_arm(
         f.instructions().local_get(ll.j);
         f.instructions()
             .i32_const(ll.flags_scratch_bytes_per_elem as i32);
+        f.instructions().i32_mul();
+        f.instructions().i32_add();
+        f.instructions().local_set(dest);
+    }
+
+    // list_elem_record_base = record_slot_base + j * records_per_elem
+    // list_elem_record_tuples_base = record_tuples_buf_base
+    //                              + j * record_tuples_bytes_per_elem
+    // Both staged once so per-cell `emit_record_runtime_fill` adds the
+    // build-time-const offsets without recomputing.
+    if let Some(slot_base) = ll.record_slot_base {
+        let dest = lcl.list_elem_record_base.expect(
+            "list_elem_record_base unset — fn_has_list_elem_record gate \
+             disagrees with ListEmitLocals.record_slot_base",
+        );
+        f.instructions().local_get(slot_base);
+        f.instructions().local_get(ll.j);
+        if ll.records_per_elem != 1 {
+            f.instructions().i32_const(ll.records_per_elem as i32);
+            f.instructions().i32_mul();
+        }
+        f.instructions().i32_add();
+        f.instructions().local_set(dest);
+    }
+    if let Some(buf_base) = ll.record_tuples_buf_base {
+        let dest = lcl.list_elem_record_tuples_base.expect(
+            "list_elem_record_tuples_base unset — fn_has_list_elem_record \
+             gate disagrees with ListEmitLocals.record_tuples_buf_base",
+        );
+        f.instructions().local_get(buf_base);
+        f.instructions().local_get(ll.j);
+        f.instructions()
+            .i32_const(ll.record_tuples_bytes_per_elem as i32);
         f.instructions().i32_mul();
         f.instructions().i32_add();
         f.instructions().local_set(dest);
@@ -1907,15 +2098,18 @@ fn emit_handle_runtime_fill(
 }
 
 /// Fill one `Cell::RecordOf`'s slot in the per-call record-info
-/// buffer: build-time-const `type-name` + `fields` slice (`(ptr, len)`).
-/// All three fields are constants for static cells (the tuples
-/// segment is laid out at build time and the per-cell `fields_ptr`
-/// is pre-resolved to absolute by `back_fill_record_fields_ptrs`).
-/// List-element records (commit-2) will compute `slot_addr` and
-/// `fields_ptr` per iteration off the staged base locals.
+/// buffer: write `type-name` + `fields` slice (`(ptr, len)`). Static
+/// cells fold offsets into memargs and use the pre-resolved absolute
+/// `fields_ptr` from the fill. List-element cells stage the entry
+/// address + per-iter `fields_ptr` from the iter base locals, then
+/// write each field's `(name, child-cell-idx)` tuple into the
+/// per-iter tuples sub-slice (with `cell_idx = elem_cell_base +
+/// child_pos_in_elem` resolved at runtime).
 fn emit_record_runtime_fill(
     f: &mut Function,
     fill: &RecordRuntimeFill,
+    fields: &[(BlobSlice, u32)],
+    elem_cell_base: Option<u32>,
     lcl: &WrapperLocals,
     info: RecordInfoOffsets,
 ) {
@@ -1925,36 +2119,177 @@ fn emit_record_runtime_fill(
          fn_has_record_cells gate must agree with the cells reaching \
          emit_record_runtime_fill",
     );
-    // Migration commit: only `Static` slots are constructed. When
-    // PerIteration lands this let becomes refutable, forcing the
-    // per-iter slot-addr stage to be wired before recompiling.
-    let RecordSlotSource::Static { entry_idx } = fill.slot_source;
-    let entry_off = entry_idx * info.entry_size;
-    let type_name_off = entry_off + info.type_name_off;
-    let fields_off = entry_off + info.fields_off;
-
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
         memory_index: 0,
     };
-    let store_const = |f: &mut Function, off: u32, value: i32| {
-        f.instructions().local_get(base_local);
-        f.instructions().i32_const(value);
-        f.instructions().i32_store(store_i32(off));
-    };
-    store_const(
-        f,
-        type_name_off + SLICE_PTR_OFFSET,
-        fill.type_name.off as i32,
-    );
-    store_const(
-        f,
-        type_name_off + SLICE_LEN_OFFSET,
-        fill.type_name.len as i32,
-    );
-    store_const(f, fields_off + SLICE_PTR_OFFSET, fill.fields_ptr);
-    store_const(f, fields_off + SLICE_LEN_OFFSET, fill.fields_len as i32);
+
+    match fill.slot_source {
+        RecordSlotSource::Static {
+            entry_idx,
+            fields_ptr,
+        } => {
+            let entry_off = entry_idx * info.entry_size;
+            let type_name_off = entry_off + info.type_name_off;
+            let fields_off = entry_off + info.fields_off;
+            let store_const = |f: &mut Function, off: u32, value: i32| {
+                f.instructions().local_get(base_local);
+                f.instructions().i32_const(value);
+                f.instructions().i32_store(store_i32(off));
+            };
+            store_const(
+                f,
+                type_name_off + SLICE_PTR_OFFSET,
+                fill.type_name.off as i32,
+            );
+            store_const(
+                f,
+                type_name_off + SLICE_LEN_OFFSET,
+                fill.type_name.len as i32,
+            );
+            store_const(f, fields_off + SLICE_PTR_OFFSET, fields_ptr);
+            store_const(f, fields_off + SLICE_LEN_OFFSET, fill.fields_len as i32);
+        }
+        RecordSlotSource::PerIteration {
+            entry_offset_in_elem,
+            tuples_offset_in_elem,
+        } => {
+            let iter_entry_base = lcl.list_elem_record_base.expect(
+                "list_elem_record_base unset — fn_has_list_elem_record gate disagrees",
+            );
+            let iter_tuples_base = lcl.list_elem_record_tuples_base.expect(
+                "list_elem_record_tuples_base unset — fn_has_list_elem_record gate disagrees",
+            );
+            let entry_dest = lcl.record_slot_addr.expect(
+                "record_slot_addr unset — fn_has_list_elem_record gate disagrees \
+                 with the cells reaching emit_record_runtime_fill",
+            );
+            let tuples_dest = lcl.record_tuples_slice_addr.expect(
+                "record_tuples_slice_addr unset — fn_has_list_elem_record gate disagrees",
+            );
+            // entry_addr = base + (iter_entry_base + entry_offset_in_elem) * entry_size
+            f.instructions().local_get(iter_entry_base);
+            if entry_offset_in_elem != 0 {
+                f.instructions().i32_const(entry_offset_in_elem as i32);
+                f.instructions().i32_add();
+            }
+            f.instructions().i32_const(info.entry_size as i32);
+            f.instructions().i32_mul();
+            f.instructions().local_get(base_local);
+            f.instructions().i32_add();
+            f.instructions().local_set(entry_dest);
+            // tuples_slice_addr = iter_tuples_base + tuples_offset_in_elem
+            f.instructions().local_get(iter_tuples_base);
+            if tuples_offset_in_elem != 0 {
+                f.instructions().i32_const(tuples_offset_in_elem as i32);
+                f.instructions().i32_add();
+            }
+            f.instructions().local_set(tuples_dest);
+
+            // Write type-name (build-time-const) + fields.len
+            // (build-time-const) into the entry, with fields.ptr =
+            // tuples_slice_addr (runtime).
+            let store_const = |f: &mut Function, off: u32, value: i32| {
+                f.instructions().local_get(entry_dest);
+                f.instructions().i32_const(value);
+                f.instructions().i32_store(store_i32(off));
+            };
+            store_const(
+                f,
+                info.type_name_off + SLICE_PTR_OFFSET,
+                fill.type_name.off as i32,
+            );
+            store_const(
+                f,
+                info.type_name_off + SLICE_LEN_OFFSET,
+                fill.type_name.len as i32,
+            );
+            f.instructions().local_get(entry_dest);
+            f.instructions().local_get(tuples_dest);
+            f.instructions()
+                .i32_store(store_i32(info.fields_off + SLICE_PTR_OFFSET));
+            store_const(
+                f,
+                info.fields_off + SLICE_LEN_OFFSET,
+                fill.fields_len as i32,
+            );
+
+            // Per field: write the tuple at
+            //   tuples_slice_addr + i * tuple_size
+            // with name = const, idx = elem_cell_base + child_pos.
+            let elem_base = elem_cell_base.expect(
+                "PerIteration record fill outside a list element body — \
+                 emit_cell_op must thread elem_cell_base for list-element records",
+            );
+            debug_assert_eq!(
+                fields.len() as u32,
+                fill.fields_len,
+                "fill.fields_len must match the cell's fields slice",
+            );
+            for (i, (name, child_pos_in_elem)) in fields.iter().enumerate() {
+                let i = i as u32;
+                let tuple_off = i * info.tuple_size;
+                // tuple.name = const
+                let store_name = |f: &mut Function, off: u32, value: i32| {
+                    f.instructions().local_get(tuples_dest);
+                    f.instructions().i32_const(value);
+                    f.instructions().i32_store(store_i32(off));
+                };
+                store_name(
+                    f,
+                    tuple_off + info.tuple_name_off + SLICE_PTR_OFFSET,
+                    name.off as i32,
+                );
+                store_name(
+                    f,
+                    tuple_off + info.tuple_name_off + SLICE_LEN_OFFSET,
+                    name.len as i32,
+                );
+                // tuple.idx = elem_cell_base + child_pos_in_elem
+                f.instructions().local_get(tuples_dest);
+                f.instructions().local_get(elem_base);
+                if *child_pos_in_elem != 0 {
+                    f.instructions().i32_const(*child_pos_in_elem as i32);
+                    f.instructions().i32_add();
+                }
+                f.instructions()
+                    .i32_store(store_i32(tuple_off + info.tuple_idx_off));
+            }
+        }
+    }
+}
+
+/// Resolve a `Cell::RecordOf`'s `cell::record-of(idx)` payload.
+/// Same shape as [`stage_flags_cell_payload`].
+fn stage_record_cell_payload(
+    f: &mut Function,
+    lcl: &WrapperLocals,
+    fill: &RecordRuntimeFill,
+) -> PayloadSource {
+    use super::sidetable::record_info::RecordSlotSource;
+    match fill.slot_source {
+        RecordSlotSource::Static { entry_idx, .. } => PayloadSource::ConstI32(entry_idx as i32),
+        RecordSlotSource::PerIteration {
+            entry_offset_in_elem,
+            ..
+        } => {
+            let iter_base = lcl
+                .list_elem_record_base
+                .expect("list_elem_record_base unset — fn_has_list_elem_record gate disagrees");
+            if entry_offset_in_elem == 0 {
+                return PayloadSource::Local(iter_base);
+            }
+            let dest = lcl
+                .record_payload_idx
+                .expect("record_payload_idx unset — fn_has_list_elem_record gate disagrees");
+            f.instructions().local_get(iter_base);
+            f.instructions().i32_const(entry_offset_in_elem as i32);
+            f.instructions().i32_add();
+            f.instructions().local_set(dest);
+            PayloadSource::Local(dest)
+        }
+    }
 }
 
 /// Resolve a `Cell::Flags`'s `cell::flags-set(idx)` payload.

@@ -1790,6 +1790,37 @@ fn tier2_shapes() -> Vec<Shape> {
                 selected: 0b010,
             },
         ]))),
+        // list<point>: per-call record-info buffer + per-call
+        // field-tuples buffer. Each iteration writes one record-info
+        // entry and the matching `(field-name, child-cell-idx)` tuples
+        // (cell-idxs runtime-resolved off `elem_cell_base`). End-to-end
+        // pin for the PerIteration record fill emit path.
+        Shape::List(Box::new(Shape::Record {
+            wit_name: "point",
+            rust_name: "Point",
+            fields: vec![
+                (
+                    "x",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "3u32",
+                        expected_debug: "3",
+                    },
+                ),
+                (
+                    "y",
+                    Shape::Primitive {
+                        name: "s32",
+                        wit_type: "s32",
+                        rust_ty: "i32",
+                        rust_literal: "-5i32",
+                        expected_debug: "-5",
+                    },
+                ),
+            ],
+        })),
     ]
 }
 

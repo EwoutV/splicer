@@ -107,6 +107,7 @@ struct CellsTarget {
     cells_field_off: u32,
     static_handle_count: u32,
     static_flags_count: u32,
+    static_record_count: u32,
 }
 
 /// Cells-slab allocation for one (param | result) plan. Runs the
@@ -130,6 +131,7 @@ fn emit_alloc_cells_for_plan(
         plan,
         target.static_handle_count,
         target.static_flags_count,
+        target.static_record_count,
         list_locals,
         local_base,
         lcl,
@@ -296,19 +298,43 @@ fn emit_alloc_flags_info_for_plan(
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
-/// Per-call record-info buffer alloc + slice-ptr patch. Static-only
-/// regime today (mirrors [`emit_alloc_flags_info_for_plan`]'s
-/// build-time-const branch); the runtime-sized branch lands when
-/// `Cell::RecordOf` opens in `list_element_class`. Field-tree's
-/// `record_infos.len` was baked statically in `build_fields_blob`.
+/// Per-call record-info buffer alloc + slice-ptr patch. Mirrors
+/// [`emit_alloc_flags_info_for_plan`]'s two-regime structure
+/// (static-count + runtime-count) for the per-call record-info
+/// entries buffer. The field-tuples themselves stay baked in the
+/// static tuples segment for non-list-element records; list-element
+/// records get a per-list field-tuples buffer allocated in
+/// `emit_list_of_arm`.
 fn emit_alloc_record_info_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
     static_count: u32,
+    runtime_sized: bool,
     base_ptr: i32,
     slice_field_off: u32,
     lcl: &WrapperLocals,
 ) {
+    if runtime_sized {
+        let count_local = lcl.next_record_idx.expect(
+            "next_record_idx unset — fn_has_list_elem_record gate disagrees \
+             with the plan's list_specs",
+        );
+        let base_local = lcl.record_info_base.expect(
+            "record_info_base local unset — fn_has_record_cells gate disagrees \
+             with fn_has_list_elem_record",
+        );
+        emit_cabi_realloc_call_runtime(
+            f,
+            ctx.cabi_realloc_idx,
+            ctx.record_info.align,
+            count_local,
+            ctx.record_info.entry_size,
+            base_local,
+        );
+        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
+        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
+        return;
+    }
     if static_count == 0 {
         return;
     }
@@ -369,8 +395,14 @@ pub(super) fn emit_wrapper_function(
     // sequences, and returns a `FrozenLocals`. After this point there
     // is no `LocalsBuilder` in scope, so additional `alloc_local` calls
     // are a compile error.
-    let (lcl, result_emit, frozen) =
-        alloc_wrapper_locals(ctx.resolve, &schema.size_align, builder, fd, func);
+    let (lcl, result_emit, frozen) = alloc_wrapper_locals(
+        ctx.resolve,
+        &schema.size_align,
+        schema.record_field_tuple_layout.size,
+        builder,
+        fd,
+        func,
+    );
 
     let mut f = Function::new_with_locals_types(frozen.locals);
 
@@ -387,7 +419,10 @@ pub(super) fn emit_wrapper_function(
         cabi_realloc_idx: func_idx.cabi_realloc_idx,
         handle_info: HandleInfoOffsets::from_layout(&schema.handle_info_layout),
         flags_info: FlagsInfoOffsets::from_layout(&schema.flags_info_layout),
-        record_info: RecordInfoOffsets::from_layout(&schema.record_info_layout),
+        record_info: RecordInfoOffsets::from_layout(
+            &schema.record_info_layout,
+            &schema.record_field_tuple_layout,
+        ),
     };
 
     // ── Phase 1: on-call (only if before-hook wired) ──
@@ -415,6 +450,7 @@ pub(super) fn emit_wrapper_function(
                     cells_field_off: field_off + cells_slice_off,
                     static_handle_count: p.handle_count,
                     static_flags_count: p.flags_count,
+                    static_record_count: p.record_count,
                 },
             );
             emit_alloc_handle_info_for_plan(
@@ -439,6 +475,7 @@ pub(super) fn emit_wrapper_function(
                 &mut f,
                 &lift_ctx,
                 p.record_count,
+                p.lift.plan.has_list_elem_record(),
                 fd.fields_buf_offset as i32,
                 field_off + record_infos_slice_off,
                 &lcl,
@@ -588,6 +625,7 @@ pub(super) fn emit_wrapper_function(
                         cells_field_off,
                         static_handle_count: result_handle_count,
                         static_flags_count: result_flags_count,
+                        static_record_count: result_record_count,
                     },
                 );
                 emit_alloc_handle_info_for_plan(
@@ -612,6 +650,7 @@ pub(super) fn emit_wrapper_function(
                     &mut f,
                     &lift_ctx,
                     result_record_count,
+                    plan.has_list_elem_record(),
                     after_pf.params_offset,
                     record_infos_field_off,
                     &lcl,
@@ -668,6 +707,7 @@ pub(super) fn emit_wrapper_function(
                     &mut f,
                     &lift_ctx,
                     result_record_count,
+                    false,
                     after_pf.params_offset,
                     record_infos_field_off,
                     &lcl,

@@ -279,6 +279,15 @@ pub(crate) enum ListElementClass {
     /// (uniform stride) and the set-flags scratch buffer
     /// (per-cell variable stride within an iteration).
     PrestagedFlags,
+    /// `Cell::RecordOf`. Folds to `CellSideData::Record` with
+    /// `RecordSlotSource::PerIteration`. Two per-call buffers grow
+    /// with list-element records: the record-info entries buffer
+    /// (uniform stride) and the field-tuples buffer (per-cell
+    /// variable stride within an iteration). β scope is scalar-field
+    /// records — list elements that contain compound (record,
+    /// variant, list, …) cells stay gated until classify can flatten
+    /// them through the element plan.
+    PrestagedRecord,
 }
 
 impl Cell {
@@ -294,6 +303,7 @@ impl Cell {
             Cell::TupleOf { .. } => Some(ListElementClass::PrestagedTupleIndices),
             Cell::Handle { .. } => Some(ListElementClass::PrestagedHandle),
             Cell::Flags { .. } => Some(ListElementClass::PrestagedFlags),
+            Cell::RecordOf { .. } => Some(ListElementClass::PrestagedRecord),
             Cell::Bool { .. }
             | Cell::IntegerSignExt { .. }
             | Cell::IntegerZeroExt { .. }
@@ -303,7 +313,7 @@ impl Cell {
             | Cell::Text { .. }
             | Cell::Bytes { .. }
             | Cell::EnumCase { .. } => Some(ListElementClass::Scalar),
-            Cell::RecordOf { .. } | Cell::Variant { .. } | Cell::ListOf { .. } => None,
+            Cell::Variant { .. } | Cell::ListOf { .. } => None,
         }
     }
 
@@ -433,6 +443,16 @@ impl LiftPlan {
                 .cells
                 .iter()
                 .any(|c| matches!(c, Cell::Flags { .. }))
+        })
+    }
+
+    /// Companion to [`has_list_elem_handle`] for `Cell::RecordOf`.
+    pub(crate) fn has_list_elem_record(&self) -> bool {
+        self.list_specs().any(|spec| {
+            spec.element_plan
+                .cells
+                .iter()
+                .any(|c| matches!(c, Cell::RecordOf { .. }))
         })
     }
 
@@ -1010,9 +1030,9 @@ impl LiftPlanBuilder {
                 "`list<T>` element type {elem:?} contains a cell shape that \
                  isn't yet supported as a list element (allowed today: bool, \
                  integers, floats, string, list<u8>, enum, char, option, \
-                 result, tuple, flags, own/borrow/stream/future/error-context \
+                 result, tuple, flags, record, own/borrow/stream/future/error-context \
                  handles — with allowed inner cells throughout). Still \
-                 gated: record, variant, nested list. File a request at \
+                 gated: variant, nested list. File a request at \
                  {ISSUES_URL} to bump priority."
             ));
         }

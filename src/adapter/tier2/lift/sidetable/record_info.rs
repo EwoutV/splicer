@@ -24,34 +24,42 @@ use super::super::plan::{Cell, LiftPlan};
 use super::PerCellIndices;
 
 /// Where a `Cell::RecordOf`'s slot lives in the per-(fn, param | result)
-/// record-info buffer.
+/// record-info buffer plus where its field-tuples sub-slice lives.
+/// Static cells carry a build-time `entry_idx` and a pre-resolved
+/// absolute `fields_ptr`; list-element cells stripe both the entry
+/// idx and the tuples sub-slice off per-iter bases. Mirrors flags's
+/// `Static { entry_idx, scratch_addr } / PerIteration { … }` pair —
+/// each variant carries exactly the data the corresponding emit
+/// branch consumes, no dead fields.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum RecordSlotSource {
-    /// Build-time absolute index — outer-plan records.
-    Static { entry_idx: u32 },
-    // List-element variant lands when `Cell::RecordOf` is opened in
-    // `Cell::list_element_class`. Will mirror `FlagsSlotSource::PerIteration`:
-    // entry idx = `list_elem_record_base + entry_offset_in_elem`,
-    // fields ptr = per-iter tuples-buffer slot, all at runtime.
+    /// Outer-plan records: `entry_idx` is build-time-const and
+    /// `fields_ptr` is a pre-resolved absolute address (post
+    /// [`back_fill_record_fields_ptrs`]).
+    Static { entry_idx: u32, fields_ptr: i32 },
+    /// List-element records: entry idx is `list_elem_record_base +
+    /// entry_offset_in_elem`; field-tuples sub-slice base is
+    /// `list_elem_record_tuples_base + tuples_offset_in_elem`. Both
+    /// `*_offset_in_elem`s are build-time-known (the cell's position
+    /// among the element-plan's record cells); the runtime locals
+    /// are staged by the list-of-arm.
+    PerIteration {
+        entry_offset_in_elem: u32,
+        tuples_offset_in_elem: u32,
+    },
 }
 
 /// Per-(plan-cell) emit-phase data for one `Cell::RecordOf`. The
-/// wrapper writes `type-name` + `fields.ptr` + `fields.len`
-/// (all build-time-const for static cells) into the buffer slot
-/// resolved from `slot_source`. Cell payload is `cell::record-of(idx)`
-/// with the same idx as `slot_source`.
+/// wrapper writes `type-name` + `fields.ptr` + `fields.len` into the
+/// buffer slot resolved from `slot_source`; cell payload is
+/// `cell::record-of(idx)` with the same idx as `slot_source`.
 #[derive(Clone, Debug)]
 pub(crate) struct RecordRuntimeFill {
     pub slot_source: RecordSlotSource,
     /// `(off, len)` of the type-name into the shared name blob.
     pub type_name: BlobSlice,
-    /// Absolute address of this record's `(field-name, child-cell-idx)`
-    /// tuples slice within the baked tuples segment. Layout-phase
-    /// patches the segment-relative offset to absolute via
-    /// [`back_fill_record_fields_ptrs`] once the tuples segment has
-    /// a base. List-element records (commit-2) compute this per call.
-    pub fields_ptr: i32,
-    /// Number of `(name, idx)` tuples for this record.
+    /// Number of `(name, idx)` tuples for this record. Build-time-
+    /// const for both Static and PerIteration regimes.
     pub fields_len: u32,
 }
 
@@ -152,10 +160,12 @@ fn scan_plan(
                 tuple.write_i32(tuples_bytes, RECORD_FIELD_TUPLE_IDX, *child_cell_idx as i32);
             }
             fill_map[cell_pos] = Some(RecordRuntimeFill {
-                slot_source: RecordSlotSource::Static { entry_idx: count },
+                slot_source: RecordSlotSource::Static {
+                    entry_idx: count,
+                    // Segment-relative until back_fill_record_fields_ptrs runs.
+                    fields_ptr: tuples_off as i32,
+                },
                 type_name: *type_name,
-                // Segment-relative until back_fill_record_fields_ptrs runs.
-                fields_ptr: tuples_off as i32,
                 fields_len,
             });
             count += 1;
@@ -173,12 +183,15 @@ pub(crate) fn back_fill_record_fields_ptrs(
     per_cell_fill: &mut PerCellIndices<RecordRuntimeFill>,
     tuples_base: u32,
 ) {
-    super::back_fill_per_cell(per_cell_fill, &mut [], |fill| {
-        // commit-1: only `Static` is constructed. PerIteration lands
-        // in commit-2 and gets its own (no-op-here) match arm.
-        let RecordSlotSource::Static { .. } = fill.slot_source;
-        fill.fields_ptr = (tuples_base as i32)
-            .checked_add(fill.fields_ptr)
-            .expect("absolute fields_ptr overflowed i32 — tuples_base + offset > 2 GB");
+    super::back_fill_per_cell(per_cell_fill, &mut [], |fill| match &mut fill.slot_source {
+        RecordSlotSource::Static { fields_ptr, .. } => {
+            *fields_ptr = (tuples_base as i32)
+                .checked_add(*fields_ptr)
+                .expect("absolute fields_ptr overflowed i32 — tuples_base + offset > 2 GB");
+        }
+        // PerIteration `fields_ptr` is computed per call from
+        // `list_elem_record_tuples_base + tuples_offset_in_elem` —
+        // not rebased off the static tuples segment.
+        RecordSlotSource::PerIteration { .. } => {}
     });
 }

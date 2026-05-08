@@ -36,6 +36,7 @@ const TEST_WIT: &str = r#"
         flags fcaps { net, fs, time, env, rand }
         variant shape { circle, sq(u32), tri(u32) }
         record point { x: u32, y: s32 }
+        record solo { v: u32 }
         record nested { p: point, c: color }
         record two-enums { c: color, m: mood }
         record pair { a: u8, b: u8 }
@@ -123,6 +124,16 @@ const TEST_WIT: &str = r#"
         f-list-of-list: func(xs: list<list<u32>>);
         record list-pair { items: list<string>, scores: list<u32> }
         f-list-of-record: func(xs: list<point>);
+        // `list<variant>` is still gated — covers the bail path that
+        // the deleted `list_of_compound_element_bails_at_plan_build`
+        // generic-test used to assert. New still-gated kinds drop in
+        // here as one-liners.
+        f-list-of-variant: func(xs: list<shape>);
+        // Multi-record element with mismatched field counts (point=2,
+        // solo=1) — pins literal `tuples_offset_in_elem` so a
+        // uniform-stride bug (e.g. records_per_elem * max_fields *
+        // tuple_size) doesn't silently match the cumulative formula.
+        f-list-tuple-record-mixed: func(xs: list<tuple<point, solo>>);
         f-result-list-list: func(r: result<list<u32>, list<u32>>);
         variant list-or-int { with-list(list<u32>), plain(u32) }
         f-variant-list-arm: func(v: list-or-int);
@@ -449,12 +460,14 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 let entry_idx = record_idx;
                 let fields_ptr = (RECORD_TUPLES_BASE + entry_idx * RECORD_TUPLES_STRIDE) as i32;
                 let fill = RecordRuntimeFill {
-                    slot_source: RecordSlotSource::Static { entry_idx },
+                    slot_source: RecordSlotSource::Static {
+                        entry_idx,
+                        fields_ptr,
+                    },
                     type_name: BlobSlice {
                         off: 0,
                         len: STUB_RECORD_NAME_LEN,
                     },
-                    fields_ptr,
                     fields_len: fields.len() as u32,
                 };
                 record_idx += 1;
@@ -569,6 +582,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let handle_info_layout = synth_info_layout("handle-info");
     let flags_info_layout = synth_info_layout("flags-info");
     let record_info_layout = synth_info_layout("record-info");
+    let (_, record_field_tuple_layout) = synth_record_info_layouts(resolve);
     let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan, resolve);
     let n = plan.flat_slot_count;
@@ -599,6 +613,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let record_info_base = builder.alloc_local(ValType::I32);
     let next_handle_idx = builder.alloc_local(ValType::I32);
     let next_flags_idx = builder.alloc_local(ValType::I32);
+    let next_record_idx = builder.alloc_local(ValType::I32);
     let list_elem_handle_base = builder.alloc_local(ValType::I32);
     let handle_slot_addr = builder.alloc_local(ValType::I32);
     let handle_payload_idx = builder.alloc_local(ValType::I32);
@@ -606,7 +621,18 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let list_elem_flags_scratch_base = builder.alloc_local(ValType::I32);
     let flags_slot_addr = builder.alloc_local(ValType::I32);
     let flags_payload_idx = builder.alloc_local(ValType::I32);
-    let list_locals = super::emit::alloc_list_emit_locals(plan, resolve, &sizes, &mut builder);
+    let list_elem_record_base = builder.alloc_local(ValType::I32);
+    let list_elem_record_tuples_base = builder.alloc_local(ValType::I32);
+    let record_slot_addr = builder.alloc_local(ValType::I32);
+    let record_payload_idx = builder.alloc_local(ValType::I32);
+    let record_tuples_slice_addr = builder.alloc_local(ValType::I32);
+    let list_locals = super::emit::alloc_list_emit_locals(
+        plan,
+        resolve,
+        &sizes,
+        record_field_tuple_layout.size,
+        &mut builder,
+    );
     let FrozenLocals { locals } = builder.freeze();
 
     let lcl = WrapperLocals {
@@ -631,6 +657,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         record_info_base: Some(record_info_base),
         next_handle_idx: Some(next_handle_idx),
         next_flags_idx: Some(next_flags_idx),
+        next_record_idx: Some(next_record_idx),
         list_elem_handle_base: Some(list_elem_handle_base),
         handle_slot_addr: Some(handle_slot_addr),
         handle_payload_idx: Some(handle_payload_idx),
@@ -638,6 +665,11 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         list_elem_flags_scratch_base: Some(list_elem_flags_scratch_base),
         flags_slot_addr: Some(flags_slot_addr),
         flags_payload_idx: Some(flags_payload_idx),
+        list_elem_record_base: Some(list_elem_record_base),
+        list_elem_record_tuples_base: Some(list_elem_record_tuples_base),
+        record_slot_addr: Some(record_slot_addr),
+        record_payload_idx: Some(record_payload_idx),
+        record_tuples_slice_addr: Some(record_tuples_slice_addr),
         result: None,
         tr_addr: None,
         id_local,
@@ -687,7 +719,10 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         cabi_realloc_idx: 0,
         handle_info: super::emit::HandleInfoOffsets::from_layout(&handle_info_layout),
         flags_info: super::emit::FlagsInfoOffsets::from_layout(&flags_info_layout),
-        record_info: super::emit::RecordInfoOffsets::from_layout(&record_info_layout),
+        record_info: super::emit::RecordInfoOffsets::from_layout(
+            &record_info_layout,
+            &record_field_tuple_layout,
+        ),
     };
     emit_lift_plan(
         &mut f,
@@ -1238,7 +1273,10 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
     // offset_in_elem (TupleOf children, Handle slots).
     use super::sidetable::flags_info::FlagsSlotSource;
     use super::sidetable::handle_info::HandleSlotSource;
+    use super::sidetable::record_info::RecordSlotSource;
     let (r, mut names) = setup();
+    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let record_tuple_size = record_tuple_layout.size;
     for fn_name in [
         "f-list-tuple-u32-string",
         "f-list-tuple-of-tuple",
@@ -1249,16 +1287,20 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
         "f-list-flags",
         "f-list-tuple-of-flags",
         "f-list-tuple-mixed-flags",
+        "f-list-of-record",
+        "f-list-tuple-record-mixed",
     ] {
         let plan = plan_for_param(fn_name, &r, &mut names);
         let elem_plan = list_element_plan(&plan, 0);
-        let (side, counts) = super::emit::walk_element_plan(elem_plan);
+        let (side, counts) = super::emit::walk_element_plan(elem_plan, record_tuple_size);
         assert_eq!(side.len(), elem_plan.cells.len());
         let mut expected_chars = 0u32;
         let mut expected_tuple_slots = 0u32;
         let mut expected_handles = 0u32;
         let mut expected_flags = 0u32;
         let mut expected_flags_scratch = 0u32;
+        let mut expected_records = 0u32;
+        let mut expected_record_tuples_bytes = 0u32;
         let mut running_tuple_off = 0u32;
         for (cell, sd) in elem_plan.cells.iter().zip(side.iter()) {
             match cell {
@@ -1324,6 +1366,33 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
                     expected_flags += 1;
                     expected_flags_scratch += flag_names.len() as u32 * STRING_FLAT_BYTES;
                 }
+                Cell::RecordOf { fields, .. } => {
+                    let CellSideData::Record(fill) = sd else {
+                        panic!("expected Record side data, got {sd:?}");
+                    };
+                    let RecordSlotSource::PerIteration {
+                        entry_offset_in_elem,
+                        tuples_offset_in_elem,
+                    } = fill.slot_source
+                    else {
+                        panic!(
+                            "list-element Record must carry PerIteration slot source, \
+                             got {:?}",
+                            fill.slot_source,
+                        );
+                    };
+                    assert_eq!(
+                        entry_offset_in_elem, expected_records,
+                        "Record entry_offset_in_elem must be the cumulative count",
+                    );
+                    assert_eq!(
+                        tuples_offset_in_elem, expected_record_tuples_bytes,
+                        "Record tuples_offset_in_elem must be cumulative \
+                         (sum of prior cells' field-tuples sizes)",
+                    );
+                    expected_records += 1;
+                    expected_record_tuples_bytes += fields.len() as u32 * record_tuple_size;
+                }
                 _ => assert!(matches!(sd, CellSideData::None)),
             }
         }
@@ -1347,6 +1416,14 @@ fn walk_element_plan_counts_match_side_data_lockstep() {
             counts.flags_scratch_bytes, expected_flags_scratch,
             "counts.flags_scratch_bytes drift in {fn_name}",
         );
+        assert_eq!(
+            counts.records, expected_records,
+            "counts.records drift in {fn_name}",
+        );
+        assert_eq!(
+            counts.record_tuples_bytes, expected_record_tuples_bytes,
+            "counts.record_tuples_bytes drift in {fn_name}",
+        );
     }
 }
 
@@ -1364,7 +1441,8 @@ fn walk_element_plan_pins_mixed_flags_scratch_bytes_literal() {
     let (r, mut names) = setup();
     let plan = plan_for_param("f-list-tuple-mixed-flags", &r, &mut names);
     let elem_plan = list_element_plan(&plan, 0);
-    let (side, counts) = super::emit::walk_element_plan(elem_plan);
+    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let (side, counts) = super::emit::walk_element_plan(elem_plan, record_tuple_layout.size);
     let flags_offsets: Vec<(u32, u32)> = side
         .iter()
         .filter_map(|sd| match sd {
@@ -1389,14 +1467,56 @@ fn walk_element_plan_pins_mixed_flags_scratch_bytes_literal() {
 }
 
 #[test]
+fn walk_element_plan_pins_mixed_record_tuples_bytes_literal() {
+    // Twin of [`walk_element_plan_pins_mixed_flags_scratch_bytes_literal`]
+    // for record tuples. `f-list-tuple-record-mixed` =
+    // list<tuple<point, solo>>, point = 2 fields, solo = 1 field. The
+    // element-plan record-cells land at cumulative
+    // `tuples_offset_in_elem`s of (0, 2 * tuple_size); a regression
+    // that uses a uniform per-record stride (e.g. max-fields or
+    // records_per_elem-driven) would compute different values and be
+    // caught here in a way that the lockstep test (which derives
+    // expected values from the same per-cell formula) wouldn't.
+    use super::sidetable::record_info::RecordSlotSource;
+    let (r, mut names) = setup();
+    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
+    let tuple_size = record_tuple_layout.size;
+    let plan = plan_for_param("f-list-tuple-record-mixed", &r, &mut names);
+    let elem_plan = list_element_plan(&plan, 0);
+    let (side, counts) = super::emit::walk_element_plan(elem_plan, tuple_size);
+    let record_offsets: Vec<(u32, u32)> = side
+        .iter()
+        .filter_map(|sd| match sd {
+            CellSideData::Record(fill) => match fill.slot_source {
+                RecordSlotSource::PerIteration {
+                    entry_offset_in_elem,
+                    tuples_offset_in_elem,
+                } => Some((entry_offset_in_elem, tuples_offset_in_elem)),
+                _ => panic!("list-element Record must be PerIteration"),
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        record_offsets,
+        vec![(0, 0), (1, 2 * tuple_size)],
+        "tuple<point, solo> must give point (entry 0, tuples 0) \
+         and solo (entry 1, tuples 2 * tuple_size)",
+    );
+    assert_eq!(counts.records, 2);
+    assert_eq!(counts.record_tuples_bytes, (2 + 1) * tuple_size);
+}
+
+#[test]
 fn walk_element_plan_zero_counts_for_scalar_only() {
     // Scalar-only element plans must produce zero-counts so the
     // per-list buffer allocations stay gated off.
     let (r, mut names) = setup();
+    let (_, record_tuple_layout) = synth_record_info_layouts(&r);
     for fn_name in ["f-list-u32", "f-list-string"] {
         let plan = plan_for_param(fn_name, &r, &mut names);
         let elem_plan = list_element_plan(&plan, 0);
-        let (_, counts) = super::emit::walk_element_plan(elem_plan);
+        let (_, counts) = super::emit::walk_element_plan(elem_plan, record_tuple_layout.size);
         assert_eq!(counts.chars, 0, "{fn_name} should have no char cells");
         assert_eq!(
             counts.tuple_idx_slots, 0,
@@ -1404,6 +1524,7 @@ fn walk_element_plan_zero_counts_for_scalar_only() {
         );
         assert_eq!(counts.handles, 0, "{fn_name} should have no handle cells");
         assert_eq!(counts.flags, 0, "{fn_name} should have no flags cells");
+        assert_eq!(counts.records, 0, "{fn_name} should have no record cells");
     }
 }
 
@@ -1447,19 +1568,39 @@ fn nested_list_bails_at_plan_build() {
 }
 
 #[test]
-fn list_of_compound_element_bails_at_plan_build() {
-    // list<point>: record element types aren't a supported list element
-    // shape today (compound element types defer to a later landing).
+fn list_of_variant_bails_at_plan_build() {
+    // Variants are still gated as a list-element kind. Pins the
+    // bail message + URL so a future change that opens variant
+    // before its emit path is wired surfaces here.
     let (r, mut names) = setup();
     let err = LiftPlan::for_type(
-        &func_named(&r, "f-list-of-record").params[0].ty,
+        &func_named(&r, "f-list-of-variant").params[0].ty,
         &r,
         &mut names,
     )
-    .expect_err("list<record> must bail at plan build");
+    .expect_err("list<variant> must bail at plan build");
     let msg = err.to_string();
     assert!(msg.contains("`list<T>` element type"));
     assert!(msg.contains("github.com/ejrgilbert/splicer/issues"));
+}
+
+#[test]
+fn list_of_record_classifies_with_perirecord_element() {
+    // list<point>: record elements are now supported. The element
+    // plan carries one `Cell::RecordOf` after its primitive field
+    // cells (children-first), and `has_list_elem_record()` flips
+    // true so the wrapper alloc routes through the runtime-sized
+    // record-info branch.
+    let (r, mut names) = setup();
+    let plan = plan_for_param("f-list-of-record", &r, &mut names);
+    let Cell::ListOf { element_plan, .. } = &plan.cells[0] else {
+        panic!("expected ListOf at cell 0, got {:?}", plan.cells[0]);
+    };
+    assert!(matches!(
+        element_plan.cells.last(),
+        Some(Cell::RecordOf { .. })
+    ));
+    assert!(plan.has_list_elem_record());
 }
 
 #[test]
@@ -2284,9 +2425,11 @@ fn build_record_info_maps_assigns_per_param_counts_and_cell_idx() {
                 .for_param(fn_idx, param_idx)
                 .iter()
                 .map(|f| {
-                    f.as_ref().map(|fill| {
-                        let RecordSlotSource::Static { entry_idx } = fill.slot_source;
-                        entry_idx
+                    f.as_ref().map(|fill| match fill.slot_source {
+                        RecordSlotSource::Static { entry_idx, .. } => entry_idx,
+                        RecordSlotSource::PerIteration { .. } => {
+                            unreachable!("outer-plan walk produces only Static fills")
+                        }
                     })
                 })
                 .collect();
@@ -2398,6 +2541,15 @@ fn emit_lift_plan_validates_every_classify_built_shape() {
         plan_for_param("f-list-flags", &r, &mut names),
         plan_for_param("f-list-tuple-of-flags", &r, &mut names),
         plan_for_param("f-list-tuple-mixed-flags", &r, &mut names),
+        // List-element records: per-call record-info buffer + per-call
+        // field-tuples buffer (cell-idxs runtime-resolved off
+        // `elem_cell_base`). Pins emit_record_runtime_fill's
+        // PerIteration arm + the cell::record-of payload staging.
+        plan_for_param("f-list-of-record", &r, &mut names),
+        // Mixed-field-count record tuple element — pins
+        // `records_per_elem > 1` + cumulative `tuples_offset_in_elem`
+        // for the multi-record case (point=2 fields, solo=1 field).
+        plan_for_param("f-list-tuple-record-mixed", &r, &mut names),
         // `func(top: own<R>, xs: list<own<R>>)` params[1] — mixed
         // wrapper with both a static handle (top) and a
         // list-element handle (xs). Pins the
