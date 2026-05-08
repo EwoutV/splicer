@@ -140,6 +140,13 @@ pub(crate) struct ParamLayout {
     /// patching `len` per call) lands when `Cell::Flags` opens in
     /// `list_element_class`.
     pub flags_count: u32,
+    /// `Cell::RecordOf` count among the plan's outer cells.
+    /// Authoritative for the static `field_tree.record_infos.len`
+    /// bake and the static-count `cabi_realloc`. Same static-vs-
+    /// runtime distinction as [`Self::handle_count`] /
+    /// [`Self::flags_count`]; runtime regime arrives with
+    /// `list<record>` (commit-2).
+    pub record_count: u32,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -159,6 +166,11 @@ pub(crate) struct ResultLayout {
     /// `Cell::Flags` in the compound plan. Same static-vs-runtime
     /// distinction as [`ParamLayout::flags_count`].
     pub flags_count: u32,
+    /// Result-side counterpart of [`ParamLayout::record_count`]:
+    /// number of outer `Cell::RecordOf` in the compound result plan.
+    /// Records always retptr (no Direct route), so `0` for non-
+    /// compound results.
+    pub record_count: u32,
 }
 
 pub(crate) enum ResultSourceLayout {
@@ -181,7 +193,6 @@ pub(crate) enum ResultSourceLayout {
         cell_side: Vec<CellSideData>,
     },
 }
-
 
 // ─── Classifiers ──────────────────────────────────────────────────
 
@@ -338,4 +349,3 @@ fn is_supported_direct_result(ty: &Type, resolve: &Resolve) -> bool {
         },
     }
 }
-

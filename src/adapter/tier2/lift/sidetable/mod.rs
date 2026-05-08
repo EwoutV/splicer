@@ -34,6 +34,7 @@ pub(super) mod variant_info;
 
 use flags_info::FlagsRuntimeFill;
 use handle_info::HandleRuntimeFill;
+use record_info::RecordRuntimeFill;
 use variant_info::VariantRuntimeFill;
 
 /// Per-plan-cell side-table data the emit phase reads. One entry per
@@ -44,10 +45,12 @@ use variant_info::VariantRuntimeFill;
 #[derive(Clone, Debug)]
 pub(crate) enum CellSideData {
     None,
-    /// `cell::record-of(u32)` payload — build-time-known side-table idx.
-    Record {
-        idx: u32,
-    },
+    /// `cell::record-of(u32)` payload + the addresses the wrapper
+    /// patches at runtime (type-name + fields slice). Static cells'
+    /// fields_ptr is build-time-const (resolved post-layout); list-
+    /// element cells stage it per iteration. Boxed for the same
+    /// reason as Flags/Variant.
+    Record(Box<RecordRuntimeFill>),
     /// `cell::tuple-of(list<u32>)` payload source. See
     /// [`TupleIdxSource`] for which buffer the `(ptr, len)` points at.
     Tuple {
@@ -112,7 +115,7 @@ pub(crate) enum TupleIdxSource {
 /// kinds land — adding one here + the matching `fold_cell_side_data`
 /// arm is the full change.
 pub(crate) struct CellFillSources<'a> {
-    pub record_info: &'a [Option<u32>],
+    pub record_fill: &'a [Option<RecordRuntimeFill>],
     pub tuple_indices: &'a [Option<BlobSlice>],
     pub flags_fill: &'a [Option<FlagsRuntimeFill>],
     pub variant_fill: &'a [Option<VariantRuntimeFill>],
@@ -134,7 +137,7 @@ pub(crate) fn fold_cell_side_data(
     sources: &CellFillSources<'_>,
 ) -> Vec<CellSideData> {
     let n = plan.cells.len();
-    debug_assert_eq!(sources.record_info.len(), n);
+    debug_assert_eq!(sources.record_fill.len(), n);
     debug_assert_eq!(sources.tuple_indices.len(), n);
     debug_assert_eq!(sources.flags_fill.len(), n);
     debug_assert_eq!(sources.variant_fill.len(), n);
@@ -145,9 +148,11 @@ pub(crate) fn fold_cell_side_data(
         .enumerate()
         .map(|(i, cell)| match cell {
             // Side-data-bearing kinds.
-            Cell::RecordOf { .. } => CellSideData::Record {
-                idx: sources.record_info[i].expect("RecordOf cell missing record-info idx"),
-            },
+            Cell::RecordOf { .. } => CellSideData::Record(Box::new(
+                sources.record_fill[i]
+                    .clone()
+                    .expect("RecordOf cell missing runtime-fill bundle"),
+            )),
             Cell::TupleOf { .. } => CellSideData::Tuple {
                 source: TupleIdxSource::Static(
                     sources.tuple_indices[i].expect("TupleOf cell missing tuple-indices slice"),
@@ -452,4 +457,3 @@ pub(crate) struct SideTableBlob {
     pub per_param: Vec<Vec<Option<SymRef>>>,
     pub per_result: Vec<Option<SymRef>>,
 }
-

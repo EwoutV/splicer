@@ -18,6 +18,7 @@ use super::super::{FuncClassified, FuncShape};
 use super::plan::{ArmGuard, Cell, HandleKind, LiftPlan};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
+use super::sidetable::record_info::RecordRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::{CellSideData, CharScratch, TupleIdxSource};
 use super::*;
@@ -216,12 +217,7 @@ fn assert_plan_no_root(plan: &LiftPlan, cells: Vec<Cell>, slot_count: u32) {
 /// `Cell::Flags` shorthand for fixtures. Interns `type_name` and
 /// each item name; mirrors plan-build's interning so [`BlobSlice`]s
 /// match by-value regardless of which side ran first.
-fn flags_cell(
-    names: &mut NameInterner,
-    flat_slot: u32,
-    type_name: &str,
-    items: &[&str],
-) -> Cell {
+fn flags_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, items: &[&str]) -> Cell {
     let type_name = names.intern(type_name);
     let flag_names = items.iter().map(|n| names.intern(n)).collect();
     Cell::Flags {
@@ -234,12 +230,7 @@ fn flags_cell(
 /// `Cell::EnumCase` shorthand for fixtures. Same shape as
 /// [`flags_cell`] — interns through `names` so fixture and plan
 /// converge on the same [`BlobSlice`]s.
-fn enum_cell(
-    names: &mut NameInterner,
-    flat_slot: u32,
-    type_name: &str,
-    cases: &[&str],
-) -> Cell {
+fn enum_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, cases: &[&str]) -> Cell {
     let type_name = names.intern(type_name);
     let case_names = cases.iter().map(|n| names.intern(n)).collect();
     Cell::EnumCase {
@@ -433,6 +424,16 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     /// Stub flag-name length (any non-zero u32 works).
     const STUB_FLAG_NAME_LEN: u32 = 4;
 
+    /// Mid-page cursor for the synth record-tuples buffer — anywhere
+    /// in linear memory works.
+    const RECORD_TUPLES_BASE: u32 = 0x4000;
+    /// Stub tuples-slot stride — each record's `(name, idx)` slot is
+    /// `STRING_FLAT_BYTES + 4` bytes wide; rounding up to 16 is fine
+    /// for the validator (it only checks address shape, not contents).
+    const RECORD_TUPLES_STRIDE: u32 = 16;
+    /// Stub type-name length for record fills.
+    const STUB_RECORD_NAME_LEN: u32 = 4;
+
     let mut record_idx: u32 = 0;
     let mut tuple_cursor: u32 = 0;
     let mut flags_cursor: u32 = FLAGS_SCRATCH_BASE;
@@ -443,10 +444,21 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
     plan.cells
         .iter()
         .map(|op| match op {
-            Cell::RecordOf { .. } => {
-                let idx = record_idx;
+            Cell::RecordOf { fields, .. } => {
+                use super::sidetable::record_info::RecordSlotSource;
+                let entry_idx = record_idx;
+                let fields_ptr = (RECORD_TUPLES_BASE + entry_idx * RECORD_TUPLES_STRIDE) as i32;
+                let fill = RecordRuntimeFill {
+                    slot_source: RecordSlotSource::Static { entry_idx },
+                    type_name: BlobSlice {
+                        off: 0,
+                        len: STUB_RECORD_NAME_LEN,
+                    },
+                    fields_ptr,
+                    fields_len: fields.len() as u32,
+                };
                 record_idx += 1;
-                CellSideData::Record { idx }
+                CellSideData::Record(Box::new(fill))
             }
             Cell::TupleOf { children } => {
                 let off = tuple_cursor;
@@ -556,6 +568,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let cell_layout = synth_cell_layout();
     let handle_info_layout = synth_info_layout("handle-info");
     let flags_info_layout = synth_info_layout("flags-info");
+    let record_info_layout = synth_info_layout("record-info");
     let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan, resolve);
     let n = plan.flat_slot_count;
@@ -583,6 +596,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let next_cell_idx = builder.alloc_local(ValType::I32);
     let handle_info_base = builder.alloc_local(ValType::I32);
     let flags_info_base = builder.alloc_local(ValType::I32);
+    let record_info_base = builder.alloc_local(ValType::I32);
     let next_handle_idx = builder.alloc_local(ValType::I32);
     let next_flags_idx = builder.alloc_local(ValType::I32);
     let list_elem_handle_base = builder.alloc_local(ValType::I32);
@@ -614,6 +628,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         next_cell_idx,
         handle_info_base: Some(handle_info_base),
         flags_info_base: Some(flags_info_base),
+        record_info_base: Some(record_info_base),
         next_handle_idx: Some(next_handle_idx),
         next_flags_idx: Some(next_flags_idx),
         list_elem_handle_base: Some(list_elem_handle_base),
@@ -672,6 +687,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         cabi_realloc_idx: 0,
         handle_info: super::emit::HandleInfoOffsets::from_layout(&handle_info_layout),
         flags_info: super::emit::FlagsInfoOffsets::from_layout(&flags_info_layout),
+        record_info: super::emit::RecordInfoOffsets::from_layout(&record_info_layout),
     };
     emit_lift_plan(
         &mut f,
@@ -770,7 +786,12 @@ fn flags_assigns_one_cell_one_slot() {
     let plan = plan_for_named("fperms", &r, &mut names);
     assert_plan_no_root(
         &plan,
-        vec![flags_cell(&mut names, 0, "fperms", &["read", "write", "exec"])],
+        vec![flags_cell(
+            &mut names,
+            0,
+            "fperms",
+            &["read", "write", "exec"],
+        )],
         1,
     );
 }
@@ -2227,32 +2248,28 @@ fn name_interner_dedupes_record_strings_across_plans() {
 // ─── Record-info side-table layout ────────────────────────────
 
 #[test]
-fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
+fn build_record_info_maps_assigns_per_param_counts_and_cell_idx() {
     // 2 funcs, 3 params total — exactly the audit's request.
     // f-point(p: point):                 1 RecordOf cell
     // f-mix-records(p: point, n: nested): 1 + 2 RecordOf cells
+    use super::sidetable::record_info::RecordSlotSource;
     let (r, mut names) = setup();
     let funcs = vec![
         func_with_params(&r, &mut names, &["point"]),
         func_with_params(&r, &mut names, &["point", "nested"]),
     ];
-    let (entry, tuple) = synth_record_info_layouts(&r);
-    let blobs = build_record_info_blob(&funcs, &entry, &tuple, 0, 1);
+    let (_, tuple) = synth_record_info_layouts(&r);
+    let maps = build_record_info_maps(&funcs, &tuple, 0);
 
-    // Range lengths per (fn, param). New cases drop in here.
-    let lens: Vec<Vec<u32>> = blobs
-        .per_param_range
-        .iter()
-        .map(|fns| fns.iter().map(|sr| sr.map_or(0, |s| s.len)).collect())
-        .collect();
-    assert_eq!(lens, vec![vec![1], vec![1, 2]]);
+    // Per-(fn, param) counts. New cases drop in here.
+    assert_eq!(maps.per_param_count, vec![vec![1], vec![1, 2]]);
 
-    // Cell-idx maps reset per range — index counts up only inside
+    // Cell-idx maps reset per range — entry_idx counts up only inside
     // one (fn, param), not across them. Children-first plan order
     // puts each RecordOf cell after its descendants, so the
     // `Some(_)` slots land at the *end* of each map (and, for
-    // `nested`, the inner `point` parent picks up side-table idx 0
-    // before the outer `nested` parent picks up idx 1).
+    // `nested`, the inner `point` parent picks up entry_idx 0
+    // before the outer `nested` parent picks up entry_idx 1).
     let expected: Vec<Vec<&[Option<u32>]>> = vec![
         vec![&[None, None, Some(0)]],
         vec![
@@ -2262,16 +2279,34 @@ fn build_record_info_blob_assigns_per_param_ranges_and_cell_idx() {
     ];
     for (fn_idx, fn_expected) in expected.iter().enumerate() {
         for (param_idx, param_expected) in fn_expected.iter().enumerate() {
+            let actual: Vec<Option<u32>> = maps
+                .per_cell_fill
+                .for_param(fn_idx, param_idx)
+                .iter()
+                .map(|f| {
+                    f.as_ref().map(|fill| {
+                        let RecordSlotSource::Static { entry_idx } = fill.slot_source;
+                        entry_idx
+                    })
+                })
+                .collect();
             assert_eq!(
-                blobs.per_cell_idx.for_param(fn_idx, param_idx),
+                actual.as_slice(),
                 *param_expected,
                 "fn {fn_idx} param {param_idx}",
             );
         }
     }
 
-    // 4 record entries → 4 relocs into the tuples segment.
-    assert_eq!(blobs.entries.relocs.len(), 4);
+    // Pin the tuples-segment size — a `record_field_tuple_layout` drift
+    // (e.g. struct-field reorder, or string-flat-bytes change) shows up
+    // as a wrong segment size here.
+    //
+    // 4 RecordOf cells × 2 fields each = 8 `(name, idx)` tuples:
+    //   fn-0 p: point          → 1 record × 2 fields = 2
+    //   fn-1 p: point          → 1 record × 2 fields = 2
+    //   fn-1 n: nested         → 2 records × 2 fields = 4 (inner point + outer nested)
+    assert_eq!(maps.tuples.bytes.len() as u32, 8 * tuple.size);
 }
 
 // ─── emit_lift_plan round-trip through validator ──────────────

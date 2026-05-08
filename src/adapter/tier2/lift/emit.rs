@@ -21,6 +21,7 @@ use super::classify::ResultSourceLayout;
 use super::plan::{ArmGuard, Cell, LiftPlan, ListElementClass, ListSpec};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
+use super::sidetable::record_info::RecordRuntimeFill;
 use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::{CellSideData, CharScratch, TupleIdxSource};
 use wit_parser::abi::WasmType;
@@ -156,6 +157,10 @@ pub(crate) struct WrapperLocals {
     /// Companion to [`Self::next_handle_idx`] for flags-info entries.
     /// `Some` iff [`fn_has_list_elem_flags`].
     pub next_flags_idx: Option<u32>,
+    /// Base address of the active plan's record-info buffer.
+    /// `Some` iff [`fn_has_record_cells`]. Same stage-then-consume
+    /// invariant as [`Self::handle_info_base`].
+    pub record_info_base: Option<u32>,
     /// Base address of the active plan's flags-info buffer.
     /// `Some` iff [`fn_has_flags_cells`]. Same stage-then-consume
     /// invariant as [`Self::handle_info_base`].
@@ -233,6 +238,7 @@ pub(crate) struct LiftEmitCtx<'a> {
     pub cabi_realloc_idx: u32,
     pub handle_info: HandleInfoOffsets,
     pub flags_info: FlagsInfoOffsets,
+    pub record_info: RecordInfoOffsets,
 }
 
 /// Build-time-resolved geometry of one `record handle-info` entry.
@@ -275,6 +281,29 @@ impl FlagsInfoOffsets {
             align: layout.align,
             type_name_off: layout.offset_of(INFO_TYPE_NAME),
             set_flags_off: layout.offset_of(FLAGS_INFO_SET_FLAGS),
+        }
+    }
+}
+
+/// Build-time-resolved geometry of one `record record-info` entry.
+/// Same shape as [`HandleInfoOffsets`] for the record-info side.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordInfoOffsets {
+    pub entry_size: u32,
+    pub align: u32,
+    pub type_name_off: u32,
+    pub fields_off: u32,
+}
+
+impl RecordInfoOffsets {
+    pub(crate) fn from_layout(layout: &RecordLayout) -> Self {
+        use super::super::schema::RECORD_INFO_FIELDS;
+        use super::sidetable::INFO_TYPE_NAME;
+        Self {
+            entry_size: layout.size,
+            align: layout.align,
+            type_name_off: layout.offset_of(INFO_TYPE_NAME),
+            fields_off: layout.offset_of(RECORD_INFO_FIELDS),
         }
     }
 }
@@ -526,10 +555,19 @@ fn fn_has_handle_cells(fd: &FuncDispatch) -> bool {
 fn fn_has_flags_cells(fd: &FuncDispatch) -> bool {
     fn_has_list_elem_flags(fd)
         || fd.params.iter().any(|p| p.flags_count > 0)
+        || fd.result_lift.as_ref().is_some_and(|rl| rl.flags_count > 0)
+}
+
+/// Any `Cell::RecordOf` in the wrapper. Gates
+/// `WrapperLocals.record_info_base`. List-element record support
+/// (commit-2) will fold in here when `Cell::RecordOf` opens in
+/// `list_element_class`.
+fn fn_has_record_cells(fd: &FuncDispatch) -> bool {
+    fd.params.iter().any(|p| p.record_count > 0)
         || fd
             .result_lift
             .as_ref()
-            .is_some_and(|rl| rl.flags_count > 0)
+            .is_some_and(|rl| rl.record_count > 0)
 }
 
 /// Per-class counts collected by [`walk_element_plan`]. Drives the
@@ -567,9 +605,7 @@ pub(super) struct ElementCounts {
 /// BlobSlices) is read directly off the cell — no layout-phase
 /// strings table is needed; the slices were interned at plan-build
 /// time (see [`Cell::Flags`]).
-pub(super) fn walk_element_plan(
-    element_plan: &LiftPlan,
-) -> (Vec<CellSideData>, ElementCounts) {
+pub(super) fn walk_element_plan(element_plan: &LiftPlan) -> (Vec<CellSideData>, ElementCounts) {
     let mut counts = ElementCounts::default();
     let side: Vec<CellSideData> = element_plan
         .cells
@@ -632,19 +668,15 @@ pub(super) fn walk_element_plan(
                     let entry_offset_in_elem = counts.flags;
                     let scratch_offset_in_elem = counts.flags_scratch_bytes;
                     counts.flags += 1;
-                    counts.flags_scratch_bytes +=
-                        flag_names.len() as u32 * STRING_FLAT_BYTES;
-                    CellSideData::Flags(Box::new(
-                        super::sidetable::flags_info::FlagsRuntimeFill {
-                            slot_source:
-                                super::sidetable::flags_info::FlagsSlotSource::PerIteration {
-                                    entry_offset_in_elem,
-                                    scratch_offset_in_elem,
-                                },
-                            type_name: *type_name,
-                            flag_names: flag_names.clone(),
+                    counts.flags_scratch_bytes += flag_names.len() as u32 * STRING_FLAT_BYTES;
+                    CellSideData::Flags(Box::new(super::sidetable::flags_info::FlagsRuntimeFill {
+                        slot_source: super::sidetable::flags_info::FlagsSlotSource::PerIteration {
+                            entry_offset_in_elem,
+                            scratch_offset_in_elem,
                         },
-                    ))
+                        type_name: *type_name,
+                        flag_names: flag_names.clone(),
+                    }))
                 }
             }
         })
@@ -753,12 +785,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                 let mut bindgen = WasmEncoderBindgen::new(size_align, addr_local, &mut builder);
                 lift_from_memory(resolve, &mut bindgen, (), &compound.ty);
                 let loads = bindgen.into_instructions();
-                let list_locals = alloc_list_emit_locals(
-                    &compound.plan,
-                    resolve,
-                    size_align,
-                    &mut builder,
-                );
+                let list_locals =
+                    alloc_list_emit_locals(&compound.plan, resolve, size_align, &mut builder);
                 ResultEmitPlan::Compound {
                     plan: &compound.plan,
                     retptr_offset: *retptr_offset,
@@ -819,6 +847,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let next_cell_idx = builder.alloc_local(ValType::I32);
     let handle_info_base = fn_has_handle_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let flags_info_base = fn_has_flags_cells(fd).then(|| builder.alloc_local(ValType::I32));
+    let record_info_base = fn_has_record_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let next_handle_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
     let next_flags_idx = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
 
@@ -856,6 +885,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             next_cell_idx,
             handle_info_base,
             flags_info_base,
+            record_info_base,
             next_handle_idx,
             next_flags_idx,
             param_list_locals,
@@ -1210,12 +1240,17 @@ fn emit_cell_op(
             let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
             cell_layout.emit_bytes(f, addr, ptr, len);
         }
-        // Pure side-table reads.
         Cell::RecordOf { .. } => {
-            let CellSideData::Record { idx } = side_data else {
+            let CellSideData::Record(fill) = side_data else {
                 panic!("RecordOf cell paired with non-Record side data {side_data:?}");
             };
-            cell_layout.emit_record_of(f, addr, *idx);
+            emit_record_runtime_fill(f, fill, lcl, ctx.record_info);
+            // Migration commit: every record cell is `Static`. When
+            // PerIteration lands this `let` becomes refutable and
+            // rustc forces the per-iter wiring before recompiling.
+            let super::sidetable::record_info::RecordSlotSource::Static { entry_idx } =
+                fill.slot_source;
+            cell_layout.emit_record_of(f, addr, entry_idx);
         }
         Cell::TupleOf { children } => {
             let CellSideData::Tuple { source: src_kind } = side_data else {
@@ -1525,7 +1560,8 @@ fn emit_list_of_arm(
         );
         f.instructions().local_get(buf_base);
         f.instructions().local_get(ll.j);
-        f.instructions().i32_const(ll.flags_scratch_bytes_per_elem as i32);
+        f.instructions()
+            .i32_const(ll.flags_scratch_bytes_per_elem as i32);
         f.instructions().i32_mul();
         f.instructions().i32_add();
         f.instructions().local_set(dest);
@@ -1870,6 +1906,57 @@ fn emit_handle_runtime_fill(
     });
 }
 
+/// Fill one `Cell::RecordOf`'s slot in the per-call record-info
+/// buffer: build-time-const `type-name` + `fields` slice (`(ptr, len)`).
+/// All three fields are constants for static cells (the tuples
+/// segment is laid out at build time and the per-cell `fields_ptr`
+/// is pre-resolved to absolute by `back_fill_record_fields_ptrs`).
+/// List-element records (commit-2) will compute `slot_addr` and
+/// `fields_ptr` per iteration off the staged base locals.
+fn emit_record_runtime_fill(
+    f: &mut Function,
+    fill: &RecordRuntimeFill,
+    lcl: &WrapperLocals,
+    info: RecordInfoOffsets,
+) {
+    use super::sidetable::record_info::RecordSlotSource;
+    let base_local = lcl.record_info_base.expect(
+        "record_info_base local unset on a wrapper containing Cell::RecordOf — \
+         fn_has_record_cells gate must agree with the cells reaching \
+         emit_record_runtime_fill",
+    );
+    // Migration commit: only `Static` slots are constructed. When
+    // PerIteration lands this let becomes refutable, forcing the
+    // per-iter slot-addr stage to be wired before recompiling.
+    let RecordSlotSource::Static { entry_idx } = fill.slot_source;
+    let entry_off = entry_idx * info.entry_size;
+    let type_name_off = entry_off + info.type_name_off;
+    let fields_off = entry_off + info.fields_off;
+
+    let store_i32 = |off: u32| MemArg {
+        offset: off as u64,
+        align: I32_STORE_LOG2_ALIGN,
+        memory_index: 0,
+    };
+    let store_const = |f: &mut Function, off: u32, value: i32| {
+        f.instructions().local_get(base_local);
+        f.instructions().i32_const(value);
+        f.instructions().i32_store(store_i32(off));
+    };
+    store_const(
+        f,
+        type_name_off + SLICE_PTR_OFFSET,
+        fill.type_name.off as i32,
+    );
+    store_const(
+        f,
+        type_name_off + SLICE_LEN_OFFSET,
+        fill.type_name.len as i32,
+    );
+    store_const(f, fields_off + SLICE_PTR_OFFSET, fill.fields_ptr);
+    store_const(f, fields_off + SLICE_LEN_OFFSET, fill.fields_len as i32);
+}
+
 /// Resolve a `Cell::Flags`'s `cell::flags-set(idx)` payload.
 /// Same shape as [`stage_handle_cell_payload`].
 fn stage_flags_cell_payload(
@@ -1884,15 +1971,15 @@ fn stage_flags_cell_payload(
             entry_offset_in_elem,
             ..
         } => {
-            let iter_base = lcl.list_elem_flags_base.expect(
-                "list_elem_flags_base unset — fn_has_list_elem_flags gate disagrees",
-            );
+            let iter_base = lcl
+                .list_elem_flags_base
+                .expect("list_elem_flags_base unset — fn_has_list_elem_flags gate disagrees");
             if entry_offset_in_elem == 0 {
                 return PayloadSource::Local(iter_base);
             }
-            let dest = lcl.flags_payload_idx.expect(
-                "flags_payload_idx unset — fn_has_list_elem_flags gate disagrees",
-            );
+            let dest = lcl
+                .flags_payload_idx
+                .expect("flags_payload_idx unset — fn_has_list_elem_flags gate disagrees");
             f.instructions().local_get(iter_base);
             f.instructions().i32_const(entry_offset_in_elem as i32);
             f.instructions().i32_add();
@@ -1986,9 +2073,9 @@ fn emit_flags_runtime_fill(
                 "flags_slot_addr unset — fn_has_list_elem_flags gate disagrees \
                  with the cells reaching emit_flags_runtime_fill",
             );
-            let iter_entry_base = lcl.list_elem_flags_base.expect(
-                "list_elem_flags_base unset — fn_has_list_elem_flags gate disagrees",
-            );
+            let iter_entry_base = lcl
+                .list_elem_flags_base
+                .expect("list_elem_flags_base unset — fn_has_list_elem_flags gate disagrees");
             let iter_scratch_base = lcl.list_elem_flags_scratch_base.expect(
                 "list_elem_flags_scratch_base unset — fn_has_list_elem_flags gate disagrees",
             );
@@ -2025,8 +2112,16 @@ fn emit_flags_runtime_fill(
         f.instructions().i32_const(value);
         f.instructions().i32_store(store_i32(off));
     };
-    store_const(f, type_name_off + SLICE_PTR_OFFSET, fill.type_name.off as i32);
-    store_const(f, type_name_off + SLICE_LEN_OFFSET, fill.type_name.len as i32);
+    store_const(
+        f,
+        type_name_off + SLICE_PTR_OFFSET,
+        fill.type_name.off as i32,
+    );
+    store_const(
+        f,
+        type_name_off + SLICE_LEN_OFFSET,
+        fill.type_name.len as i32,
+    );
     // Write set-flags.ptr from flags_addr (the bit-walker's starting
     // cursor — see staging above). Subsequent advances to flags_addr
     // by the bit-walker don't affect this already-stored ptr.

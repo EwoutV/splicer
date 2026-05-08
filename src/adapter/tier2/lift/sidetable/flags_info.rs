@@ -31,10 +31,7 @@ use super::PerCellIndices;
 pub(crate) enum FlagsSlotSource {
     /// Outer-plan flags: entry idx is build-time-const; the scratch
     /// slab is reserved at layout time at `scratch_addr`.
-    Static {
-        entry_idx: u32,
-        scratch_addr: i32,
-    },
+    Static { entry_idx: u32, scratch_addr: i32 },
     /// List-element flags: entry idx is `list_elem_flags_base +
     /// entry_offset_in_elem`; scratch is `list.flags_scratch_base +
     /// j * flags_scratch_bytes_per_elem + scratch_offset_in_elem`.
@@ -151,8 +148,7 @@ fn scan_plan(
     plan: &LiftPlan,
     scratch_addrs: &mut impl Iterator<Item = u32>,
 ) -> (Vec<Option<FlagsRuntimeFill>>, u32) {
-    let mut fill_map: Vec<Option<FlagsRuntimeFill>> =
-        (0..plan.cells.len()).map(|_| None).collect();
+    let mut fill_map: Vec<Option<FlagsRuntimeFill>> = (0..plan.cells.len()).map(|_| None).collect();
     let mut count: u32 = 0;
     for (cell_pos, cell) in plan.cells.iter().enumerate() {
         if matches!(cell, Cell::Flags { .. }) {

@@ -361,9 +361,7 @@ impl Shape {
     fn collect_wit_decls(&self, out: &mut String, seen: &mut HashSet<&'static str>) {
         match self {
             Shape::Primitive { .. } => {}
-            Shape::Option { inner, .. } | Shape::List(inner) => {
-                inner.collect_wit_decls(out, seen)
-            }
+            Shape::Option { inner, .. } | Shape::List(inner) => inner.collect_wit_decls(out, seen),
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_wit_decls(out, seen);

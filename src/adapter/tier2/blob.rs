@@ -258,33 +258,6 @@ impl<'a> RecordWriter<'a> {
         write_le_i32(blob, off + SLICE_LEN_OFFSET as usize, slice.len as i32);
     }
 
-    /// Like [`Self::write_slice`] but for a slice that points into
-    /// another segment that hasn't been placed yet. The `len` lands
-    /// directly; the `ptr` slot stays zero and a [`Reloc`] is pushed
-    /// onto `relocs` for the layout phase to resolve. `None` leaves
-    /// the slot zeroed (no reloc, len = 0).
-    pub(super) fn write_slice_reloc(
-        &self,
-        blob: &mut [u8],
-        relocs: &mut Vec<Reloc>,
-        field: &str,
-        sym: Option<SymRef>,
-    ) {
-        let off = self.field_offset(field);
-        let len = match sym {
-            Some(s) => {
-                relocs.push(Reloc {
-                    site: (off + SLICE_PTR_OFFSET as usize) as u32,
-                    target: s.target,
-                    addend: s.off as i32,
-                });
-                s.len
-            }
-            None => 0,
-        };
-        write_le_i32(blob, off + SLICE_LEN_OFFSET as usize, len as i32);
-    }
-
     /// Set the `option<T>` discriminant byte at `field` to `none`.
     /// Zero the payload by leaving the rest of the record at its
     /// initial zeroes (caller should have used `extend_zero`).

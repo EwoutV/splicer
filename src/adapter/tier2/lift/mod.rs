@@ -44,7 +44,7 @@ pub(super) use classify::{
 pub(super) use emit::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
     emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, LiftEmitCtx,
-    ListEmitLocals, ResultEmitPlan, WrapperLocals,
+    ListEmitLocals, RecordInfoOffsets, ResultEmitPlan, WrapperLocals,
 };
 pub(super) use sidetable::char_info::{
     build_char_scratch_map, char_scratch_sizes, CharScratchMaps,
@@ -56,7 +56,9 @@ pub(super) use sidetable::flags_info::{
 pub(super) use sidetable::handle_info::{
     build_handle_info_maps, HandleInfoMaps, HandleRuntimeFill,
 };
-pub(super) use sidetable::record_info::{build_record_info_blob, RecordInfoBlobs};
+pub(super) use sidetable::record_info::{
+    back_fill_record_fields_ptrs, build_record_info_maps, RecordInfoMaps,
+};
 pub(super) use sidetable::tuple_indices::{build_tuple_indices_blob, TupleIndicesBlob};
 pub(super) use sidetable::variant_info::{
     back_fill_entry_addrs as back_fill_variant_entry_addrs, build_variant_info_blob,
