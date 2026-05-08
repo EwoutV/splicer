@@ -673,10 +673,24 @@ impl LiftPlanBuilder {
                 wit_parser::TypeDefKind::Future(elem) => {
                     self.push_stream_or_future(elem.as_ref(), HandleKind::Future, resolve, names)
                 }
+                wit_parser::TypeDefKind::Resource => {
+                    // Resources at payload position only surface via
+                    // `Handle(own/borrow)`; bare resource types are
+                    // forbidden by canonical ABI. Inline-resource
+                    // interfaces are also caught earlier by
+                    // `require_no_inline_resources`.
+                    unreachable!(
+                        "tier-2 lift: bare `Resource` at payload position is \
+                         forbidden by canonical ABI"
+                    )
+                }
+                wit_parser::TypeDefKind::Unknown => {
+                    // wit-parser placeholder for unresolved types;
+                    // a fully-resolved tree should never carry one.
+                    unreachable!("tier-2 lift: unresolved `Unknown` typedef")
+                }
                 wit_parser::TypeDefKind::FixedLengthList(_, _)
-                | wit_parser::TypeDefKind::Map(_, _)
-                | wit_parser::TypeDefKind::Resource
-                | wit_parser::TypeDefKind::Unknown => {
+                | wit_parser::TypeDefKind::Map(_, _) => {
                     todo!(
                         "tier-2 lift: unsupported TypeDefKind {:?}",
                         &resolve.types[*id].kind
