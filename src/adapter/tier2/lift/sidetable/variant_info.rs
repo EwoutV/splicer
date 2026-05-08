@@ -1,148 +1,131 @@
-//! Variant-info side-table builder. Per-cell entries laid out like
-//! [`super::flags_info`], but each entry has *two* runtime-filled
-//! fields: `case-name` (one of N pre-interned case-name slices,
-//! selected per call by disc) and `payload` (an `option<u32>`
-//! pointing at the active arm's child cell when non-unit). The
-//! wrapper's N-way disc dispatch picks which case-name + payload to
-//! write per call.
+//! Variant-info layout. One entry per `Cell::Variant` appearance.
+//! Entries live in a per-(fn, param | result) buffer the wrapper
+//! allocates per call via `cabi_realloc`; the emitter writes the
+//! build-time-const `type-name` and the runtime-dispatched `case-name`
+//! + `payload` (option<u32>) into each slot.
+//! `field_tree.variant_infos` is patched at runtime to point at the
+//! buffer.
+//!
+//! Per-call (vs. baked-in-static) is forced by `list<variant>`: the
+//! count is len-dependent and `field_tree.variant_infos` must span
+//! all entries contiguously.
 
-use super::super::super::super::abi::emit::{BlobSlice, RecordLayout};
-use super::super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
-use super::super::super::schema::{VARIANT_INFO_CASE_NAME, VARIANT_INFO_PAYLOAD};
+use super::super::super::super::abi::emit::BlobSlice;
 use super::super::super::FuncClassified;
-use super::super::plan::Cell;
-use super::{
-    back_fill_per_cell, build_per_cell_side_table, CellEntryWriter, PerCellIndices,
-    PerCellSideTableBlob, INFO_TYPE_NAME,
-};
+use super::super::plan::{Cell, LiftPlan};
+use super::PerCellIndices;
 
-/// Per-(plan-cell) emit-phase data for one `Cell::Variant`.
+/// Where a `Cell::Variant`'s slot lives in the per-(fn, param | result)
+/// variant-info buffer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum VariantSlotSource {
+    /// Build-time absolute index — outer-plan variants.
+    Static { entry_idx: u32 },
+    // List-element variant lands when `Cell::Variant` is opened in
+    // `Cell::list_element_class`. Will mirror `FlagsSlotSource::PerIteration`:
+    // entry idx = `list_elem_variant_base + entry_offset_in_elem`,
+    // computed at runtime.
+}
+
+/// Per-(plan-cell) emit-phase data for one `Cell::Variant`. The
+/// wrapper writes `type-name` (build-time-const) and the
+/// disc-dispatched `case-name` + `payload` into the buffer slot
+/// resolved from `slot_source`. Cell payload is `cell::variant-case(idx)`
+/// with the same idx as `slot_source`.
 #[derive(Clone, Debug)]
 pub(crate) struct VariantRuntimeFill {
-    /// `cell::variant-case(u32)` payload — range-relative index.
-    pub side_table_idx: u32,
-    /// Byte offset of *this* entry within the entries segment.
-    /// Combined with `entries_base` by [`back_fill_entry_addrs`] to
-    /// recover the absolute slot addresses.
-    pub entry_seg_off: u32,
-    /// Absolute address of the entry's `case-name` `(ptr, len)` slot.
-    /// `None` until [`back_fill_entry_addrs`] runs.
-    pub case_name_addr: Option<i32>,
-    /// Absolute address of the entry's `payload` field's option-disc
-    /// byte (option<u32>'s disc at offset 0). `None` until back-fill.
-    pub payload_disc_addr: Option<i32>,
-    /// Absolute address of the entry's `payload` field's u32 slot
-    /// (option<u32>'s value at the schema-derived sub-offset).
-    /// `None` until back-fill.
-    pub payload_value_addr: Option<i32>,
+    pub slot_source: VariantSlotSource,
+    /// `(off, len)` of the type-name into the shared name blob.
+    pub type_name: BlobSlice,
     /// Pre-interned `(off, len)` of each case-name, in disc order.
     pub case_names: Vec<BlobSlice>,
     /// Per-case child cell idx, in disc order. `None` for unit cases.
     pub per_case_payload: Vec<Option<u32>>,
 }
 
-pub(crate) struct VariantInfoBlobs {
-    pub entries: Segment,
-    pub per_param_range: Vec<Vec<Option<SymRef>>>,
-    pub per_result_range: Vec<Option<SymRef>>,
+/// Output of the per-cell walk over every `Cell::Variant` appearance.
+/// Mirrors [`super::flags_info::FlagsInfoMaps`] — the buffer is
+/// per-call so there's no segment to lay out, just per-(fn, param |
+/// result) entry counts + per-cell fills.
+pub(crate) struct VariantInfoMaps {
+    /// Per-cell fills for plan walks (param + compound result).
     pub per_cell_fill: PerCellIndices<VariantRuntimeFill>,
+    /// Number of variant entries per (fn, param). Drives the per-call
+    /// buffer size + the static `field_tree.variant_infos.len` bake.
+    pub per_param_count: Vec<Vec<u32>>,
+    /// Number of variant entries in each fn's compound result buffer.
+    /// `0` when no variant cells in the result lift; never any Direct
+    /// (sync flat) variant results — `Variant` always retptrs.
+    pub per_result_count: Vec<u32>,
 }
 
-/// One variant-info entry per `Cell::Variant`. Runtime-filled
-/// fields (`case-name`, `payload`) stay zeroed in the segment;
-/// the wrapper patches them per call. Type-name + case-name slices
-/// are read off the cell (interned at plan-build time, mirroring
-/// [`Cell::EnumCase`] / [`Cell::Flags`] / [`Cell::Handle`]).
-pub(crate) fn build_variant_info_blob(
-    per_func: &[FuncClassified],
-    entry_layout: &RecordLayout,
-    entries_id: SymbolId,
-) -> VariantInfoBlobs {
-    let mut writer = VariantEntryWriter { entry_layout };
-    let PerCellSideTableBlob {
-        entries,
-        per_param_range,
-        per_result_range,
-        per_cell_fill,
-        per_result_single_fill,
-    } = build_per_cell_side_table(per_func, entry_layout, entries_id, &mut writer);
-    // `HAS_DIRECT = false` ⇒ framework never produces single fills.
-    debug_assert!(per_result_single_fill.is_empty());
-    VariantInfoBlobs {
-        entries,
-        per_param_range,
-        per_result_range,
-        per_cell_fill,
+/// Walk every (fn, param | compound-result) to collect per-cell
+/// `VariantRuntimeFill`s + per-(fn, param | result) entry counts.
+/// No segment is built — entries are written into a per-call
+/// `cabi_realloc`'d buffer at emit time.
+///
+/// `Variant` always retptrs so there's no `Direct` arm; all
+/// variant-bearing results route through the compound plan.
+pub(crate) fn build_variant_info_maps(per_func: &[FuncClassified]) -> VariantInfoMaps {
+    let mut per_param_fill: Vec<Vec<Vec<Option<VariantRuntimeFill>>>> =
+        Vec::with_capacity(per_func.len());
+    let mut per_param_count: Vec<Vec<u32>> = Vec::with_capacity(per_func.len());
+    let mut per_result_fill: Vec<Vec<Option<VariantRuntimeFill>>> =
+        Vec::with_capacity(per_func.len());
+    let mut per_result_count: Vec<u32> = Vec::with_capacity(per_func.len());
+    for fd in per_func {
+        let mut params_fill = Vec::with_capacity(fd.params.len());
+        let mut params_count = Vec::with_capacity(fd.params.len());
+        for p in &fd.params {
+            let (fill, count) = scan_plan(&p.plan);
+            params_fill.push(fill);
+            params_count.push(count);
+        }
+        per_param_fill.push(params_fill);
+        per_param_count.push(params_count);
+        let (result_fill, result_count) = match fd.result_lift.as_ref().and_then(|rl| rl.compound())
+        {
+            Some(c) => scan_plan(&c.plan),
+            None => (Vec::new(), 0),
+        };
+        per_result_fill.push(result_fill);
+        per_result_count.push(result_count);
+    }
+    VariantInfoMaps {
+        per_cell_fill: PerCellIndices {
+            per_param: per_param_fill,
+            per_result: per_result_fill,
+        },
+        per_param_count,
+        per_result_count,
     }
 }
 
-struct VariantEntryWriter<'a> {
-    entry_layout: &'a RecordLayout,
-}
-
-impl<'a> CellEntryWriter for VariantEntryWriter<'a> {
-    type Fill = VariantRuntimeFill;
-    // Variant always retptrs — classify never produces a Direct.
-    const HAS_DIRECT: bool = false;
-
-    fn step_cell(
-        &mut self,
-        entries: &mut Vec<u8>,
-        cell: &Cell,
-        side_table_idx: u32,
-    ) -> Option<VariantRuntimeFill> {
-        let Cell::Variant {
+/// Walk one plan's outer cells, allocating range-relative
+/// `Static { entry_idx }` per `Cell::Variant` and pulling type_name +
+/// case_names + per_case_payload off the cell. List-element variants
+/// (commit-2) will use `PerIteration` and won't participate in this
+/// static count.
+fn scan_plan(plan: &LiftPlan) -> (Vec<Option<VariantRuntimeFill>>, u32) {
+    let mut fill_map: Vec<Option<VariantRuntimeFill>> =
+        (0..plan.cells.len()).map(|_| None).collect();
+    let mut count: u32 = 0;
+    for (cell_pos, cell) in plan.cells.iter().enumerate() {
+        if let Cell::Variant {
             type_name,
             case_names,
             per_case_payload,
             ..
         } = cell
-        else {
-            return None;
-        };
-
-        let entry_seg_off = entries.len() as u32;
-        // `case-name.*` and `payload.*` stay zero — the wrapper
-        // patches them per call.
-        let entry = RecordWriter::extend_zero(entries, self.entry_layout);
-        entry.write_slice(entries, INFO_TYPE_NAME, *type_name);
-
-        Some(VariantRuntimeFill {
-            side_table_idx,
-            entry_seg_off,
-            case_name_addr: None,
-            payload_disc_addr: None,
-            payload_value_addr: None,
-            case_names: case_names.clone(),
-            per_case_payload: per_case_payload.clone(),
-        })
+        {
+            fill_map[cell_pos] = Some(VariantRuntimeFill {
+                slot_source: VariantSlotSource::Static { entry_idx: count },
+                type_name: *type_name,
+                case_names: case_names.clone(),
+                per_case_payload: per_case_payload.clone(),
+            });
+            count += 1;
+        }
     }
-}
-
-/// Patch each per-cell `case_name_addr` / `payload_disc_addr` /
-/// `payload_value_addr` once the entries segment has a base.
-/// `payload_value_off` is the byte offset of the `option<u32>`
-/// payload's u32 slot within the option (schema-derived; lives on
-/// `SchemaLayouts::variant_info_payload_value_off`).
-pub(crate) fn back_fill_entry_addrs(
-    fill: &mut PerCellIndices<VariantRuntimeFill>,
-    entries_base: u32,
-    entry_layout: &RecordLayout,
-    payload_value_off: u32,
-) {
-    let case_name_off = entry_layout.offset_of(VARIANT_INFO_CASE_NAME);
-    let payload_off = entry_layout.offset_of(VARIANT_INFO_PAYLOAD);
-    back_fill_per_cell(fill, &mut [], |f| {
-        // Always-on — see flags_info::back_fill_len_addrs.
-        assert!(
-            f.case_name_addr.is_none()
-                && f.payload_disc_addr.is_none()
-                && f.payload_value_addr.is_none(),
-            "back_fill_entry_addrs called twice on the same VariantRuntimeFill",
-        );
-        let entry_off = entries_base + f.entry_seg_off;
-        f.case_name_addr = Some((entry_off + case_name_off) as i32);
-        f.payload_disc_addr = Some((entry_off + payload_off) as i32);
-        f.payload_value_addr = Some((entry_off + payload_off + payload_value_off) as i32);
-    });
+    (fill_map, count)
 }

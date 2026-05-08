@@ -509,18 +509,15 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
                 per_case_payload,
                 ..
             } => {
-                /// Synth offsets for variant entry-slot stubs — anywhere
-                /// in linear memory works.
-                const VARIANT_BASE: u32 = 0x2000;
-                let case_name_addr = VARIANT_BASE + variant_idx * 32;
-                let payload_disc_addr = case_name_addr + 16;
-                let payload_value_addr = case_name_addr + 20;
+                use super::sidetable::variant_info::VariantSlotSource;
                 let fill = VariantRuntimeFill {
-                    side_table_idx: variant_idx,
-                    entry_seg_off: 0,
-                    case_name_addr: Some(case_name_addr as i32),
-                    payload_disc_addr: Some(payload_disc_addr as i32),
-                    payload_value_addr: Some(payload_value_addr as i32),
+                    slot_source: VariantSlotSource::Static {
+                        entry_idx: variant_idx,
+                    },
+                    type_name: BlobSlice {
+                        off: 0,
+                        len: STUB_FLAG_NAME_LEN,
+                    },
                     case_names: (0..case_names.len() as u32)
                         .map(|i| BlobSlice {
                             off: i * STUB_FLAG_NAME_STRIDE,
@@ -582,6 +579,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let handle_info_layout = synth_info_layout("handle-info");
     let flags_info_layout = synth_info_layout("flags-info");
     let record_info_layout = synth_info_layout("record-info");
+    let variant_info_layout = synth_info_layout("variant-info");
     let (_, record_field_tuple_layout) = synth_record_info_layouts(resolve);
     let cell_side = auto_cell_side_data(plan);
     let param_types = plan_param_types(plan, resolve);
@@ -611,6 +609,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     let handle_info_base = builder.alloc_local(ValType::I32);
     let flags_info_base = builder.alloc_local(ValType::I32);
     let record_info_base = builder.alloc_local(ValType::I32);
+    let variant_info_base = builder.alloc_local(ValType::I32);
     let next_handle_idx = builder.alloc_local(ValType::I32);
     let next_flags_idx = builder.alloc_local(ValType::I32);
     let next_record_idx = builder.alloc_local(ValType::I32);
@@ -655,6 +654,7 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         handle_info_base: Some(handle_info_base),
         flags_info_base: Some(flags_info_base),
         record_info_base: Some(record_info_base),
+        variant_info_base: Some(variant_info_base),
         next_handle_idx: Some(next_handle_idx),
         next_flags_idx: Some(next_flags_idx),
         next_record_idx: Some(next_record_idx),
@@ -722,6 +722,10 @@ fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
         record_info: super::emit::RecordInfoOffsets::from_layout(
             &record_info_layout,
             &record_field_tuple_layout,
+        ),
+        variant_info: super::emit::VariantInfoOffsets::from_layout(
+            &variant_info_layout,
+            super::super::super::abi::emit::option_payload_offset(&sizes, &Type::U32),
         ),
     };
     emit_lift_plan(

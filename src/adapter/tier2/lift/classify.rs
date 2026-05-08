@@ -147,6 +147,10 @@ pub(crate) struct ParamLayout {
     /// [`Self::flags_count`]; runtime regime arrives with
     /// `list<record>` (commit-2).
     pub record_count: u32,
+    /// `Cell::Variant` count among the plan's outer cells.
+    /// Same shape + static-vs-runtime distinction as the others;
+    /// runtime regime arrives with `list<variant>` (commit-2).
+    pub variant_count: u32,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -171,6 +175,10 @@ pub(crate) struct ResultLayout {
     /// Records always retptr (no Direct route), so `0` for non-
     /// compound results.
     pub record_count: u32,
+    /// Result-side counterpart of [`ParamLayout::variant_count`]:
+    /// number of outer `Cell::Variant` in the compound result plan.
+    /// Variants always retptr — same as records.
+    pub variant_count: u32,
 }
 
 pub(crate) enum ResultSourceLayout {

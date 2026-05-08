@@ -17,13 +17,12 @@ use super::super::mem_layout::StaticLayout;
 use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, Segment, SymRef, SymbolBases};
 use super::lift::plan::Cell;
 use super::lift::{
-    back_fill_record_fields_ptrs, back_fill_variant_entry_addrs, build_char_scratch_map,
-    build_enum_info_blob, build_flags_info_maps, build_handle_info_maps, build_record_info_maps,
-    build_tuple_indices_blob, build_variant_info_blob, char_scratch_sizes, flags_scratch_sizes,
-    fold_cell_side_data, CellFillSources, CellSideData, CharScratch, CharScratchMaps,
-    FlagsInfoMaps, FlagsRuntimeFill, HandleInfoMaps, HandleRuntimeFill, ParamLayout,
-    RecordInfoMaps, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
-    TupleIndicesBlob, VariantInfoBlobs,
+    back_fill_record_fields_ptrs, build_char_scratch_map, build_enum_info_blob,
+    build_flags_info_maps, build_handle_info_maps, build_record_info_maps, build_tuple_indices_blob,
+    build_variant_info_maps, char_scratch_sizes, flags_scratch_sizes, fold_cell_side_data,
+    CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoMaps, FlagsRuntimeFill,
+    HandleInfoMaps, HandleRuntimeFill, ParamLayout, RecordInfoMaps, ResultLayout, ResultLift,
+    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoMaps,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -413,7 +412,6 @@ pub(super) fn lay_out_static_memory(
     let enum_info_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
-    let variant_info_id = symbols.alloc();
     let enum_info = build_enum_info_blob(&per_func, &schema.enum_info_layout, enum_info_id);
     let SideTableBlob {
         segment: enum_segment,
@@ -458,12 +456,15 @@ pub(super) fn lay_out_static_memory(
         segment: tuple_indices_seg,
         per_cell_idx: tuple_indices_per_cell,
     } = build_tuple_indices_blob(&per_func, tuple_indices_id);
-    let VariantInfoBlobs {
-        entries: variant_entries_seg,
-        per_param_range: variant_per_param_range_sym,
-        per_result_range: variant_per_result_range_sym,
-        per_cell_fill: mut variant_per_cell_fill,
-    } = build_variant_info_blob(&per_func, &schema.variant_info_layout, variant_info_id);
+    // Variant-info doesn't pre-bake a static segment — the wrapper
+    // body allocates a per-(fn, param | result) buffer per call and
+    // patches `field_tree.variant_infos`. Type-name + per-cell case
+    // dispatch are written per call from data on the cell.
+    let VariantInfoMaps {
+        per_cell_fill: variant_per_cell_fill,
+        per_param_count: variant_per_param_count,
+        per_result_count: variant_per_result_count,
+    } = build_variant_info_maps(&per_func);
     // Handle-info doesn't pre-bake a static segment — the wrapper
     // body allocates a per-(fn, param | result) buffer per call,
     // writes type-name + id, and patches `field_tree.handle_infos`.
@@ -487,19 +488,10 @@ pub(super) fn lay_out_static_memory(
     // records (commit-2) compute `fields_ptr` per call.
     back_fill_record_fields_ptrs(&mut record_per_cell_fill, record_tuples_base);
 
-    // Runtime-filled variant entries: place + back-fill the per-cell
-    // case-name / payload-value slot addresses.
-    let variant_entries_base =
-        place_segment(&mut layout, &mut symbols, &mut relocs, variant_entries_seg);
-    back_fill_variant_entry_addrs(
-        &mut variant_per_cell_fill,
-        variant_entries_base,
-        &schema.variant_info_layout,
-        schema.variant_info_payload_value_off,
-    );
-    // Handle-info: no static segment to place; fills already carry
-    // their (range-relative) `side_table_idx` and per-cell `type-name`,
-    // and the per-call buffer is allocated in the wrapper body.
+    // Variant-info: no static segment to place. Fills already carry
+    // their (range-relative) `entry_idx` + the per-cell type-name +
+    // case-names; the per-call buffer is allocated in the wrapper
+    // body. Same shape as flags / record / handle.
 
     // Resolve per-(fn, param) and per-fn `SymRef`s to absolute
     // `BlobSlice`s now that every segment has a base. Tuple-indices
@@ -507,15 +499,11 @@ pub(super) fn lay_out_static_memory(
     // per (fn, param | result) via `PerCellIndices::resolve_*`.
     let (enum_per_param, enum_per_result) =
         resolve_param_result_ranges(&symbols, enum_per_param_sym, enum_per_result_sym);
-    let (variant_per_param_range, variant_per_result_range) = resolve_param_result_ranges(
-        &symbols,
-        variant_per_param_range_sym,
-        variant_per_result_range_sym,
-    );
-    // handle-infos has no static entries segment — the wrapper body
-    // allocates a per-call buffer and patches `handle_infos.ptr`. The
-    // `len` is build-time-const (entry count per (fn, param | result)),
-    // baked into the static field-tree below.
+    // handle-infos / variant-infos / record-info entries have no
+    // static segments — the wrapper body allocates per-call buffers
+    // and patches each `*_infos.ptr`. The `len` is build-time-const
+    // (entry count per (fn, param | result)), baked into the static
+    // field-tree below.
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
@@ -533,7 +521,10 @@ pub(super) fn lay_out_static_memory(
                         off: 0,
                         len: record_per_param_count[fn_idx][p_idx],
                     },
-                    variant_infos: variant_per_param_range[fn_idx][p_idx],
+                    variant_infos: BlobSlice {
+                        off: 0,
+                        len: variant_per_param_count[fn_idx][p_idx],
+                    },
                     handle_infos: BlobSlice {
                         off: 0,
                         len: handle_per_param_count[fn_idx][p_idx],
@@ -553,7 +544,10 @@ pub(super) fn lay_out_static_memory(
                 off: 0,
                 len: record_per_result_count[fn_idx],
             },
-            variant_infos: variant_per_result_range[fn_idx],
+            variant_infos: BlobSlice {
+                off: 0,
+                len: variant_per_result_count[fn_idx],
+            },
             handle_infos: BlobSlice {
                 off: 0,
                 len: handle_per_result_count[fn_idx],
@@ -681,6 +675,7 @@ pub(super) fn lay_out_static_memory(
                         handle_count: handle_per_param_count[i][p_idx],
                         flags_count: flags_per_param_count[i][p_idx],
                         record_count: record_per_param_count[i][p_idx],
+                        variant_count: variant_per_param_count[i][p_idx],
                     }
                 })
                 .collect();
@@ -722,6 +717,7 @@ pub(super) fn lay_out_static_memory(
                     handle_count: handle_per_result_count[i],
                     flags_count: flags_per_result_count[i],
                     record_count: record_per_result_count[i],
+                    variant_count: variant_per_result_count[i],
                 }
             });
 

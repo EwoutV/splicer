@@ -38,11 +38,11 @@ use super::lift::plan::LiftPlan;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
     emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, LiftEmitCtx,
-    ListEmitLocals, RecordInfoOffsets, ResultEmitPlan, WrapperLocals,
+    ListEmitLocals, RecordInfoOffsets, ResultEmitPlan, VariantInfoOffsets, WrapperLocals,
 };
 use super::schema::{
     SchemaLayouts, FIELD_TREE, ON_CALL_ARGS, ON_CALL_CALL, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS,
-    TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS,
+    TREE_FLAGS_INFOS, TREE_HANDLE_INFOS, TREE_RECORD_INFOS, TREE_VARIANT_INFOS,
 };
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
@@ -355,6 +355,39 @@ fn emit_alloc_record_info_for_plan(
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
+/// Per-call variant-info buffer alloc + slice-ptr patch. Static-only
+/// regime today (mirrors [`emit_alloc_record_info_for_plan`]'s
+/// build-time-const branch); the runtime-sized branch lands when
+/// `Cell::Variant` opens in `list_element_class`. Field-tree's
+/// `variant_infos.len` was baked statically in `build_fields_blob`.
+fn emit_alloc_variant_info_for_plan(
+    f: &mut Function,
+    ctx: &LiftEmitCtx<'_>,
+    static_count: u32,
+    base_ptr: i32,
+    slice_field_off: u32,
+    lcl: &WrapperLocals,
+) {
+    if static_count == 0 {
+        return;
+    }
+    let base_local = lcl.variant_info_base.expect(
+        "variant_info_base local unset — fn_has_variant_cells gate disagrees \
+         with the per-(param|result) variant_count",
+    );
+    let buf_size = static_count
+        .checked_mul(ctx.variant_info.entry_size)
+        .expect("variant_info buffer size overflowed u32 — count * entry_size");
+    emit_cabi_realloc_call(
+        f,
+        ctx.cabi_realloc_idx,
+        ctx.variant_info.align,
+        buf_size,
+        base_local,
+    );
+    emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
+}
+
 /// Write the call-id record + per-call `list<field>` args pointer/len
 /// into the indirect-params buffer at `base_ptr`.
 fn emit_populate_hook_params(
@@ -423,6 +456,10 @@ pub(super) fn emit_wrapper_function(
             &schema.record_info_layout,
             &schema.record_field_tuple_layout,
         ),
+        variant_info: VariantInfoOffsets::from_layout(
+            &schema.variant_info_layout,
+            schema.variant_info_payload_value_off,
+        ),
     };
 
     // ── Phase 1: on-call (only if before-hook wired) ──
@@ -435,6 +472,7 @@ pub(super) fn emit_wrapper_function(
         let handle_infos_slice_off = field_tree_slice_off(schema, TREE_HANDLE_INFOS);
         let flags_infos_slice_off = field_tree_slice_off(schema, TREE_FLAGS_INFOS);
         let record_infos_slice_off = field_tree_slice_off(schema, TREE_RECORD_INFOS);
+        let variant_infos_slice_off = field_tree_slice_off(schema, TREE_VARIANT_INFOS);
         for (i, p) in fd.params.iter().enumerate() {
             let field_off = i as u32 * schema.field_layout.size;
             let list_locals = &lcl.param_list_locals[i];
@@ -478,6 +516,14 @@ pub(super) fn emit_wrapper_function(
                 p.lift.plan.has_list_elem_record(),
                 fd.fields_buf_offset as i32,
                 field_off + record_infos_slice_off,
+                &lcl,
+            );
+            emit_alloc_variant_info_for_plan(
+                &mut f,
+                &lift_ctx,
+                p.variant_count,
+                fd.fields_buf_offset as i32,
+                field_off + variant_infos_slice_off,
                 &lcl,
             );
             emit_lift_plan(
@@ -577,6 +623,8 @@ pub(super) fn emit_wrapper_function(
             after_result_tree_slice_off(schema, after_static.layout, TREE_FLAGS_INFOS);
         let record_infos_field_off =
             after_result_tree_slice_off(schema, after_static.layout, TREE_RECORD_INFOS);
+        let variant_infos_field_off =
+            after_result_tree_slice_off(schema, after_static.layout, TREE_VARIANT_INFOS);
         let result_handle_count = fd
             .result_lift
             .as_ref()
@@ -591,6 +639,11 @@ pub(super) fn emit_wrapper_function(
             .result_lift
             .as_ref()
             .map(|rl| rl.record_count)
+            .unwrap_or(0);
+        let result_variant_count = fd
+            .result_lift
+            .as_ref()
+            .map(|rl| rl.variant_count)
             .unwrap_or(0);
         match &result_emit {
             ResultEmitPlan::Compound {
@@ -655,6 +708,14 @@ pub(super) fn emit_wrapper_function(
                     record_infos_field_off,
                     &lcl,
                 );
+                emit_alloc_variant_info_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    result_variant_count,
+                    after_pf.params_offset,
+                    variant_infos_field_off,
+                    &lcl,
+                );
                 // Synth locals are contiguous; `synth_locals[0]`
                 // is the plan's `local_base`.
                 emit_lift_plan(
@@ -710,6 +771,14 @@ pub(super) fn emit_wrapper_function(
                     false,
                     after_pf.params_offset,
                     record_infos_field_off,
+                    &lcl,
+                );
+                emit_alloc_variant_info_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    result_variant_count,
+                    after_pf.params_offset,
+                    variant_infos_field_off,
                     &lcl,
                 );
                 f.instructions().local_get(lcl.cells_base);

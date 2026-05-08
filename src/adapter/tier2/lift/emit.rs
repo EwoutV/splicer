@@ -180,6 +180,10 @@ pub(crate) struct WrapperLocals {
     /// `Some` iff [`fn_has_record_cells`]. Same stage-then-consume
     /// invariant as [`Self::handle_info_base`].
     pub record_info_base: Option<u32>,
+    /// Base address of the active plan's variant-info buffer.
+    /// `Some` iff [`fn_has_variant_cells`]. Same stage-then-consume
+    /// invariant as [`Self::handle_info_base`].
+    pub variant_info_base: Option<u32>,
     /// Base address of the active plan's flags-info buffer.
     /// `Some` iff [`fn_has_flags_cells`]. Same stage-then-consume
     /// invariant as [`Self::handle_info_base`].
@@ -258,6 +262,7 @@ pub(crate) struct LiftEmitCtx<'a> {
     pub handle_info: HandleInfoOffsets,
     pub flags_info: FlagsInfoOffsets,
     pub record_info: RecordInfoOffsets,
+    pub variant_info: VariantInfoOffsets,
 }
 
 /// Build-time-resolved geometry of one `record handle-info` entry.
@@ -300,6 +305,38 @@ impl FlagsInfoOffsets {
             align: layout.align,
             type_name_off: layout.offset_of(INFO_TYPE_NAME),
             set_flags_off: layout.offset_of(FLAGS_INFO_SET_FLAGS),
+        }
+    }
+}
+
+/// Build-time-resolved geometry of one `record variant-info` entry,
+/// including the `option<u32>` payload's value-byte sub-offset.
+/// `payload_off` lands the option-disc byte; `payload_off +
+/// payload_value_off` lands the u32 value slot.
+#[derive(Clone, Copy)]
+pub(crate) struct VariantInfoOffsets {
+    pub entry_size: u32,
+    pub align: u32,
+    pub type_name_off: u32,
+    pub case_name_off: u32,
+    pub payload_off: u32,
+    pub payload_value_off: u32,
+}
+
+impl VariantInfoOffsets {
+    /// `payload_value_off` is a separate arg because `payload` is
+    /// `option<u32>`, not a record — `RecordLayout::offset_of` can't
+    /// reach into it. Sourced from `option_payload_offset`.
+    pub(crate) fn from_layout(layout: &RecordLayout, payload_value_off: u32) -> Self {
+        use super::super::schema::{VARIANT_INFO_CASE_NAME, VARIANT_INFO_PAYLOAD};
+        use super::sidetable::INFO_TYPE_NAME;
+        Self {
+            entry_size: layout.size,
+            align: layout.align,
+            type_name_off: layout.offset_of(INFO_TYPE_NAME),
+            case_name_off: layout.offset_of(VARIANT_INFO_CASE_NAME),
+            payload_off: layout.offset_of(VARIANT_INFO_PAYLOAD),
+            payload_value_off,
         }
     }
 }
@@ -633,6 +670,18 @@ fn fn_has_record_cells(fd: &FuncDispatch) -> bool {
             .result_lift
             .as_ref()
             .is_some_and(|rl| rl.record_count > 0)
+}
+
+/// Any `Cell::Variant` in the wrapper. Gates
+/// `WrapperLocals.variant_info_base`. List-element variant support
+/// (commit-2) will fold in here when `Cell::Variant` opens in
+/// `list_element_class`.
+fn fn_has_variant_cells(fd: &FuncDispatch) -> bool {
+    fd.params.iter().any(|p| p.variant_count > 0)
+        || fd
+            .result_lift
+            .as_ref()
+            .is_some_and(|rl| rl.variant_count > 0)
 }
 
 /// Per-class counts collected by [`walk_element_plan`]. Drives the
@@ -970,6 +1019,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let handle_info_base = fn_has_handle_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let flags_info_base = fn_has_flags_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let record_info_base = fn_has_record_cells(fd).then(|| builder.alloc_local(ValType::I32));
+    let variant_info_base = fn_has_variant_cells(fd).then(|| builder.alloc_local(ValType::I32));
     let next_handle_idx = needs_list_handle_locals.then(|| builder.alloc_local(ValType::I32));
     let next_flags_idx = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
     let next_record_idx = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
@@ -1014,6 +1064,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             handle_info_base,
             flags_info_base,
             record_info_base,
+            variant_info_base,
             next_handle_idx,
             next_flags_idx,
             next_record_idx,
@@ -1536,8 +1587,13 @@ fn emit_single_slot_cell(
             let CellSideData::Variant(fill) = side_data else {
                 panic!("Variant cell paired with non-Variant side data {side_data:?}");
             };
-            emit_variant_runtime_fill(f, source, fill);
-            cell_layout.emit_variant_case(f, addr, fill.side_table_idx);
+            emit_variant_runtime_fill(f, source, fill, lcl, ctx.variant_info);
+            // Migration commit: every variant cell is `Static`. When
+            // PerIteration lands this `let` becomes refutable and
+            // rustc forces the per-iter wiring before recompiling.
+            let super::sidetable::variant_info::VariantSlotSource::Static { entry_idx } =
+                fill.slot_source;
+            cell_layout.emit_variant_case(f, addr, entry_idx);
         }
         // Multi-slot + side-table-only + list — caller's responsibility.
         Cell::Text { .. }
@@ -2503,18 +2559,36 @@ fn emit_flags_runtime_fill(
         .i32_store(store_i32(set_flags_off + SLICE_LEN_OFFSET));
 }
 
-/// N-way disc dispatch for one `Cell::Variant` cell. For each case
-/// `i ∈ 0..N` the wrapper writes:
-///   - `case_names[i]` `(ptr, len)` into `case_name_addr`
-///   - option<u32> at `payload_disc_addr` / `payload_value_addr`:
-///     `some(child_idx)` for payload-bearing cases, `none` for unit
+/// Fill one `Cell::Variant`'s slot in the per-call variant-info
+/// buffer: write `type-name` (build-time-const) and the
+/// disc-dispatched `case-name` + `payload` (option<u32>) at runtime.
+/// Static cells fold the entry offset into memargs; per-iteration
+/// cells (commit-2) will stage `slot_addr = base + iter_base *
+/// entry_size` once and reuse for the per-arm stores.
 ///
-/// Encoded as nested if/else (compares disc to each case_idx). For
-/// typical variants (≤ 8 cases) the nested depth is manageable;
-/// `br_table` is a future optimization. Same single-threaded
-/// constraint as flags's bit-walk — the static segment is unsafe
-/// under concurrent calls.
-fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRuntimeFill) {
+/// N-way disc dispatch is encoded as nested if/else. For typical
+/// variants (≤ 8 cases) the nested depth is manageable; `br_table`
+/// is a future optimization. Single-threaded — the per-cell scratch
+/// is unsafe under concurrent calls.
+fn emit_variant_runtime_fill(
+    f: &mut Function,
+    disc_local: u32,
+    fill: &VariantRuntimeFill,
+    lcl: &WrapperLocals,
+    info: VariantInfoOffsets,
+) {
+    use super::sidetable::variant_info::VariantSlotSource;
+    let base_local = lcl.variant_info_base.expect(
+        "variant_info_base local unset on a wrapper containing Cell::Variant — \
+         fn_has_variant_cells gate must agree with the cells reaching \
+         emit_variant_runtime_fill",
+    );
+    // Migration commit: only `Static` slots are constructed. When
+    // PerIteration lands this let becomes refutable, forcing the
+    // per-iter slot-addr stage to be wired before recompiling.
+    let VariantSlotSource::Static { entry_idx } = fill.slot_source;
+    let entry_off = entry_idx * info.entry_size;
+
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
@@ -2526,23 +2600,35 @@ fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRu
         memory_index: 0,
     };
 
-    let case_name_addr = fill
-        .case_name_addr
-        .expect("case_name_addr unset — layout must run back_fill_variant_entry_addrs");
-    let payload_disc_addr = fill
-        .payload_disc_addr
-        .expect("payload_disc_addr unset — layout must run back_fill_variant_entry_addrs");
-    let payload_value_addr = fill
-        .payload_value_addr
-        .expect("payload_value_addr unset — layout must run back_fill_variant_entry_addrs");
+    // Write type-name (build-time-const).
+    let store_const = |f: &mut Function, off: u32, value: i32| {
+        f.instructions().local_get(base_local);
+        f.instructions().i32_const(value);
+        f.instructions().i32_store(store_i32(off));
+    };
+    let type_name_off = entry_off + info.type_name_off;
+    store_const(
+        f,
+        type_name_off + SLICE_PTR_OFFSET,
+        fill.type_name.off as i32,
+    );
+    store_const(
+        f,
+        type_name_off + SLICE_LEN_OFFSET,
+        fill.type_name.len as i32,
+    );
+
+    let case_name_off = entry_off + info.case_name_off;
+    let payload_off = entry_off + info.payload_off;
+    let payload_value_off = payload_off + info.payload_value_off;
 
     debug_assert_eq!(fill.case_names.len(), fill.per_case_payload.len());
 
     // Nested if/else: for each case `i`, `if disc == i { write case
-    // i's data }` else recurse to the next case. The last arm has
-    // no else (unreachable canonical-ABI disc out of range — wasm
-    // validators don't require unreachable for completeness here
-    // since the ABI guarantees disc < N).
+    // i's data }` else recurse. The last arm has no else (canonical-
+    // ABI disc out of range is unreachable; wasm validators don't
+    // require unreachable for completeness since the ABI guarantees
+    // disc < N).
     for (i, name) in fill.case_names.iter().enumerate() {
         let is_last = i + 1 == fill.case_names.len();
         if !is_last {
@@ -2552,26 +2638,22 @@ fn emit_variant_runtime_fill(f: &mut Function, disc_local: u32, fill: &VariantRu
             f.instructions().if_(BlockType::Empty);
         }
         // case-name = case_names[i]
-        f.instructions().i32_const(case_name_addr);
-        f.instructions().i32_const(name.off as i32);
-        f.instructions().i32_store(store_i32(SLICE_PTR_OFFSET));
-        f.instructions().i32_const(case_name_addr);
-        f.instructions().i32_const(name.len as i32);
-        f.instructions().i32_store(store_i32(SLICE_LEN_OFFSET));
+        store_const(f, case_name_off + SLICE_PTR_OFFSET, name.off as i32);
+        store_const(f, case_name_off + SLICE_LEN_OFFSET, name.len as i32);
         // payload = some(child_idx) or none
         match fill.per_case_payload[i] {
             Some(child_idx) => {
-                f.instructions().i32_const(payload_disc_addr);
+                f.instructions().local_get(base_local);
                 f.instructions().i32_const(OPTION_SOME as i32);
-                f.instructions().i32_store8(store_i8(0));
-                f.instructions().i32_const(payload_value_addr);
+                f.instructions().i32_store8(store_i8(payload_off));
+                f.instructions().local_get(base_local);
                 f.instructions().i32_const(child_idx as i32);
-                f.instructions().i32_store(store_i32(0));
+                f.instructions().i32_store(store_i32(payload_value_off));
             }
             None => {
-                f.instructions().i32_const(payload_disc_addr);
+                f.instructions().local_get(base_local);
                 f.instructions().i32_const(OPTION_NONE as i32);
-                f.instructions().i32_store8(store_i8(0));
+                f.instructions().i32_store8(store_i8(payload_off));
                 // value slot left untouched (irrelevant when disc=0)
             }
         }
