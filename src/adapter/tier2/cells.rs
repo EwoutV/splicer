@@ -512,12 +512,7 @@ impl CellLayout {
     /// `payload` is `ConstI32(idx)` for static cells (build-time idx)
     /// or `Local(local)` for list-element cells (runtime-staged idx
     /// off `list_elem_record_base`).
-    pub(crate) fn emit_record_of(
-        &self,
-        f: &mut Function,
-        addr_local: u32,
-        payload: PayloadSource,
-    ) {
+    pub(crate) fn emit_record_of(&self, f: &mut Function, addr_local: u32, payload: PayloadSource) {
         self.emit_cell(
             f,
             addr_local,

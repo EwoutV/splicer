@@ -18,11 +18,12 @@ use super::blob::{resolve, NameInterner, RecordWriter, RelocPlan, Segment, SymRe
 use super::lift::plan::Cell;
 use super::lift::{
     back_fill_record_fields_ptrs, build_char_scratch_map, build_enum_info_blob,
-    build_flags_info_maps, build_handle_info_maps, build_record_info_maps, build_tuple_indices_blob,
-    build_variant_info_maps, char_scratch_sizes, flags_scratch_sizes, fold_cell_side_data,
-    CellFillSources, CellSideData, CharScratch, CharScratchMaps, FlagsInfoMaps, FlagsRuntimeFill,
-    HandleInfoMaps, HandleRuntimeFill, ParamLayout, RecordInfoMaps, ResultLayout, ResultLift,
-    ResultSource, ResultSourceLayout, SideTableBlob, TupleIndicesBlob, VariantInfoMaps,
+    build_flags_info_maps, build_handle_info_maps, build_record_info_maps,
+    build_tuple_indices_blob, build_variant_info_maps, char_scratch_sizes, flags_scratch_sizes,
+    fold_cell_side_data, CellFillSources, CellSideData, CharScratch, CharScratchMaps,
+    FlagsInfoMaps, FlagsRuntimeFill, HandleInfoMaps, HandleRuntimeFill, InfoCounts, ParamLayout,
+    RecordInfoMaps, ResultLayout, ResultLift, ResultSource, ResultSourceLayout, SideTableBlob,
+    TupleIndicesBlob, VariantInfoMaps,
 };
 use super::schema::{
     SchemaLayouts, FIELD_NAME, FIELD_TREE, ON_RET_CALL, ON_RET_RESULT, TREE_CELLS, TREE_ENUM_INFOS,
@@ -672,10 +673,12 @@ pub(super) fn lay_out_static_memory(
                     ParamLayout {
                         lift,
                         cell_side,
-                        handle_count: handle_per_param_count[i][p_idx],
-                        flags_count: flags_per_param_count[i][p_idx],
-                        record_count: record_per_param_count[i][p_idx],
-                        variant_count: variant_per_param_count[i][p_idx],
+                        info_counts: InfoCounts {
+                            handle: handle_per_param_count[i][p_idx],
+                            flags: flags_per_param_count[i][p_idx],
+                            record: record_per_param_count[i][p_idx],
+                            variant: variant_per_param_count[i][p_idx],
+                        },
                     }
                 })
                 .collect();
@@ -714,10 +717,12 @@ pub(super) fn lay_out_static_memory(
                 };
                 ResultLayout {
                     source: layout_source,
-                    handle_count: handle_per_result_count[i],
-                    flags_count: flags_per_result_count[i],
-                    record_count: record_per_result_count[i],
-                    variant_count: variant_per_result_count[i],
+                    info_counts: InfoCounts {
+                        handle: handle_per_result_count[i],
+                        flags: flags_per_result_count[i],
+                        record: record_per_result_count[i],
+                        variant: variant_per_result_count[i],
+                    },
                 }
             });
 

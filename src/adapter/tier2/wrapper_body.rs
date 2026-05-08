@@ -37,7 +37,7 @@ use super::super::indices::LocalsBuilder;
 use super::lift::plan::LiftPlan;
 use super::lift::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,
-    emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, LiftEmitCtx,
+    emit_list_pre_pass, CellSideRefs, FlagsInfoOffsets, HandleInfoOffsets, InfoCounts, LiftEmitCtx,
     ListEmitLocals, RecordInfoOffsets, ResultEmitPlan, VariantInfoOffsets, WrapperLocals,
 };
 use super::schema::{
@@ -105,10 +105,7 @@ struct OnCallCallSite {
 struct CellsTarget {
     fields_base_ptr: i32,
     cells_field_off: u32,
-    static_handle_count: u32,
-    static_flags_count: u32,
-    static_record_count: u32,
-    static_variant_count: u32,
+    static_info_counts: InfoCounts,
 }
 
 /// Cells-slab allocation for one (param | result) plan. Runs the
@@ -130,10 +127,7 @@ fn emit_alloc_cells_for_plan(
         f,
         ctx,
         plan,
-        target.static_handle_count,
-        target.static_flags_count,
-        target.static_record_count,
-        target.static_variant_count,
+        &target.static_info_counts,
         list_locals,
         local_base,
         lcl,
@@ -181,43 +175,123 @@ fn after_result_tree_slice_off(
         + schema.tree_layout.offset_of(tree_field)
 }
 
-/// Per-call handle-info buffer alloc + slice-ptr patch for one
+/// Closed set of per-cell side-table kinds with a per-call info
+/// buffer (handle / flags / record / variant). The only other gated
+/// list-element kind is `list<list<T>>`, which uses a separate
+/// indices model and doesn't fit this pattern. Drives uniform
+/// dispatch across the per-(param | result) alloc + the predicates
+/// that gate the corresponding wrapper locals.
+#[derive(Clone, Copy)]
+enum InfoKind {
+    Handle,
+    Flags,
+    Record,
+    Variant,
+}
+
+impl InfoKind {
+    /// Lowercase singular suffix used in panic messages — must match
+    /// the same suffix in the gate-predicate names (`fn_has_*_cells`,
+    /// `fn_has_list_elem_*`, `next_*_idx`, `*_info_base`). A predicate
+    /// rename without updating this would silently produce a panic
+    /// message pointing at a non-existent function.
+    fn name(self) -> &'static str {
+        match self {
+            InfoKind::Handle => "handle",
+            InfoKind::Flags => "flags",
+            InfoKind::Record => "record",
+            InfoKind::Variant => "variant",
+        }
+    }
+
+    /// `(align, entry_size)` from the schema-derived offsets bundle.
+    fn entry_geometry(self, ctx: &LiftEmitCtx<'_>) -> (u32, u32) {
+        match self {
+            InfoKind::Handle => (ctx.handle_info.align, ctx.handle_info.entry_size),
+            InfoKind::Flags => (ctx.flags_info.align, ctx.flags_info.entry_size),
+            InfoKind::Record => (ctx.record_info.align, ctx.record_info.entry_size),
+            InfoKind::Variant => (ctx.variant_info.align, ctx.variant_info.entry_size),
+        }
+    }
+
+    /// `(info_base_local, runtime_count_local)` from the wrapper
+    /// locals. Both `Option` — `info_base` is `Some` iff the wrapper
+    /// has any cells of this kind; `runtime_count` is `Some` iff the
+    /// wrapper has list-element cells of this kind.
+    fn locals(self, lcl: &WrapperLocals) -> (Option<u32>, Option<u32>) {
+        match self {
+            InfoKind::Handle => (lcl.handle_info_base, lcl.next_handle_idx),
+            InfoKind::Flags => (lcl.flags_info_base, lcl.next_flags_idx),
+            InfoKind::Record => (lcl.record_info_base, lcl.next_record_idx),
+            InfoKind::Variant => (lcl.variant_info_base, lcl.next_variant_idx),
+        }
+    }
+}
+
+/// Per-kind dispatch + slice-target inputs for one
+/// [`emit_alloc_info_buffer_for_plan`] call. Bundled so the function
+/// signature stays under clippy's `too_many_arguments` cap; the call
+/// sites already iterate over `[InfoBufferTarget; 4]` arrays.
+struct InfoBufferTarget {
+    kind: InfoKind,
+    /// Outer-cell count of this kind (drives static-count `cabi_realloc`).
+    static_count: u32,
+    /// `true` iff this plan has list-element cells of this kind —
+    /// the alloc reads `next_*_idx` and patches both `ptr` + `len`.
+    runtime_sized: bool,
+    /// Field-tree slice offset within the `field` (or after-result)
+    /// record where this kind's `*-infos` slice lives.
+    slice_field_off: u32,
+}
+
+/// Per-call info-buffer alloc + slice-ptr patch for one
 /// (param | result) plan.
 ///
 /// Two count regimes, picked per-plan (build-time-known):
-/// - **Runtime** (`runtime_sized = true`): this plan contains a
-///   `list<handle>` somewhere. The pre-pass accumulated
-///   `static_count + Σ_lists len * handles_per_elem` into
-///   `lcl.next_handle_idx`; the alloc uses that local and patches
-///   both `ptr` + `len`.
-/// - **Build-time-const** (`runtime_sized = false`): no list-element
-///   handles. Skipped entirely when `static_count == 0`; otherwise
-///   `cabi_realloc(static_count * entry_size)` + ptr patch (the
-///   slice's `len` was baked statically).
-fn emit_alloc_handle_info_for_plan(
+/// - **Runtime** (`target.runtime_sized = true`): the plan contains
+///   a list-element cell of this kind. The pre-pass accumulated
+///   `static_count + Σ_lists len * per_elem` into the matching
+///   `next_*_idx`; the alloc uses that local and patches `ptr` + `len`.
+/// - **Build-time-const** (`target.runtime_sized = false`): no list-
+///   element cells. Skipped entirely when `static_count == 0`;
+///   otherwise `cabi_realloc(static_count * entry_size)` + ptr patch
+///   (the slice's `len` was baked statically by `build_fields_blob`).
+fn emit_alloc_info_buffer_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
-    static_count: u32,
-    runtime_sized: bool,
+    target: InfoBufferTarget,
     base_ptr: i32,
-    slice_field_off: u32,
     lcl: &WrapperLocals,
 ) {
+    let InfoBufferTarget {
+        kind,
+        static_count,
+        runtime_sized,
+        slice_field_off,
+    } = target;
+    let (align, entry_size) = kind.entry_geometry(ctx);
+    let (base_local_opt, count_local_opt) = kind.locals(lcl);
     if runtime_sized {
-        let count_local = lcl.next_handle_idx.expect(
-            "next_handle_idx unset — fn_has_list_elem_handle gate disagrees \
-             with the plan's list_specs",
-        );
-        let base_local = lcl.handle_info_base.expect(
-            "handle_info_base local unset — fn_has_handle_cells gate disagrees \
-             with fn_has_list_elem_handle",
-        );
+        let count_local = count_local_opt.unwrap_or_else(|| {
+            panic!(
+                "next_{kind}_idx unset — fn_has_list_elem_{kind} gate disagrees \
+                 with the plan's list_specs",
+                kind = kind.name(),
+            )
+        });
+        let base_local = base_local_opt.unwrap_or_else(|| {
+            panic!(
+                "{kind}_info_base local unset — fn_has_{kind}_cells gate disagrees \
+                 with fn_has_list_elem_{kind}",
+                kind = kind.name(),
+            )
+        });
         emit_cabi_realloc_call_runtime(
             f,
             ctx.cabi_realloc_idx,
-            ctx.handle_info.align,
+            align,
             count_local,
-            ctx.handle_info.entry_size,
+            entry_size,
             base_local,
         );
         emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
@@ -227,187 +301,20 @@ fn emit_alloc_handle_info_for_plan(
     if static_count == 0 {
         return;
     }
-    let base_local = lcl.handle_info_base.expect(
-        "handle_info_base local unset — fn_has_handle_cells gate disagrees \
-         with the per-(param|result) handle_count",
-    );
-    let buf_size = static_count
-        .checked_mul(ctx.handle_info.entry_size)
-        .expect("handle_info buffer size overflowed u32 — count * entry_size");
-    emit_cabi_realloc_call(
-        f,
-        ctx.cabi_realloc_idx,
-        ctx.handle_info.align,
-        buf_size,
-        base_local,
-    );
-    emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
-}
-
-/// Per-call flags-info buffer alloc + slice-ptr patch. Mirrors
-/// [`emit_alloc_handle_info_for_plan`]'s two-regime structure
-/// (static-count + runtime-count) for the per-call flags-info
-/// entries buffer. The set-flags scratch slabs themselves stay
-/// per-cell static for non-list-element flags; list-element flags
-/// get a per-list scratch buffer allocated in `emit_list_of_arm`.
-fn emit_alloc_flags_info_for_plan(
-    f: &mut Function,
-    ctx: &LiftEmitCtx<'_>,
-    static_count: u32,
-    runtime_sized: bool,
-    base_ptr: i32,
-    slice_field_off: u32,
-    lcl: &WrapperLocals,
-) {
-    if runtime_sized {
-        let count_local = lcl.next_flags_idx.expect(
-            "next_flags_idx unset — fn_has_list_elem_flags gate disagrees \
-             with the plan's list_specs",
-        );
-        let base_local = lcl.flags_info_base.expect(
-            "flags_info_base local unset — fn_has_flags_cells gate disagrees \
-             with fn_has_list_elem_flags",
-        );
-        emit_cabi_realloc_call_runtime(
-            f,
-            ctx.cabi_realloc_idx,
-            ctx.flags_info.align,
-            count_local,
-            ctx.flags_info.entry_size,
-            base_local,
-        );
-        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
-        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
-        return;
-    }
-    if static_count == 0 {
-        return;
-    }
-    let base_local = lcl.flags_info_base.expect(
-        "flags_info_base local unset — fn_has_flags_cells gate disagrees \
-         with the per-(param|result) flags_count",
-    );
-    let buf_size = static_count
-        .checked_mul(ctx.flags_info.entry_size)
-        .expect("flags_info buffer size overflowed u32 — count * entry_size");
-    emit_cabi_realloc_call(
-        f,
-        ctx.cabi_realloc_idx,
-        ctx.flags_info.align,
-        buf_size,
-        base_local,
-    );
-    emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
-}
-
-/// Per-call record-info buffer alloc + slice-ptr patch. Mirrors
-/// [`emit_alloc_flags_info_for_plan`]'s two-regime structure
-/// (static-count + runtime-count) for the per-call record-info
-/// entries buffer. The field-tuples themselves stay baked in the
-/// static tuples segment for non-list-element records; list-element
-/// records get a per-list field-tuples buffer allocated in
-/// `emit_list_of_arm`.
-fn emit_alloc_record_info_for_plan(
-    f: &mut Function,
-    ctx: &LiftEmitCtx<'_>,
-    static_count: u32,
-    runtime_sized: bool,
-    base_ptr: i32,
-    slice_field_off: u32,
-    lcl: &WrapperLocals,
-) {
-    if runtime_sized {
-        let count_local = lcl.next_record_idx.expect(
-            "next_record_idx unset — fn_has_list_elem_record gate disagrees \
-             with the plan's list_specs",
-        );
-        let base_local = lcl.record_info_base.expect(
-            "record_info_base local unset — fn_has_record_cells gate disagrees \
-             with fn_has_list_elem_record",
-        );
-        emit_cabi_realloc_call_runtime(
-            f,
-            ctx.cabi_realloc_idx,
-            ctx.record_info.align,
-            count_local,
-            ctx.record_info.entry_size,
-            base_local,
-        );
-        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
-        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
-        return;
-    }
-    if static_count == 0 {
-        return;
-    }
-    let base_local = lcl.record_info_base.expect(
-        "record_info_base local unset — fn_has_record_cells gate disagrees \
-         with the per-(param|result) record_count",
-    );
-    let buf_size = static_count
-        .checked_mul(ctx.record_info.entry_size)
-        .expect("record_info buffer size overflowed u32 — count * entry_size");
-    emit_cabi_realloc_call(
-        f,
-        ctx.cabi_realloc_idx,
-        ctx.record_info.align,
-        buf_size,
-        base_local,
-    );
-    emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
-}
-
-/// Per-call variant-info buffer alloc + slice-ptr patch. Mirrors
-/// [`emit_alloc_record_info_for_plan`]'s two-regime structure
-/// (static-count + runtime-count). No per-list scratch — variant
-/// has uniform-stride entries with no inner sub-slabs.
-fn emit_alloc_variant_info_for_plan(
-    f: &mut Function,
-    ctx: &LiftEmitCtx<'_>,
-    static_count: u32,
-    runtime_sized: bool,
-    base_ptr: i32,
-    slice_field_off: u32,
-    lcl: &WrapperLocals,
-) {
-    if runtime_sized {
-        let count_local = lcl.next_variant_idx.expect(
-            "next_variant_idx unset — fn_has_list_elem_variant gate disagrees \
-             with the plan's list_specs",
-        );
-        let base_local = lcl.variant_info_base.expect(
-            "variant_info_base local unset — fn_has_variant_cells gate disagrees \
-             with fn_has_list_elem_variant",
-        );
-        emit_cabi_realloc_call_runtime(
-            f,
-            ctx.cabi_realloc_idx,
-            ctx.variant_info.align,
-            count_local,
-            ctx.variant_info.entry_size,
-            base_local,
-        );
-        emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
-        emit_store_slice_len_runtime(f, base_ptr, slice_field_off, count_local);
-        return;
-    }
-    if static_count == 0 {
-        return;
-    }
-    let base_local = lcl.variant_info_base.expect(
-        "variant_info_base local unset — fn_has_variant_cells gate disagrees \
-         with the per-(param|result) variant_count",
-    );
-    let buf_size = static_count
-        .checked_mul(ctx.variant_info.entry_size)
-        .expect("variant_info buffer size overflowed u32 — count * entry_size");
-    emit_cabi_realloc_call(
-        f,
-        ctx.cabi_realloc_idx,
-        ctx.variant_info.align,
-        buf_size,
-        base_local,
-    );
+    let base_local = base_local_opt.unwrap_or_else(|| {
+        panic!(
+            "{kind}_info_base local unset — fn_has_{kind}_cells gate disagrees \
+             with the per-(param|result) {kind}_count",
+            kind = kind.name(),
+        )
+    });
+    let buf_size = static_count.checked_mul(entry_size).unwrap_or_else(|| {
+        panic!(
+            "{kind}_info buffer size overflowed u32 — count * entry_size",
+            kind = kind.name(),
+        )
+    });
+    emit_cabi_realloc_call(f, ctx.cabi_realloc_idx, align, buf_size, base_local);
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
 
@@ -509,48 +416,43 @@ pub(super) fn emit_wrapper_function(
                 CellsTarget {
                     fields_base_ptr: fd.fields_buf_offset as i32,
                     cells_field_off: field_off + cells_slice_off,
-                    static_handle_count: p.handle_count,
-                    static_flags_count: p.flags_count,
-                    static_record_count: p.record_count,
-                    static_variant_count: p.variant_count,
+                    static_info_counts: p.info_counts,
                 },
             );
-            emit_alloc_handle_info_for_plan(
-                &mut f,
-                &lift_ctx,
-                p.handle_count,
-                p.lift.plan.has_list_elem_handle(),
-                fd.fields_buf_offset as i32,
-                field_off + handle_infos_slice_off,
-                &lcl,
-            );
-            emit_alloc_flags_info_for_plan(
-                &mut f,
-                &lift_ctx,
-                p.flags_count,
-                p.lift.plan.has_list_elem_flags(),
-                fd.fields_buf_offset as i32,
-                field_off + flags_infos_slice_off,
-                &lcl,
-            );
-            emit_alloc_record_info_for_plan(
-                &mut f,
-                &lift_ctx,
-                p.record_count,
-                p.lift.plan.has_list_elem_record(),
-                fd.fields_buf_offset as i32,
-                field_off + record_infos_slice_off,
-                &lcl,
-            );
-            emit_alloc_variant_info_for_plan(
-                &mut f,
-                &lift_ctx,
-                p.variant_count,
-                p.lift.plan.has_list_elem_variant(),
-                fd.fields_buf_offset as i32,
-                field_off + variant_infos_slice_off,
-                &lcl,
-            );
+            for target in [
+                InfoBufferTarget {
+                    kind: InfoKind::Handle,
+                    static_count: p.info_counts.handle,
+                    runtime_sized: p.lift.plan.has_list_elem_handle(),
+                    slice_field_off: field_off + handle_infos_slice_off,
+                },
+                InfoBufferTarget {
+                    kind: InfoKind::Flags,
+                    static_count: p.info_counts.flags,
+                    runtime_sized: p.lift.plan.has_list_elem_flags(),
+                    slice_field_off: field_off + flags_infos_slice_off,
+                },
+                InfoBufferTarget {
+                    kind: InfoKind::Record,
+                    static_count: p.info_counts.record,
+                    runtime_sized: p.lift.plan.has_list_elem_record(),
+                    slice_field_off: field_off + record_infos_slice_off,
+                },
+                InfoBufferTarget {
+                    kind: InfoKind::Variant,
+                    static_count: p.info_counts.variant,
+                    runtime_sized: p.lift.plan.has_list_elem_variant(),
+                    slice_field_off: field_off + variant_infos_slice_off,
+                },
+            ] {
+                emit_alloc_info_buffer_for_plan(
+                    &mut f,
+                    &lift_ctx,
+                    target,
+                    fd.fields_buf_offset as i32,
+                    &lcl,
+                );
+            }
             emit_lift_plan(
                 &mut f,
                 &lift_ctx,
@@ -650,26 +552,11 @@ pub(super) fn emit_wrapper_function(
             after_result_tree_slice_off(schema, after_static.layout, TREE_RECORD_INFOS);
         let variant_infos_field_off =
             after_result_tree_slice_off(schema, after_static.layout, TREE_VARIANT_INFOS);
-        let result_handle_count = fd
+        let result_info_counts = fd
             .result_lift
             .as_ref()
-            .map(|rl| rl.handle_count)
-            .unwrap_or(0);
-        let result_flags_count = fd
-            .result_lift
-            .as_ref()
-            .map(|rl| rl.flags_count)
-            .unwrap_or(0);
-        let result_record_count = fd
-            .result_lift
-            .as_ref()
-            .map(|rl| rl.record_count)
-            .unwrap_or(0);
-        let result_variant_count = fd
-            .result_lift
-            .as_ref()
-            .map(|rl| rl.variant_count)
-            .unwrap_or(0);
+            .map(|rl| rl.info_counts)
+            .unwrap_or_default();
         match &result_emit {
             ResultEmitPlan::Compound {
                 plan,
@@ -701,48 +588,43 @@ pub(super) fn emit_wrapper_function(
                     CellsTarget {
                         fields_base_ptr: after_pf.params_offset,
                         cells_field_off,
-                        static_handle_count: result_handle_count,
-                        static_flags_count: result_flags_count,
-                        static_record_count: result_record_count,
-                        static_variant_count: result_variant_count,
+                        static_info_counts: result_info_counts,
                     },
                 );
-                emit_alloc_handle_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_handle_count,
-                    plan.has_list_elem_handle(),
-                    after_pf.params_offset,
-                    handle_infos_field_off,
-                    &lcl,
-                );
-                emit_alloc_flags_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_flags_count,
-                    plan.has_list_elem_flags(),
-                    after_pf.params_offset,
-                    flags_infos_field_off,
-                    &lcl,
-                );
-                emit_alloc_record_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_record_count,
-                    plan.has_list_elem_record(),
-                    after_pf.params_offset,
-                    record_infos_field_off,
-                    &lcl,
-                );
-                emit_alloc_variant_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_variant_count,
-                    plan.has_list_elem_variant(),
-                    after_pf.params_offset,
-                    variant_infos_field_off,
-                    &lcl,
-                );
+                for target in [
+                    InfoBufferTarget {
+                        kind: InfoKind::Handle,
+                        static_count: result_info_counts.handle,
+                        runtime_sized: plan.has_list_elem_handle(),
+                        slice_field_off: handle_infos_field_off,
+                    },
+                    InfoBufferTarget {
+                        kind: InfoKind::Flags,
+                        static_count: result_info_counts.flags,
+                        runtime_sized: plan.has_list_elem_flags(),
+                        slice_field_off: flags_infos_field_off,
+                    },
+                    InfoBufferTarget {
+                        kind: InfoKind::Record,
+                        static_count: result_info_counts.record,
+                        runtime_sized: plan.has_list_elem_record(),
+                        slice_field_off: record_infos_field_off,
+                    },
+                    InfoBufferTarget {
+                        kind: InfoKind::Variant,
+                        static_count: result_info_counts.variant,
+                        runtime_sized: plan.has_list_elem_variant(),
+                        slice_field_off: variant_infos_field_off,
+                    },
+                ] {
+                    emit_alloc_info_buffer_for_plan(
+                        &mut f,
+                        &lift_ctx,
+                        target,
+                        after_pf.params_offset,
+                        &lcl,
+                    );
+                }
                 // Synth locals are contiguous; `synth_locals[0]`
                 // is the plan's `local_base`.
                 emit_lift_plan(
@@ -772,43 +654,42 @@ pub(super) fn emit_wrapper_function(
                     lcl.cells_base,
                 );
                 // Direct result is single-cell flat; lists never reach
-                // this branch, so list-element handles can't appear here.
-                emit_alloc_handle_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_handle_count,
-                    false,
-                    after_pf.params_offset,
-                    handle_infos_field_off,
-                    &lcl,
-                );
-                emit_alloc_flags_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_flags_count,
-                    false,
-                    after_pf.params_offset,
-                    flags_infos_field_off,
-                    &lcl,
-                );
-                emit_alloc_record_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_record_count,
-                    false,
-                    after_pf.params_offset,
-                    record_infos_field_off,
-                    &lcl,
-                );
-                emit_alloc_variant_info_for_plan(
-                    &mut f,
-                    &lift_ctx,
-                    result_variant_count,
-                    false,
-                    after_pf.params_offset,
-                    variant_infos_field_off,
-                    &lcl,
-                );
+                // this branch, so list-element cells can't appear
+                // here — `runtime_sized: false` always.
+                for target in [
+                    InfoBufferTarget {
+                        kind: InfoKind::Handle,
+                        static_count: result_info_counts.handle,
+                        runtime_sized: false,
+                        slice_field_off: handle_infos_field_off,
+                    },
+                    InfoBufferTarget {
+                        kind: InfoKind::Flags,
+                        static_count: result_info_counts.flags,
+                        runtime_sized: false,
+                        slice_field_off: flags_infos_field_off,
+                    },
+                    InfoBufferTarget {
+                        kind: InfoKind::Record,
+                        static_count: result_info_counts.record,
+                        runtime_sized: false,
+                        slice_field_off: record_infos_field_off,
+                    },
+                    InfoBufferTarget {
+                        kind: InfoKind::Variant,
+                        static_count: result_info_counts.variant,
+                        runtime_sized: false,
+                        slice_field_off: variant_infos_field_off,
+                    },
+                ] {
+                    emit_alloc_info_buffer_for_plan(
+                        &mut f,
+                        &lift_ctx,
+                        target,
+                        after_pf.params_offset,
+                        &lcl,
+                    );
+                }
                 f.instructions().local_get(lcl.cells_base);
                 f.instructions().local_set(lcl.addr);
                 emit_lift_result(&mut f, &lift_ctx, &result_emit, &lcl);

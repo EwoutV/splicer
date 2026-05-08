@@ -38,8 +38,8 @@ pub(super) mod sidetable;
 // Re-exports for the rest of `tier2::*`. External code keeps doing
 // `use super::lift::{ParamLayout, ...}`.
 pub(super) use classify::{
-    classify_func_params, classify_result_lift, ParamLayout, ParamLift, ResultLayout, ResultLift,
-    ResultSource, ResultSourceLayout,
+    classify_func_params, classify_result_lift, InfoCounts, ParamLayout, ParamLift, ResultLayout,
+    ResultLift, ResultSource, ResultSourceLayout,
 };
 pub(super) use emit::{
     alloc_wrapper_locals, emit_lift_compound_prefix, emit_lift_plan, emit_lift_result,

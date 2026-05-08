@@ -117,6 +117,24 @@ pub(crate) struct ParamLift {
 // placeholders" failure mode in the audit follow-up doc is
 // structurally impossible with this split.
 
+/// Per-kind outer-cell counts driving static-buffer sizing +
+/// per-list-pre-pass seeds. Each field is the count among the plan's
+/// outer cells (excluding list-element cells, which fold in at
+/// runtime via the per-list bump). For each kind:
+///   - Authoritative for the static `field_tree.*_infos.len` bake.
+///   - Sizes the static-count `cabi_realloc` when no list-element
+///     cells of the kind exist.
+///   - Seeds the per-list bump in [`super::emit::emit_list_pre_pass`]
+///     when list-element cells are present (the static len + every
+///     list's `len * per_elem`).
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InfoCounts {
+    pub handle: u32,
+    pub flags: u32,
+    pub record: u32,
+    pub variant: u32,
+}
+
 /// Post-layout per-parameter lift descriptor: the classify-time
 /// data plus per-cell side-table bookkeeping. The cells slab is
 /// `cabi_realloc`'d per-call by the wrapper body (no static offset).
@@ -126,31 +144,8 @@ pub(crate) struct ParamLayout {
     /// holding the side-table bookkeeping the emit phase needs (idx,
     /// blob slice, runtime-fill, …) for cells whose kind has any.
     pub cell_side: Vec<CellSideData>,
-    /// `Cell::Handle` count among the plan's outer cells (excludes
-    /// list-element handles, which fold in at runtime). Authoritative
-    /// for the static `field_tree.handle_infos.len` bake and the
-    /// static-count `cabi_realloc`; on plans with list-element
-    /// handles the static `len` is patched at runtime, and this is
-    /// the seed for the per-list bump in `emit_list_pre_pass`.
-    pub handle_count: u32,
-    /// `Cell::Flags` count among the plan's outer cells. Authoritative
-    /// for the static `field_tree.flags_infos.len` bake and the
-    /// static-count `cabi_realloc`. Mirrors [`Self::handle_count`]'s
-    /// shape; the runtime-count regime (with list-element flags
-    /// patching `len` per call) lands when `Cell::Flags` opens in
-    /// `list_element_class`.
-    pub flags_count: u32,
-    /// `Cell::RecordOf` count among the plan's outer cells.
-    /// Authoritative for the static `field_tree.record_infos.len`
-    /// bake and the static-count `cabi_realloc`. Same static-vs-
-    /// runtime distinction as [`Self::handle_count`] /
-    /// [`Self::flags_count`]; runtime regime arrives with
-    /// `list<record>` (commit-2).
-    pub record_count: u32,
-    /// `Cell::Variant` count among the plan's outer cells.
-    /// Same shape + static-vs-runtime distinction as the others;
-    /// runtime regime arrives with `list<variant>` (commit-2).
-    pub variant_count: u32,
+    /// Per-kind outer-cell counts (handle / flags / record / variant).
+    pub info_counts: InfoCounts,
 }
 
 /// Post-layout per-result lift descriptor: a sum-type `source`
@@ -161,24 +156,11 @@ pub(crate) struct ParamLayout {
 /// pre-layout `side_table` directly).
 pub(crate) struct ResultLayout {
     pub source: ResultSourceLayout,
-    /// Result-side counterpart of [`ParamLayout::handle_count`]:
-    /// 1 for a `Direct(Handle)` result, else the number of outer
-    /// `Cell::Handle` in `Compound::compound.plan.cells`.
-    pub handle_count: u32,
-    /// Result-side counterpart of [`ParamLayout::flags_count`]:
-    /// 1 for a `Direct(Flags)` result, else the number of outer
-    /// `Cell::Flags` in the compound plan. Same static-vs-runtime
-    /// distinction as [`ParamLayout::flags_count`].
-    pub flags_count: u32,
-    /// Result-side counterpart of [`ParamLayout::record_count`]:
-    /// number of outer `Cell::RecordOf` in the compound result plan.
-    /// Records always retptr (no Direct route), so `0` for non-
-    /// compound results.
-    pub record_count: u32,
-    /// Result-side counterpart of [`ParamLayout::variant_count`]:
-    /// number of outer `Cell::Variant` in the compound result plan.
-    /// Variants always retptr — same as records.
-    pub variant_count: u32,
+    /// Result-side counterpart of [`ParamLayout::info_counts`].
+    /// `Direct` paths can only contribute 1 to `handle` or `flags`
+    /// (never to `record` / `variant` — those always retptr); the
+    /// `Compound` path mirrors the param-side rule.
+    pub info_counts: InfoCounts,
 }
 
 pub(crate) enum ResultSourceLayout {

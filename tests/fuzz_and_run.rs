@@ -173,7 +173,17 @@ enum Shape {
         inner: Box<Shape>,
         is_some: bool,
     },
+    /// `list<T>` materialized as a single-element vec at runtime —
+    /// `vec![<inner literal>]`. The most common shape; chosen over
+    /// `Vec<Shape>` so test fixtures stay terse and the harness's
+    /// `expected_debug` formatting is predictable.
     List(Box<Shape>),
+    /// `list<T>` materialized as an empty vec at runtime —
+    /// `vec![]`. Exercises the `len == 0` runtime path: per-call
+    /// `cabi_realloc(0, …)` calls, the for-loop that never enters,
+    /// and (for compound kinds) the per-list info-buffer realloc
+    /// with count == static_count + 0.
+    ListEmpty(Box<Shape>),
     Tuple(Vec<Shape>),
     Record {
         /// Record name in WIT. Keep single-word to dodge kebab→snake
@@ -286,6 +296,7 @@ impl Shape {
                 format!("option_{arm}_{}", inner.name())
             }
             Shape::List(inner) => format!("list_{}", inner.name()),
+            Shape::ListEmpty(inner) => format!("empty_list_{}", inner.name()),
             Shape::Tuple(parts) => {
                 let mut s = String::from("tuple");
                 for p in parts {
@@ -323,7 +334,7 @@ impl Shape {
         match self {
             Shape::Primitive { wit_type, .. } => (*wit_type).to_string(),
             Shape::Option { inner, .. } => format!("option<{}>", inner.wit_type()),
-            Shape::List(inner) => format!("list<{}>", inner.wit_type()),
+            Shape::List(inner) | Shape::ListEmpty(inner) => format!("list<{}>", inner.wit_type()),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -361,7 +372,9 @@ impl Shape {
     fn collect_wit_decls(&self, out: &mut String, seen: &mut HashSet<&'static str>) {
         match self {
             Shape::Primitive { .. } => {}
-            Shape::Option { inner, .. } | Shape::List(inner) => inner.collect_wit_decls(out, seen),
+            Shape::Option { inner, .. } | Shape::List(inner) | Shape::ListEmpty(inner) => {
+                inner.collect_wit_decls(out, seen)
+            }
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_wit_decls(out, seen);
@@ -469,7 +482,7 @@ impl Shape {
         match self {
             Shape::Primitive { rust_ty, .. } => (*rust_ty).to_string(),
             Shape::Option { inner, .. } => format!("Option<{}>", inner.rust_ty(side)),
-            Shape::List(inner) => format!("Vec<{}>", inner.rust_ty(side)),
+            Shape::List(inner) | Shape::ListEmpty(inner) => format!("Vec<{}>", inner.rust_ty(side)),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -551,6 +564,11 @@ impl Shape {
                     _ => AsyncMode::Async,
                 };
                 format!("vec![{}]", inner.rust_literal(side, elem_mode))
+            }
+            Shape::ListEmpty(_) => {
+                // Empty literal — type is inferred from the
+                // wit-bindgen-generated param signature (`&[T]`).
+                "vec![]".to_string()
             }
             Shape::Tuple(parts) => {
                 let inside = parts
@@ -688,7 +706,7 @@ impl Shape {
         // ownership transfer is in the elements; you can't borrow a
         // slice of resources because each handle has to move into
         // the call). Pass-by-value regardless of mode.
-        if let Shape::List(inner) = self {
+        if let Shape::List(inner) | Shape::ListEmpty(inner) = self {
             if matches!(inner.as_ref(), Shape::ResourceOwn { .. }) {
                 return v_ident.to_string();
             }
@@ -723,7 +741,7 @@ impl Shape {
                 *rust_ty != "String" || matches!(mode, AsyncMode::Sync)
             }
             Shape::Option { inner, .. } => inner.is_copy_in(mode),
-            Shape::List(_) => false,
+            Shape::List(_) | Shape::ListEmpty(_) => false,
             Shape::Tuple(parts) => parts.iter().all(|p| p.is_copy_in(mode)),
             Shape::Record { fields, .. } => {
                 fields.iter().all(|(_, s)| s.is_copy_in(AsyncMode::Async))
@@ -751,7 +769,9 @@ impl Shape {
     fn contains_resource(&self) -> bool {
         match self {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => false,
-            Shape::Option { inner, .. } | Shape::List(inner) => inner.contains_resource(),
+            Shape::Option { inner, .. } | Shape::List(inner) | Shape::ListEmpty(inner) => {
+                inner.contains_resource()
+            }
             Shape::Tuple(parts) => parts.iter().any(Shape::contains_resource),
             Shape::Record { fields, .. } => fields.iter().any(|(_, s)| s.contains_resource()),
             Shape::Variant { cases, .. } => cases
@@ -772,7 +792,9 @@ impl Shape {
     fn collect_resources(&self, out: &mut Vec<(&'static str, &'static str)>) {
         match self {
             Shape::Primitive { .. } | Shape::Enum { .. } | Shape::Flags { .. } => {}
-            Shape::Option { inner, .. } | Shape::List(inner) => inner.collect_resources(out),
+            Shape::Option { inner, .. } | Shape::List(inner) | Shape::ListEmpty(inner) => {
+                inner.collect_resources(out)
+            }
             Shape::Tuple(parts) => {
                 for p in parts {
                     p.collect_resources(out);
@@ -844,6 +866,7 @@ impl Shape {
                 }
             }
             Shape::List(inner) => format!("[{}]", inner.expected_debug_in(err_enums)),
+            Shape::ListEmpty(_) => "[]".to_string(),
             Shape::Tuple(parts) => {
                 let inside = parts
                     .iter()
@@ -1866,6 +1889,85 @@ fn tier2_shapes() -> Vec<Shape> {
                 },
             ],
             selected: 0,
+        })),
+        // Empty-list (len == 0) coverage for the compound kinds. The
+        // wrapper still allocates the cells slab + each kind's
+        // info-buffer (sized at static_count + 0), but the per-element
+        // for-loop never enters and `cabi_realloc(0, …)` falls through
+        // each per-iter scratch buffer. Pins:
+        //   - len==0 doesn't trap on the cells-slab realloc;
+        //   - runtime-sized info-buffer counters init to static + 0
+        //     and the alloc patches `len = 0` correctly;
+        //   - the per-iter scratch reallocs (char/tuple/flags/record-tuples)
+        //     don't fault when sized at 0 bytes.
+        // Resource handles are omitted — wit-component rejects an
+        // empty `list<own<R>>` with a "Type mismatch" composition
+        // error orthogonal to the tier-2 lift codegen.
+        Shape::ListEmpty(Box::new(Shape::Flags {
+            wit_name: "fperms",
+            rust_name: "Fperms",
+            flags: vec![("read", "READ"), ("write", "WRITE"), ("exec", "EXEC")],
+            selected: 0b101,
+        })),
+        Shape::ListEmpty(Box::new(Shape::Record {
+            wit_name: "point",
+            rust_name: "Point",
+            fields: vec![
+                (
+                    "x",
+                    Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "3u32",
+                        expected_debug: "3",
+                    },
+                ),
+                (
+                    "y",
+                    Shape::Primitive {
+                        name: "s32",
+                        wit_type: "s32",
+                        rust_ty: "i32",
+                        rust_literal: "-5i32",
+                        expected_debug: "-5",
+                    },
+                ),
+            ],
+        })),
+        Shape::ListEmpty(Box::new(Shape::Variant {
+            wit_name: "shape",
+            rust_name: "Shape",
+            cases: vec![
+                VariantCase {
+                    wit_name: "circle",
+                    rust_name: "Circle",
+                    payload: None,
+                },
+                VariantCase {
+                    wit_name: "sq",
+                    rust_name: "Sq",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "7u32",
+                        expected_debug: "7",
+                    }),
+                },
+                VariantCase {
+                    wit_name: "tri",
+                    rust_name: "Tri",
+                    payload: Some(Shape::Primitive {
+                        name: "u32",
+                        wit_type: "u32",
+                        rust_ty: "u32",
+                        rust_literal: "9u32",
+                        expected_debug: "9",
+                    }),
+                },
+            ],
+            selected: 1,
         })),
         // list<point>: per-call record-info buffer + per-call
         // field-tuples buffer. Each iteration writes one record-info
@@ -3282,6 +3384,9 @@ fn predict_tier2_arg_inner(shape: &Shape) -> Option<String> {
                 Some(format!("list({elem})"))
             }
         }
+        // Empty list — the before/after dump renders an empty list
+        // as `list()`, no element substring to match.
+        Shape::ListEmpty(_) => Some("list()".to_string()),
         Shape::Option { inner, is_some } => {
             if *is_some {
                 let inner_render = predict_tier2_arg_inner(inner)?;

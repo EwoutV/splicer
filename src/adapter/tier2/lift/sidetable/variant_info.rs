@@ -2,7 +2,7 @@
 //! Entries live in a per-(fn, param | result) buffer the wrapper
 //! allocates per call via `cabi_realloc`; the emitter writes the
 //! build-time-const `type-name` and the runtime-dispatched `case-name`
-//! + `payload` (option<u32>) into each slot.
+//! and `payload` (option<u32>) into each slot.
 //! `field_tree.variant_infos` is patched at runtime to point at the
 //! buffer.
 //!

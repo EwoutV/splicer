@@ -17,7 +17,7 @@ use super::super::super::abi::WasmEncoderBindgen;
 use super::super::super::indices::{FrozenLocals, LocalsBuilder};
 use super::super::cells::{CellLayout, PayloadSource};
 use super::super::FuncDispatch;
-use super::classify::ResultSourceLayout;
+use super::classify::{InfoCounts, ResultSourceLayout};
 use super::plan::{ArmGuard, Cell, LiftPlan, ListElementClass, ListSpec};
 use super::sidetable::flags_info::FlagsRuntimeFill;
 use super::sidetable::handle_info::HandleRuntimeFill;
@@ -667,48 +667,36 @@ fn fn_contains_char(fd: &FuncDispatch) -> bool {
 }
 
 /// Any `Cell::Handle` in the wrapper (params or result, including
-/// list-element plans). Gates `WrapperLocals.handle_info_base` so
-/// handle-free wrappers don't allocate the local. Static handles
-/// come from the layout-phase `handle_count` (single source of
-/// truth — see `ParamLayout.handle_count` / `ResultLayout.handle_count`);
-/// list-element handles route through [`fn_has_list_elem_handle`].
+/// Any cell of `kind` in the wrapper (params or result, including
+/// list-element plans). Gates the matching `WrapperLocals.*_info_base`
+/// — kind-free wrappers don't allocate that local. Static cells come
+/// from the layout-phase per-(param | result) `info_counts.<kind>`;
+/// list-element cells route through [`fn_has_list_elem_class`] with
+/// the matching [`ListElementClass::Prestaged*`].
+fn fn_has_info_cells(
+    fd: &FuncDispatch,
+    kind: ListElementClass,
+    count: fn(&InfoCounts) -> u32,
+) -> bool {
+    fn_has_list_elem_class(fd, kind)
+        || fd.params.iter().any(|p| count(&p.info_counts) > 0)
+        || fd
+            .result_lift
+            .as_ref()
+            .is_some_and(|rl| count(&rl.info_counts) > 0)
+}
+
 fn fn_has_handle_cells(fd: &FuncDispatch) -> bool {
-    fn_has_list_elem_handle(fd)
-        || fd.params.iter().any(|p| p.handle_count > 0)
-        || fd
-            .result_lift
-            .as_ref()
-            .is_some_and(|rl| rl.handle_count > 0)
+    fn_has_info_cells(fd, ListElementClass::PrestagedHandle, |c| c.handle)
 }
-
-/// Any `Cell::Flags` in the wrapper (params or result, including
-/// list-element plans). Gates `WrapperLocals.flags_info_base`.
 fn fn_has_flags_cells(fd: &FuncDispatch) -> bool {
-    fn_has_list_elem_flags(fd)
-        || fd.params.iter().any(|p| p.flags_count > 0)
-        || fd.result_lift.as_ref().is_some_and(|rl| rl.flags_count > 0)
+    fn_has_info_cells(fd, ListElementClass::PrestagedFlags, |c| c.flags)
 }
-
-/// Any `Cell::RecordOf` in the wrapper (params or result, including
-/// list-element plans). Gates `WrapperLocals.record_info_base`.
 fn fn_has_record_cells(fd: &FuncDispatch) -> bool {
-    fn_has_list_elem_record(fd)
-        || fd.params.iter().any(|p| p.record_count > 0)
-        || fd
-            .result_lift
-            .as_ref()
-            .is_some_and(|rl| rl.record_count > 0)
+    fn_has_info_cells(fd, ListElementClass::PrestagedRecord, |c| c.record)
 }
-
-/// Any `Cell::Variant` in the wrapper (params or result, including
-/// list-element plans). Gates `WrapperLocals.variant_info_base`.
 fn fn_has_variant_cells(fd: &FuncDispatch) -> bool {
-    fn_has_list_elem_variant(fd)
-        || fd.params.iter().any(|p| p.variant_count > 0)
-        || fd
-            .result_lift
-            .as_ref()
-            .is_some_and(|rl| rl.variant_count > 0)
+    fn_has_info_cells(fd, ListElementClass::PrestagedVariant, |c| c.variant)
 }
 
 /// Per-class counts collected by [`walk_element_plan`]. Drives the
@@ -931,8 +919,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let flags_slot_addr = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
     let flags_payload_idx = needs_list_flags_locals.then(|| builder.alloc_local(ValType::I32));
     let needs_list_record_locals = fn_has_list_elem_record(fd);
-    let list_elem_record_base =
-        needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
+    let list_elem_record_base = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
     let list_elem_record_tuples_base =
         needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
     let record_slot_addr = needs_list_record_locals.then(|| builder.alloc_local(ValType::I32));
@@ -1339,10 +1326,7 @@ pub(crate) fn emit_list_pre_pass(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
     plan: &LiftPlan,
-    static_handle_count: u32,
-    static_flags_count: u32,
-    static_record_count: u32,
-    static_variant_count: u32,
+    static_counts: &InfoCounts,
     list_locals: &[ListEmitLocals],
     local_base: u32,
     lcl: &WrapperLocals,
@@ -1354,21 +1338,16 @@ pub(crate) fn emit_list_pre_pass(
     );
     f.instructions().i32_const(plan.cell_count() as i32);
     f.instructions().local_set(lcl.next_cell_idx);
-    if let Some(next_handle_idx) = lcl.next_handle_idx {
-        f.instructions().i32_const(static_handle_count as i32);
-        f.instructions().local_set(next_handle_idx);
-    }
-    if let Some(next_flags_idx) = lcl.next_flags_idx {
-        f.instructions().i32_const(static_flags_count as i32);
-        f.instructions().local_set(next_flags_idx);
-    }
-    if let Some(next_record_idx) = lcl.next_record_idx {
-        f.instructions().i32_const(static_record_count as i32);
-        f.instructions().local_set(next_record_idx);
-    }
-    if let Some(next_variant_idx) = lcl.next_variant_idx {
-        f.instructions().i32_const(static_variant_count as i32);
-        f.instructions().local_set(next_variant_idx);
+    for (next_idx, count) in [
+        (lcl.next_handle_idx, static_counts.handle),
+        (lcl.next_flags_idx, static_counts.flags),
+        (lcl.next_record_idx, static_counts.record),
+        (lcl.next_variant_idx, static_counts.variant),
+    ] {
+        if let Some(next_idx) = next_idx {
+            f.instructions().i32_const(count as i32);
+            f.instructions().local_set(next_idx);
+        }
     }
     for spec in plan.list_specs() {
         let ll = &list_locals[spec.list_idx as usize];
@@ -2313,9 +2292,9 @@ fn emit_record_runtime_fill(
             entry_offset_in_elem,
             tuples_offset_in_elem,
         } => {
-            let iter_entry_base = lcl.list_elem_record_base.expect(
-                "list_elem_record_base unset — fn_has_list_elem_record gate disagrees",
-            );
+            let iter_entry_base = lcl
+                .list_elem_record_base
+                .expect("list_elem_record_base unset — fn_has_list_elem_record gate disagrees");
             let iter_tuples_base = lcl.list_elem_record_tuples_base.expect(
                 "list_elem_record_tuples_base unset — fn_has_list_elem_record gate disagrees",
             );
@@ -2323,9 +2302,9 @@ fn emit_record_runtime_fill(
                 "record_slot_addr unset — fn_has_list_elem_record gate disagrees \
                  with the cells reaching emit_record_runtime_fill",
             );
-            let tuples_dest = lcl.record_tuples_slice_addr.expect(
-                "record_tuples_slice_addr unset — fn_has_list_elem_record gate disagrees",
-            );
+            let tuples_dest = lcl
+                .record_tuples_slice_addr
+                .expect("record_tuples_slice_addr unset — fn_has_list_elem_record gate disagrees");
             // entry_addr = base + (iter_entry_base + entry_offset_in_elem) * entry_size
             f.instructions().local_get(iter_entry_base);
             if entry_offset_in_elem != 0 {
@@ -2716,9 +2695,9 @@ fn emit_variant_runtime_fill(
         VariantSlotSource::PerIteration {
             entry_offset_in_elem,
         } => {
-            let iter_base = lcl.list_elem_variant_base.expect(
-                "list_elem_variant_base unset — fn_has_list_elem_variant gate disagrees",
-            );
+            let iter_base = lcl
+                .list_elem_variant_base
+                .expect("list_elem_variant_base unset — fn_has_list_elem_variant gate disagrees");
             let dest = lcl.variant_slot_addr.expect(
                 "variant_slot_addr unset — fn_has_list_elem_variant gate disagrees \
                  with the cells reaching emit_variant_runtime_fill",
