@@ -44,7 +44,7 @@ lists. The side tables are the `record-infos` / `flags-infos` /
 Compound cells reference their children as **siblings in the same
 slab** via `cell-idx` rather than embedding payloads inline — so
 records, tuples, options, results, variants, and list elements
-are all addressed uniformly. Lists are runtime-sized: their cell
+are all addressed uniformly. Lists are dynamically sized: their cell
 payload points at a `cabi_realloc`'d sub-slab the wrapper grew at
 call time. The field-tree is **observation, not value
 transformation** — the underlying canonical-ABI flat values pass
@@ -130,22 +130,33 @@ landed, and the wire format's `field-tree.root` field carries the
 same number — so consumers follow `tree.root` and land on the
 root wherever it sits, rather than assuming it's at `cells[0]`.
 
-### One plan, multiple destinations
+### Why cells store offsets, not absolute locals
 
-One WIT param can consume many wasm flat slots: `u32` is 1; `string`
-is 2 — `(ptr, len)`; `record { a: u32, b: string }` is 3; and so on.
-A function's wasm locals end up as a sequence of variable-width
-per-param slices. The result, when compound, lives in its own slice
-of synth locals. A `LiftPlan` is built once per `(param | result)`
-at classify time, so the plan can't know up front which slice it'll
-be emitted into — and the same plan also gets read (structurally
-only) by every side-table builder.
+Each WIT param gets its own `LiftPlan`, and the result has its own
+plan too — different types produce different plans. But every plan
+is **built at classify time**, before the layout phase has decided
+where in the wasm function's locals each param's flat slice will
+sit. And once built, each plan is **read by multiple consumers**:
+the emitter (which writes the lift bytecode) and every side-table
+builder (which collects per-kind metadata like type-names and
+child-cell indices).
 
-To make that reuse work, cells store flat-slot positions as
-**offsets** in `0..flat_slot_count`, not absolute wasm-local
-indices. The emitter supplies a `local_base` per use; cell N's
-absolute local is `local_base + offset(N)`. Where `local_base`
-comes from per destination:
+The locals layout matters here because one WIT param can consume
+many wasm flat slots: `u32` is 1; `string` is 2 — `(ptr, len)`;
+`record { a: u32, b: string }` is 3; and so on. A function's wasm
+locals end up as a sequence of variable-width per-param slices.
+The result, when compound, lives in its own slice of synth locals.
+
+Since plans are built before any slice positions are known, cells
+store flat-slot positions as **offsets** in `0..flat_slot_count`,
+not absolute wasm-local indices. At emit time the caller computes
+a **`local_base`** — the absolute wasm-local index where this
+plan's flat-slot slice starts — and passes it in. The per-cell
+formula is then just `local_base + offset(N)`; the cumulative-sum
+work happens once, when `local_base` is computed for this emit
+call, not per cell.
+
+Where `local_base` comes from per destination:
 
 - **Param emit**: a cumulative cursor over preceding params'
   flat-slot counts. Param 0's `local_base` is 0; param 1's is
@@ -165,31 +176,62 @@ comes from per destination:
 Nominal cells (`enum-case`, `record-of`, `flags-set`, `variant-case`,
 `*-handle`, …) carry a `u32` *side-table index*. The metadata
 (type-names, case-names, child cell indices, etc.) lives in per-kind
-side tables on the field-tree. Two storage policies, picked per kind:
+side tables on the field-tree.
 
-- **Static segment, runtime-filled fields.** Entry records are
-  baked at layout time into a data segment. Build-time-const
-  fields (type-name, case-name lists, child-cell indices) are
-  written once; runtime-varying fields are patched per call. The
-  field-tree's `<kind>-infos` slice is baked statically with both
-  `(ptr, len)`.
-- **Per-call buffer, fully runtime-written.** Entries live in a
-  `cabi_realloc`'d slab the wrapper body allocates per call.
-  Build-time-const fields are written from `i32.const`s; runtime
-  fields from locals. Two sub-regimes per (fn, param | result):
-  - *Static-count*: no list-of-this-kind in the plan. Buffer size
-    is `static_count * sizeof(entry)`; `<kind>-infos.len` is baked,
-    only `.ptr` is patched.
-  - *Runtime-count*: at least one list element is of this kind. The
-    pre-pass accumulates `static_count + Σ_lists len * entries_per_elem`;
-    both `.ptr` and `.len` are patched per call. Per-list base is
-    captured before bumping; per-iteration `list_elem_<kind>_base =
-    base + j * entries_per_elem` resolves the absolute slot for
-    each element-plan cell.
+Two timelines matter for storage decisions:
+
+- **Build time** — when splicer generates the adapter wasm. A Rust
+  program walks the WIT and decides what bytes go into the binary.
+  Anything known here is **static** and can be baked directly into
+  the wasm (as data-segment bytes or `i32.const`s).
+- **Execution time** — when the generated adapter wasm actually
+  executes a call. Anything only knowable here is **dynamic** and
+  has to be computed by, or read from, the running wasm.
+
+Each side-table entry mixes both kinds of fields:
+
+- **Static fields** come straight from the WIT and are known when
+  splicer generates the adapter: a `record-info`'s `type-name`
+  (`"point"`), the list of case-names on a variant (`"circle"`,
+  `"square"`, …), child-cell indices for a record's fields.
+- **Dynamic fields** are only known when the wrapper executes: a
+  `handle-info`'s `id: u64` (handed in by the host), a
+  `variant-info`'s actual `case-name` (one of the static
+  case-names, but *which* one depends on the dynamic disc value),
+  a `flags-info`'s `set-flags` list (which bits are set depends on
+  the actual argument). These have to be written per call by the
+  running wasm.
+
+Two storage policies, picked per kind:
+
+- **Static segment, dynamic fields patched per call.** Side-table
+  entries live in a wasm data segment baked at build time. Static
+  fields are written into the segment bytes directly; dynamic
+  fields are patched per call by the running wrapper into
+  pre-reserved slots in the same entry. The field-tree's
+  `<kind>-infos` slice is baked with both `(ptr, len)` since the
+  count is known statically.
+- **Per-call buffer, every field written per call.** No pre-baked
+  bytes — the wrapper calls `cabi_realloc` per call to allocate a
+  buffer, then writes *every* field of every entry. Static fields
+  come out as `i32.const`s emitted into the wrapper body; dynamic
+  fields come from wasm locals. Two sub-regimes per (fn, param |
+  result):
+  - *Static count*: no list-of-this-kind in the plan. Buffer size
+    is `static_count * sizeof(entry)`, fixed at build time;
+    `<kind>-infos.len` is baked, only `.ptr` is patched per call.
+  - *Dynamic count*: at least one list element is of this kind.
+    The pre-pass accumulates `static_count + Σ_lists len *
+    entries_per_elem` into the `cabi_realloc` size; both `.ptr`
+    and `.len` are patched per call. Per-list base is captured
+    before bumping; per-iteration `list_elem_<kind>_base = base +
+    j * entries_per_elem` resolves the absolute slot for each
+    element-plan cell.
 
 **Rule.** A side-table kind moves to the per-call policy as soon
 as any element-plan can introduce a list-of-that-kind: the entry
-count becomes len-dependent and a static segment can't size it.
+count then depends on the dynamic list length, and a static data
+segment can't be sized for that.
 
 Per-call storage costs ~7 wasm instructions + one extra
 `cabi_realloc` per (fn, param | result) with that kind, plus
@@ -198,15 +240,15 @@ baked. Paid uniformly even when the list-of-form isn't in play.
 The tradeoff favors uniform shape over the few instructions saved
 by a hybrid path.
 
-### Static-vs-runtime discriminant indices
+### Static-vs-dynamic discriminant indices
 
-For some kinds the side-table index is runtime-dynamic (e.g.,
-`enum-case`: the disc selects an entry); for others it's
-adapter-build-time-static (e.g., `record-of`: one entry per plan
-cell). For list-element kinds the index is runtime-staged off a
-per-iteration base. `PayloadSource::{Local, ConstI32}` in
-`cells.rs` discriminates at byte emission; the codegen layer
-picks the source based on the cell's semantics.
+For some kinds the side-table index is dynamic (e.g., `enum-case`:
+the disc selects an entry); for others it's static (e.g.,
+`record-of`: one entry per plan cell, known at build time). For
+list-element kinds the index is dynamically staged off a per-
+iteration base. `PayloadSource::{Local, ConstI32}` in `cells.rs`
+discriminates at byte emission; the codegen layer picks the source
+based on the cell's semantics.
 
 ---
 

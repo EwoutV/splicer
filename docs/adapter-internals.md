@@ -154,7 +154,7 @@ unchanged; the field-tree is observation, not value transformation.
 
 The data flow for tier-2 (cell shapes, side-table policy, plan
 invariants, when entries live in static segments vs per-call
-`cabi_realloc`'d buffers, the runtime-count regime for list-element
+`cabi_realloc`'d buffers, the dynamic-count regime for list-element
 widening) is documented in
 [`docs/tiers/lift-codegen.md`](./tiers/lift-codegen.md) and stays
 there because it moves as new kinds open. This doc covers only the
@@ -305,14 +305,15 @@ Three layers, all expected to pass for any non-trivial change:
   cell-encoding regressions at `cargo test` time.
 - **Adapter-shape integration tests** — run the full generator for
   various interface shapes, then validate the emitted binary with
-  `wasmparser`. Catches structural bugs but not runtime behavior.
+  `wasmparser`. Catches structural bugs but not execution-time behavior.
 - **End-to-end composition** in `tests/component-interposition/`.
   Run `./run.sh __testme` to build every configuration (single
   middleware / chain / fan-in / nested / …), compose with real
   handler components, and execute through a wasmtime runner. The
-  gold standard for "does the adapter actually work?" — runtime
-  bugs (unaligned retptrs, missing borrow-drops, cell-layout drift)
-  surface here even when the unit + binary-validation layers pass.
+  gold standard for "does the adapter actually work?" —
+  execution-time bugs (unaligned retptrs, missing borrow-drops,
+  cell-layout drift) surface here even when the unit +
+  binary-validation layers pass.
 
 For tier-2 specifically, there's also a canned wasmtime sweep
 (`cargo test --test fuzz_and_run test_tier2_canned -- --ignored`)

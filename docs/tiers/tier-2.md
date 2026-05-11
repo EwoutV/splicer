@@ -147,7 +147,7 @@ to switch.
 The lift codegen reserves slabs sized `count * elem_bytes` (cells
 slab) and `len * 4` (per-list child-index buffer). Both go through
 `cabi_realloc`, whose size param is canonical-ABI i32 (signed). When a
-runtime `len` would make the multiplication overflow signed i32 — at
+dynamic `len` would make the multiplication overflow signed i32 — at
 roughly 134M cells (16-byte cell stride) or 536M list-of indices — the
 wrapper traps via `unreachable` rather than wrapping silently and
 under-allocating.
