@@ -132,29 +132,31 @@ root wherever it sits, rather than assuming it's at `cells[0]`.
 
 ### One plan, multiple destinations
 
-A `LiftPlan` is built once at classify time and reused for multiple
-lift emits — once per param, once for the result, plus structural
-reads by every side-table builder. To make that reuse work, cells
-don't store absolute wasm-local indices; they store **offsets** in
-`0..flat_slot_count`. At emit time the caller passes a `local_base`
-and the absolute local is just `local_base + offset`.
+One WIT param can consume many wasm flat slots: `u32` is 1; `string`
+is 2 — `(ptr, len)`; `record { a: u32, b: string }` is 3; and so on.
+A function's wasm locals end up as a sequence of variable-width
+per-param slices. The result, when compound, lives in its own slice
+of synth locals. A `LiftPlan` is built once per `(param | result)`
+at classify time, so the plan can't know up front which slice it'll
+be emitted into — and the same plan also gets read (structurally
+only) by every side-table builder.
 
-- **Params**: `local_base` is a cumulative cursor over preceding
-  params' flat-slot counts. Param 0 starts at 0 (wasm function
-  params occupy the first locals); param 1 starts at
-  `params[0].flat_slot_count`; and so on.
-- **Compound results**: `local_base` is the first of
-  `flat_slot_count` synth locals the wrapper allocates to receive
-  `lift_from_memory`'s output. The "synth locals are contiguous"
-  invariant lives at the alloc site, so cell N's absolute local is
-  `synth_locals[0] + N`.
-- **Side-table builders**: don't care about slot positions at all —
-  they only read structural fields (case names, child indices,
-  etc.).
+To make that reuse work, cells store flat-slot positions as
+**offsets** in `0..flat_slot_count`, not absolute wasm-local
+indices. The emitter supplies a `local_base` per use; cell N's
+absolute local is `local_base + offset(N)`. Where `local_base`
+comes from per destination:
 
-If cells stored absolute indices instead, the plan would have to be
-rebuilt for each destination. Storing offsets lets the single
-classify-time plan serve every reader with no rebuild.
+- **Param emit**: a cumulative cursor over preceding params'
+  flat-slot counts. Param 0's `local_base` is 0; param 1's is
+  `params[0].flat_slot_count`; param 2's is
+  `params[0].flat_slot_count + params[1].flat_slot_count`; etc.
+- **Compound-result emit**: the first of `flat_slot_count` synth
+  locals the wrapper allocates to receive `lift_from_memory`'s
+  output. The "synth locals are contiguous" invariant lives at the
+  alloc site, so cell N's absolute local is `synth_locals[0] + N`.
+- **Side-table builders**: no `local_base` — they only read
+  structural fields like case names and child indices.
 
 ---
 
