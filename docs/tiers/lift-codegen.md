@@ -121,23 +121,40 @@ the way it is.
 appends its own cells and returns the index where its root landed;
 the caller pushes the parent referencing those already-known
 indices. Parents are appended fully constructed — no mutation
-after push, no back-fill. The root index the top-level `push`
-returns is recorded on `LiftPlan::root` so the field-tree's `root`
-field can walk straight to it without assuming `cells[0]`.
+after push, no back-fill.
 
-### Plan-relative flat slots, base supplied at emit time
+A consequence: **the root cell lands at the last index in `cells`,
+not the first** (leaves go in first; the root is constructed and
+pushed last). `LiftPlan::root` records where the root actually
+landed, and the wire format's `field-tree.root` field carries the
+same number — so consumers follow `tree.root` and land on the
+root wherever it sits, rather than assuming it's at `cells[0]`.
 
-Cells store **plan-relative** flat-slot positions in
-`0..flat_slot_count`, not absolute wasm-local indices. The emit
-phase supplies a `local_base` per call and adds it to each cell's
-slot position to recover the absolute index. Params use a
-cumulative cursor across preceding params; compound results use
-the first of `flat_slot_count` synth locals allocated for
-`lift_from_memory`'s flat output. The "synth locals are
-contiguous" invariant lives at the alloc site, not on every cell.
-The same classify-time plan thus serves both side-table builders
-(structural reads) and codegen (reads + adds `local_base`) with no
-rebuild.
+### One plan, multiple destinations
+
+A `LiftPlan` is built once at classify time and reused for multiple
+lift emits — once per param, once for the result, plus structural
+reads by every side-table builder. To make that reuse work, cells
+don't store absolute wasm-local indices; they store **offsets** in
+`0..flat_slot_count`. At emit time the caller passes a `local_base`
+and the absolute local is just `local_base + offset`.
+
+- **Params**: `local_base` is a cumulative cursor over preceding
+  params' flat-slot counts. Param 0 starts at 0 (wasm function
+  params occupy the first locals); param 1 starts at
+  `params[0].flat_slot_count`; and so on.
+- **Compound results**: `local_base` is the first of
+  `flat_slot_count` synth locals the wrapper allocates to receive
+  `lift_from_memory`'s output. The "synth locals are contiguous"
+  invariant lives at the alloc site, so cell N's absolute local is
+  `synth_locals[0] + N`.
+- **Side-table builders**: don't care about slot positions at all —
+  they only read structural fields (case names, child indices,
+  etc.).
+
+If cells stored absolute indices instead, the plan would have to be
+rebuilt for each destination. Storing offsets lets the single
+classify-time plan serve every reader with no rebuild.
 
 ---
 
