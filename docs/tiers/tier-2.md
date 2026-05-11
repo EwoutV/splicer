@@ -16,10 +16,14 @@ chain composition), see [`adapter-components.md`](../adapter-components.md).
 The adapter lifts canonical-ABI values into a **flat array of cells**.
 Compound cells reference children by `u32` index into the same array
 rather than by direct self-reference. Nominal-typed metadata
-(record-of, variant-case, etc.) lives in **per-kind side tables** that
-cells reference by `u32` index. A helper library (or hand-rolled
-walker) presents this as a tree; the wire format itself is a single
-linear `list<cell>` plus a small set of side lists plus a root index.
+(record-of, variant-case, etc.) lives in **per-kind side tables**
+that cells reference by `u32` index — these are the `record-infos`
+/ `flags-infos` / `enum-infos` / `variant-infos` / `handle-infos`
+lists on `field-tree` in the WIT; the codegen docs call them "side
+tables", the WIT names them `*-infos`, same thing either way. A
+helper library (or hand-rolled walker) presents this as a tree;
+the wire format itself is a single linear `list<cell>` plus a
+small set of side lists plus a root index.
 
 Two design constraints shape this layout:
 

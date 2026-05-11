@@ -34,9 +34,12 @@ tagged-union record naming the kind (`bool`, `text`, `record-of`,
 `variant-case`, `*-handle`, …) and a payload (a primitive value,
 a `(ptr, len)` slice, an index into a side table). Cells for one
 (function, param | result) sit contiguously in a **cells slab**;
-a **field-tree** points at the slab plus per-kind side tables
-(enum-info, record-info, variant-info, handle-info, …) carrying
-build-time-const metadata like type-names and case-name lists.
+a **field-tree** points at the slab plus per-kind **side tables**
+carrying build-time-const metadata like type-names and case-name
+lists. The side tables are the `record-infos` / `flags-infos` /
+`enum-infos` / `variant-infos` / `handle-infos` lists on
+`field-tree` in `wit/common/world.wit` — this doc calls them
+"side tables", the WIT names them `*-infos`, same thing either way.
 
 Compound cells reference their children as **siblings in the same
 slab** via `cell-idx` rather than embedding payloads inline — so
@@ -142,9 +145,8 @@ rebuild.
 
 Nominal cells (`enum-case`, `record-of`, `flags-set`, `variant-case`,
 `*-handle`, …) carry a `u32` *side-table index*. The metadata
-(type-names, case-names, child cell indices, etc.) lives in
-per-kind side tables on the field-tree. Two storage policies, picked
-per kind:
+(type-names, case-names, child cell indices, etc.) lives in per-kind
+side tables on the field-tree. Two storage policies, picked per kind:
 
 - **Static segment, runtime-filled fields.** Entry records are
   baked at layout time into a data segment. Build-time-const
