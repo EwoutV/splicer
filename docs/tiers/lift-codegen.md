@@ -70,60 +70,21 @@ name at use sites — no hardcoded offsets in adapter codegen.
 
 ---
 
-## Library leverage: leaves yes, driver no
+## Library leverage
 
-**Principle: use library leaf-operations where they fit; hand-roll
-the driver.**
+We consume `wit-parser` / `wit-bindgen-core` as **leaf operations**:
+`SizeAlign` for sizes / aligns / field offsets, `Resolve::push_flat`
+for canonical-ABI flat-slot counts, `wit_parser::abi::join` for
+variant payload joining, and `wit_bindgen_core::abi::lift_from_memory`
+to walk a WIT type from a memory address and push flat values onto
+the stack (used for retptr-loaded compound results and async
+`task.return` flat loads). `lower_to_memory` is the inverse and is
+anticipated for tier-3's modify-and-write-back path.
 
-### Leaves we use
-
-`wit_parser::SizeAlign` for sizes / alignments / record field
-offsets. `wit_parser::Resolve::push_flat` for canonical-ABI
-flat-slot counts. `wit_bindgen_core::abi::lift_from_memory` to walk
-a WIT type from a memory address, emitting wasm that pushes flat
-values onto the stack (used for retptr-loaded compound results and
-async `task.return` flat loads). `wit_bindgen_core::abi::lower_to_memory`
-is the inverse and is anticipated for tier-3's modify-and-write-back
-path. These are leaves: well-defined I/O, no hidden assumptions
-about caller context.
-
-### Driver we evaluated and rejected: `wit_bindgen_core::abi::call(...)`
-
-`call(...)` is the library's full lift → `CallInterface` → lower
-driver. We considered implementing `Bindgen` for our field-tree
-target and letting the library walk every WIT type. Concluded
-**model mismatch**, not effort:
-
-1. **The library expects a language binding.** `CallInterface`'s
-   contract is "invoke typed user code with typed args, produce a
-   typed result." Our wrapper is flat-to-flat passthrough that
-   produces a field-tree as a side artifact — the field-tree is
-   observation, not the value forwarded to the handler. We'd be
-   hijacking `CallInterface` to do something orthogonal.
-2. **Operand dual-tracking.** Each typed operand would need to
-   carry both the cell index (for the side artifact) and the
-   original flat-slot wasm locals (for forwarding). Language
-   bindings carry one representation per operand; we'd pay for
-   typed lift while not using the typed values for the call.
-3. **Side-table output channel.** Our impl produces wasm body AND
-   per-(fn, param) side-table contributions (record-info entries,
-   variant-info, handle-info, etc.). `Bindgen` isn't designed for
-   that secondary output.
-4. **Two-pass.** Static-memory layout needs cell counts before code
-   emit. `call(...)` is one pass — we'd run it twice (discovery +
-   emit) or cache a full emit run.
-
-The hand-rolled `LiftPlan` is structurally better for our case:
-declarative, walkable by side-table builders, tracks flat-locals
-alongside cells, one pass.
-
-### When to revisit
-
-Reconsider when tier-3's lift → modify → lower flow lands and maps
-naturally to `call(...)`, or when the cumulative hand-rolled
-compound-kind LoC crosses ~600. Variant payload joining math
-(`wit_parser::abi::join`) is a separate leaf we can borrow without
-buying the driver.
+We do **not** use `wit_bindgen_core::abi::call(...)` as a wrapper
+driver. It's built around a typed recursive `Value` representation
+that WIT doesn't support and that the cell format was specifically
+designed to avoid. The hand-rolled `LiftPlan` is the right fit.
 
 ---
 
