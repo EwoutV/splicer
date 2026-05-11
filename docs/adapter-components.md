@@ -20,12 +20,13 @@ target-agnostic at tiers 2 and up (the adapter lifts canonical-ABI
 values into a uniform field representation). Splicer handles all the
 type plumbing at composition time either way.
 
-This document covers the cross-tier framework: tier taxonomy, the rules
-that apply to every tier, eligibility detection, and chain composition.
-For each tier's deep dive, see the per-tier docs:
+This document covers the shared framework that applies to every tier:
+tier taxonomy, the rules common to all tiers, eligibility detection,
+and chain composition. For each tier's deep dive, see the per-tier
+docs:
 
-- [Tier 1: Name-Only Hooks](./tiers/tier-1.md) — currently supported
-- [Tier 2: Observation](./tiers/tier-2.md) — planned
+- [Tier 1: Name-Only Hooks](./tiers/tier-1.md) — shipped
+- [Tier 2: Observation](./tiers/tier-2.md) — shipped
 - [Tier 3: Transform](./tiers/tier-3.md) — planned
 - [Tier 4: Virtualize](./tiers/tier-4.md) — planned
 
@@ -50,7 +51,7 @@ replace the downstream entirely.
 | Tier | See call name | See typed data | Modify data | Bypass downstream | Status        |
 |------|---------------|----------------|-------------|-------------------|---------------|
 | [1](./tiers/tier-1.md) | yes | no  | no  | partial (block) | **supported** |
-| [2](./tiers/tier-2.md) | yes | yes | no  | no              | planned       |
+| [2](./tiers/tier-2.md) | yes | yes | no  | no              | **supported** |
 | [3](./tiers/tier-3.md) | yes | yes | yes | no              | planned       |
 | [4](./tiers/tier-4.md) | yes | yes | yes | yes             | planned       |
 
@@ -194,7 +195,7 @@ When processing a splice rule, splicer checks each middleware component:
    rejects with an error:
    ```
    middleware `my-middleware.wasm` exports interfaces from multiple tiers
-   (tier 1: splicer:tier1/before; tier 2: splicer:tier2/observe).
+   (tier 1: splicer:tier1/before; tier 2: splicer:tier2/before).
 
    A middleware must implement exactly one tier. To combine behaviors,
    ship them as separate components and chain them in `inject: [...]`.

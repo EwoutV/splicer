@@ -21,12 +21,15 @@ valid.
 ## Call-id shape
 
 Every tier-1 hook takes a `call-id` record carrying the target
-interface (fully-qualified) plus the canonical-ABI function name:
+interface (fully-qualified), the canonical-ABI function name, and a
+monotonic per-instance id for correlating `on-call` / `on-return` of
+the same invocation:
 
 ```wit
 record call-id {
     interface-name: string,    // "wasi:http/handler@0.3.0"
     function-name: string,     // "handle", "[method]request.body", ...
+    id: u64,                   // monotonic per-instance call id
 }
 ```
 

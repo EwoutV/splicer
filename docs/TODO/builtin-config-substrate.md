@@ -218,17 +218,14 @@ original scalar type for error messages).
 
 ## Sequencing
 
-**Hold until tier2 lands.** The substrate's composition wiring (item 5)
-sits in the same adapter/composition pipeline that tier2 codegen is
-actively touching. Building in parallel guarantees merge conflict;
-branching off the tier2 branch trades that for repeated rebases against
-a moving target. Cleanest path: tier2 → main, then config substrate
-as a fresh branch off main.
+Tier 2 has landed, so the substrate can proceed as a fresh branch
+off main without the merge-conflict risk the original plan was
+sequenced around.
 
-In the meantime, `otel-bare-metrics` runs in always-flush (`buffer = 1`)
-mode with hardcoded defaults. The `TODO(aggregation)` block in its
-`lib.rs` lists the config keys and semantics so the rework is mechanical
-once the substrate is in place.
+Until the substrate lands, `otel-bare-metrics` runs in always-flush
+(`buffer = 1`) mode with hardcoded defaults. The `TODO(aggregation)`
+block in its `lib.rs` lists the config keys and semantics so the
+rework is mechanical once the substrate is in place.
 
 ## Defaults / missing-key semantics
 

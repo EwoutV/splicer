@@ -9,44 +9,20 @@ on what hasn't been built yet.
 
 ## Middleware tier roadmap
 
-Tier 1 is shipped. Tiers 2, 3, and 4 are planned. The user-facing
-taxonomy and per-tier WIT shapes live in
-[`adapter-components.md`](../adapter-components.md); this section captures
-only the open design questions that aren't settled there.
+Tiers 1 and 2 are shipped. Tiers 3 and 4 are planned. The
+user-facing taxonomy and per-tier WIT shapes live in
+[`adapter-components.md`](../adapter-components.md) and the per-tier
+docs under [`tiers/`](../tiers/); this section captures only the
+open design questions that aren't settled there.
 
 | Tier | New capability                                       | Status      |
 |------|------------------------------------------------------|-------------|
 | 1    | see function name                                    | **shipped** |
-| 2    | observe typed args / results (no modify)             | planned     |
+| 2    | observe typed args / results (no modify)             | **shipped** |
 | 3    | modify typed args / results, downstream still called | planned     |
 | 4    | replace the downstream entirely (virtualize)         | planned     |
 
-### Open design questions for tier 2 / 3 / 4
-
-The user-facing doc settles the value representation
-(`field-value` variant covering every WIT ctor, simple type names in
-values, fully-qualified interface ID at call level, async-only hooks,
-arbitrary middleware imports, **one tier per middleware**, and chain
-composition semantics including tier-4-as-terminator). What it doesn't
-pin down:
-
-- **Per-call hook signature for multi-interface attachment.** Tier-2
-  recording works best when one middleware is attached to *several*
-  interfaces at once (e.g. `wasi:http/handler` plus `wasi:http/types`)
-  so it sees the whole span of nested calls. The hook needs to carry
-  enough identity for the middleware to disambiguate which interface
-  each call belongs to. Sketch:
-  ```wit
-  record call-id {
-      interface: string,   // "wasi:http/types@0.3.0"
-      function: string,    // "request.body"
-  }
-  on-call: async func(call: call-id, args: list<field>);
-  on-return: async func(call: call-id, results: list<field>);
-  ```
-  Open: should `call-id` also carry a per-invocation correlation token
-  so nested calls can be associated with their enclosing top-level
-  call? (See "Span-based recording" below.)
+### Open design questions for tier 3 / 4
 
 - **Tier-3 short-circuit.** Tier 3 mutates in-flight values but still
   forwards to the downstream. Should it have a way to bail (return a
@@ -67,90 +43,6 @@ target interface's tier-4 world and synthesizes the return value
 itself. The Rust-codegen path is still useful for built-ins that want
 `arbitrary`-style auto-generation, but it's now an implementation
 strategy *for tier 4*, not a separate fourth category.
-
-## Resource-shape adapter-adapter (tier-2 ergonomic shim)
-
-Tier-2's canonical wire format is the cell array
-(`splicer:common/types.field-tree`) — fast, polyglot-neutral, but
-awkward to walk by hand without a helper library.
-
-The plan is to ship a second WIT package `splicer:tier2-resources`
-that exposes the same hooks (`before` / `after` / `trap`) but with
-the lifted value wrapped as a `resource lifted-value` carrying lazy
-accessor methods (`kind()`, `as-integer()`, `as-list()`, etc.). A
-**built-in adapter-adapter component** sits between splicer's
-tier-2 adapter (which emits cells) and the user middleware, doing
-the cells → resource conversion in front of the user code:
-
-```
-caller
-  → splicer's tier-2 adapter   (canonical-ABI → cells)
-      → adapter-adapter         (cells → resource API)
-          → user middleware
-              → downstream
-```
-
-Splicer detects which shape the user middleware exports
-(`splicer:tier2/*` vs `splicer:tier2-resources/*`) and either wires
-direct or inserts the adapter-adapter automatically. Same
-classification logic as the rest of contract.rs — just a third tier
-detection.
-
-**Why this matters:** without the adapter-adapter, polyglot middleware
-authors have to either (a) write their own per-language cell walker
-or (b) tolerate `tree.cells[idx as usize]`-style code. With it, every
-wit-bindgen-targeted language (TS, Python, Go, C, Rust, ...) gets an
-idiomatic resource API for free. No splicer-side per-language work.
-
-**Implementation cost:** the adapter-adapter is a state-bearing
-wasm component — holds the cell array as resource state, dispatches
-accessor methods into the array, returns child `lifted-value`
-resources for compound cases. Roughly 2–3× the adapter code of the
-cells path, but mechanical (no canonical-ABI logic — that's already
-done by the tier-2 adapter upstream).
-
-**Runtime cost (paid by the user middleware that opts in):** every
-accessor method on `lifted-value` is a component-boundary call —
-`val.kind()`, `val.as-integer()`, `val.as-list()`, etc. Walking a
-50-field record means ~150 component calls (kind + as-record +
-50 × kind + 50 × as-* per field). At wasmtime's component-call
-overhead (~tens of ns per call), that's ~5–10μs per traversal of a
-50-field record. Comparison to the direct cells path:
-
-| Path | Component calls per walk | Per-call cost (50-field record) |
-|---------------|--------------------------|--------------------------------:|
-| cells (direct) | 0 (in-process Vec access) | ~250 ns |
-| cells + adapter-adapter | ~150 (per-accessor) | ~5–10 μs |
-
-So the adapter-adapter trades **~30× walk-time slowdown** for
-"works idiomatically in any wit-bindgen language without splicer
-shipping a per-language helper." For light-touch middleware (auth,
-throttle, tracer reading a few fields) the overhead is irrelevant.
-For traversal-heavy middleware (logger, recorder dumping the whole
-tree) it's meaningful — at HTTP scale (~10ms request budget), 10μs
-is ~0.1% added latency, so still acceptable for most workloads but
-worth measuring once we have real users.
-
-A user with measurable perf pressure can drop the adapter-adapter
-and write against `splicer:tier2/*` directly with their own walker
-(or the splicer-provided Rust helper). The cost-vs-ergonomics
-choice is per-middleware, not project-wide.
-
-**When to build:** after tier-2 v1 ships and we have measured demand
-for non-Rust middleware authoring. The cell wire format is forward-
-compatible with this shim landing later — middleware that exports
-`splicer:tier2-resources/*` can be added without breaking
-`splicer:tier2/*` middleware.
-
-Other adapter-adapter shapes that fit the same pattern (worth
-mentioning even though we won't build them):
-
-- **cells → OpenTelemetry spans** — for OTel-shaped tracing
-- **cells → JSON / structured event stream** — for log aggregators
-- **cells → jsonpath-queryable view** — for declarative metric extraction
-
-Each is a separate downstream component; the adapter pipeline stays
-unchanged.
 
 ## Auto-instrument resources alongside their target
 
@@ -189,8 +81,9 @@ Implementation sketch:
   shape.
 - Emit a one-line info log so users know what got auto-wired.
 
-When to build: after tier-2 ships and the first user complains about
-the multi-WIT setup ceremony. Until then it's premature.
+When to build: once a user complains about the multi-WIT setup
+ceremony. Tier 2 has shipped, so the underlying observation surface
+is in place; only the UX modifier is missing.
 
 ## Span-based recording and record/replay
 
@@ -215,25 +108,31 @@ guessing — middleware guessing breaks under concurrency (two
 in-flight `handle` calls would see their inner `request.body` reads
 intermixed in the hook stream with no way to disambiguate).
 
-Sketch of what the call hook would carry:
+The shipped `call-id` (in `wit/common/world.wit`) carries
+`(interface-name, function-name, id: u64)` — the `id` field is the
+per-invocation correlation token. Span-based recording across
+nested calls still needs a way to relate inner-call ids back to
+their enclosing top-level span; that's the unresolved part.
+
+A sketch of what `call-id` might need to grow:
 
 ```wit
-record call-id {
-    interface: string,                  // "wasi:http/types@0.3.0"
-    function: string,                   // "request.body"
-    span: u64,                          // top-level call's correlation token
-    parent: option<u64>,                // immediate-caller span (nested case)
-}
+// shipped today: interface-name, function-name, id: u64
+// span work would add:
+//   parent: option<u64>   — immediate-caller call id, set when
+//                           the adapter is nested under another
+//                           instrumented boundary
 ```
 
 Open questions:
 
-- **How does the adapter learn the span token?** A natural answer:
-  the adapter at the **outermost** instrumented boundary mints a
-  fresh `u64` per top-level call and threads it through async-context
-  state (or task-local storage) so inner adapters at lower boundaries
-  can read it. Needs a concrete mechanism; the component model's
-  `task` API may or may not give enough plumbing here.
+- **How does the adapter learn the parent's call id?** A natural
+  answer: the adapter at the **outermost** instrumented boundary
+  threads its own call id through async-context state (or
+  task-local storage) so inner adapters at lower boundaries can
+  read it and populate `parent`. Needs a concrete mechanism; the
+  component model's `task` API may or may not give enough plumbing
+  here.
 - **What about non-tree fan-in?** If two top-level calls share a
   resource handle (e.g. a long-lived `wasi:keyvalue::bucket`), inner
   calls on that resource may legitimately span both top-level spans.
@@ -275,9 +174,9 @@ Open questions:
 
 A recorder is a tier-2 component that observes the lifted
 `list<field>` for each call in its span and writes them out (data
-segment, `wasi:io` stream, custom sink interface). Mostly
-straightforward once the span / correlation question is answered;
-trace format design is the main open question.
+segment, `wasi:io` stream, custom sink interface). Tier-2 has
+shipped, so this is buildable today modulo the span / correlation
+question. Trace format design is the remaining open question.
 
 ## Multi-middleware chain diagnostics
 
@@ -395,18 +294,22 @@ code generator, and `wirm` is not involved. The cost is an external
 
 ### Generation strategy summary
 
-| Middleware kind              | Generator approach                                           | Rationale                                                                        |
-|------------------------------|--------------------------------------------------------------|----------------------------------------------------------------------------------|
-| Tier 1 (type-erased)         | `wasm-encoder` + `wit-bindgen-core::abi` (shipped)           | Pure dispatch, no value construction; direct binary construction is simplest     |
-| Tier 2 (value-aware)         | `wasm-encoder` + WAVE encode/decode glue                     | Dispatch + serialization; still no value construction from scratch               |
-| Tier 3 (read-write)          | `wasm-encoder` + WAVE encode/decode glue + response injection | Same machinery as tier 2 plus a typed deserialization path                      |
-| One-per-sig (fuzzer / mock)  | Rust codegen via `syn` / `quote` + `wit-bindgen` + `arbitrary` | `arbitrary` derive handles all type complexity; codegen stays small at cost of a `cargo build` step |
+Tier 1 and tier 2 both use `wasm-encoder` + `wit-bindgen-core::abi`
+for direct core-module construction; tier 2 additionally lifts
+canonical-ABI values into the `field-tree` cell-array representation
+defined in `wit/common/world.wit` (no WAVE serialization on the wire
+path). Tier 3 will reuse the tier-2 lift plus add a lower-back path
+once it's specified. The one-per-sig case (fuzzer / mock) is where
+the strategies diverge: Rust codegen via `syn` / `quote` +
+`wit-bindgen` + `arbitrary`, then an external `cargo build` — the
+`arbitrary` derive handles all type complexity, so the codegen stays
+small.
 
-Useful references for when tier-2/3 work starts:
+Useful references for tier-3 / one-per-sig work:
 
 - [`wit-dylib`](https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wit-dylib)
-  — dynamic-linking bindings generator in `wasm-tools`. Has
-  canonical-ABI lift/lower codegen patterns worth studying.
+  — dynamic-linking bindings generator with canonical-ABI lift/lower
+  codegen patterns worth studying.
 - [Example in `wit-dylib/src/bindgen.rs`](https://github.com/bytecodealliance/wasm-tools/blob/main/crates/wit-dylib/src/bindgen.rs#L768)
   — how it generates lift code.
 
@@ -504,11 +407,18 @@ ships with, or a generated one — transparently to the user. The
 interesting entries cover different mechanisms:
 
 - **`logging` / `tracing`** — pure tier 1 (name-only). Ship as
-  a bundled `.wasm` blob in the splicer binary.
+  a bundled `.wasm` blob in the splicer binary. The current
+  `otel-bare-logs` / `otel-bare-spans` / `otel-bare-metrics`
+  builtins under `builtins/` already cover this shape.
 - **`otel`** — tier 2 (value-aware spans with request fields).
-  Gates on tier-2 work being shipped.
+  Tier 2 has shipped, so the gate is open; the value-aware
+  builtins can now be authored.
 - **`fuzz` / `mock`** — one-per-sig. Generated via the Rust-codegen
   path described in the "one-per-signature" section above.
+
+Config plumbing for built-ins (typed-vs-free-form, where config
+reaches the component, etc.) is tracked separately in
+[`builtin-config-substrate.md`](./builtin-config-substrate.md).
 
 ### Open design questions for when we revisit
 
@@ -543,13 +453,15 @@ interesting entries cover different mechanisms:
 - **MVP scope.** Probably pick two that exercise different paths —
   one bundled (`logging` proves the embedded-blob path) and one
   generated (`fuzz` proves the Rust-codegen path) — so both arms of
-  the design land at once. `otel` is the obvious third but gates on
-  tier 2.
+  the design land at once. `otel` is the obvious third candidate
+  now that tier 2 has shipped.
 
 ### Interaction with other planning items
 
-- **Tier 2 / tier 3 roadmap** — built-ins that need value access
-  (otel, content-aware logging) can't ship until those tiers do.
+- **Tier 3 roadmap** — built-ins that need to *modify* values can't
+  ship until tier 3 does. Tier 2 (value observation) has shipped, so
+  value-aware read-only built-ins (otel, content-aware logging) are
+  unblocked.
 - **One-per-signature case** — `fuzz` / `mock` are the direct
   motivating examples for that section's Rust-codegen path. If we
   build built-ins before tier 2, the first generated built-in
@@ -564,42 +476,19 @@ Two known limitations that still surface as `anyhow::bail!` errors:
 
 - **Flat params / results > 16 — pointer-form lowering.** The
   canonical ABI collapses to `(i32)` pointer form when a function's
-  flat representation exceeds 16 values. `func.rs::extract_func_sig`
-  currently bails at this boundary with a clear error (instead of
-  silently declaring wrong core types). Implementing pointer-form
-  needs: `params_are_ptr` / `results_are_ptr` flags on
-  `AdapterFunc`, pointer-form type declarations in every dispatch
-  emitter, and a memory-layout buffer reservation for the spilled
-  args.
+  flat representation exceeds the `MAX_FLAT_PARAMS` cap (16, defined
+  in `abi/compat.rs`). Tier-1 and tier-2 both bail at this boundary
+  today instead of silently declaring wrong core types.
+  Implementing pointer-form needs: `params_are_ptr` /
+  `results_are_ptr` flags carried through the per-fn dispatch
+  records, pointer-form type declarations in every dispatch emitter,
+  and a memory-layout buffer reservation for the spilled args.
 
-- **Anonymous compound types as top-level results.** When a Record
-  / Variant / Enum appears as a func result but isn't in
+- **Anonymous compound types as top-level results.** When a Record /
+  Variant / Enum appears as a func result but isn't in
   `iface.type_exports` (unusual in WIT-compiled interfaces, but
   legal at the component-model level), the adapter's export-instance
   construction can't re-export the compound — the binary fails
   validation with "instance not valid to be used as export." Fix:
-  synthesize names + auto-export in `component.rs::emit_export_phase`.
-  Low priority since real WIT always names its compounds.
-
-## Silent-fallback audit
-
-Several sites across `filter/`, `wac.rs`, and `build/dispatch.rs`
-handle "unknown" enum discriminants or missing map entries with an
-`unwrap_or(Other)` / `unwrap_or(None)` / `unwrap_or(ty)` fallback.
-These don't affect correctness under today's test fixtures, but an
-upstream change — `wasmparser` or `wirm` adding a new enum variant,
-a new `ComponentExternalKind`, an `AliasSpaceKind` expansion — could
-silently drop tracked items without any loud failure.
-
-Audit pass to file when we next touch these files:
-
-- Grep `src/adapter/filter/` and `src/wac.rs` for
-  `unwrap_or(`/`unwrap_or_else(`/`=> Other`/`=> None` on enum
-  discriminant or index-translation sites.
-- For each, replace the fallback with an explicit `anyhow::bail!`
-  that names the unexpected variant, so a future upstream addition
-  fails loud at the filter/reencoder layer instead of producing a
-  structurally-invalid adapter.
-
-No correctness impact today; prioritize when a new `wasmparser` /
-`wirm` major version lands.
+  synthesize names + auto-export in the export-emit pass. Low
+  priority since real WIT always names its compounds.

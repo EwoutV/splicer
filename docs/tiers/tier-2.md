@@ -1,15 +1,15 @@
 # Tier 2: Observation
 
-**Status:** planned.
+**Status:** shipped.
 
 The middleware can see the function name, the types of the parameters
 and return values, and the actual data being passed, but _cannot
 modify_ any of it. The call flows through to the downstream unchanged;
 _the middleware only observes_.
 
-For the cross-tier framework (one-tier-per-middleware rule, async
-convention, hook-trap propagation, chain composition), see
-[`adapter-components.md`](../adapter-components.md).
+For the shared framework that applies to every tier (one-tier-
+per-middleware rule, async convention, hook-trap propagation,
+chain composition), see [`adapter-components.md`](../adapter-components.md).
 
 ## Value representation: flattened cells with side tables
 
@@ -35,69 +35,30 @@ Two design constraints shape this layout:
    every cell payload at 8 bytes (`s64`), so the cell stride lands at
    16 bytes regardless of which case is present.
 
-```wit
-variant cell {
-    // ── primitives — payload fits in 8 bytes ──────────────────────
-    %bool(bool),
-    integer(s64),                          // s8/s16/s32/s64/u8/u16/u32/u64
-    floating(f64),                         // f32/f64 (widened)
-    text(string),                          // string and char
-    bytes(list<u8>),                       // list<u8> fast-path
+The `cell` variant is a tagged union over three families of cases:
 
-    // ── structural / anonymous — index into cells ─────────────────
-    list-of(list<u32>),                    // child indices
-    tuple-of(list<u32>),                   // child indices
-    option-some(u32),                      // index of inner value
-    option-none,
-    result-ok(option<u32>),                // index, or none for unit ok
-    result-err(option<u32>),               // index, or none for unit err
+- **Primitive** cases (`bool`, `integer`, `floating`, `text`, `bytes`)
+  hold their payload inline. `integer` widens every signed/unsigned
+  width up to s64; `floating` widens f32 to f64; `text` carries both
+  `string` and `char`; `bytes` is the `list<u8>` fast-path.
+- **Structural** cases (`list-of`, `tuple-of`, `option-some`,
+  `option-none`, `result-ok`, `result-err`) carry **child cell-
+  indices** into the same cells array — never inline payloads.
+- **Nominal** cases (`record-of`, `flags-set`, `enum-case`,
+  `variant-case`, and the four `*-handle`s — `resource-handle`,
+  `stream-handle`, `future-handle`, `error-context-handle`) carry
+  a `u32` index into the per-kind side table that holds the
+  type-name + structural metadata (record field tuples, enum/
+  variant case-name, flag-set bit names, handle correlation id).
 
-    // ── nominal — index into the corresponding side table ─────────
-    record-of(u32),                        // → record-infos[idx]
-    flags-set(u32),                        // → flags-infos[idx]
-    enum-case(u32),                        // → enum-infos[idx]
-    variant-case(u32),                     // → variant-infos[idx]
+A `field-tree` bundles the cells slab, one side-table slice per
+nominal kind, and the `root` cell index. A `field` wraps a tree
+with the param name. A function's args surface as `list<field>`;
+the result as `option<field-tree>` (none for void; results are
+unnamed in WIT, so no `field` wrapper).
 
-    // ── opaque handles — index into handle-infos ──────────────────
-    resource-handle(u32),                  // → handle-infos[idx]
-    stream-handle(u32),
-    future-handle(u32),
-    error-context-handle(u32),             // id-only; see "Resource, …" below
-}
-
-record record-info {
-    type-name: string,
-    fields: list<tuple<string, u32>>,      // (field-name, cell-index)
-}
-record flags-info  { type-name: string, set-flags: list<string>, }
-record enum-info   { type-name: string, case-name: string, }
-record variant-info {
-    type-name: string,
-    case-name: string,
-    payload: option<u32>,                  // cell-index, or none
-}
-record handle-info { type-name: string, id: u64, }
-
-record field-tree {
-    cells:         list<cell>,
-    record-infos:  list<record-info>,
-    flags-infos:   list<flags-info>,
-    enum-infos:    list<enum-info>,
-    variant-infos: list<variant-info>,
-    handle-infos:  list<handle-info>,
-    root: u32,
-}
-
-record field {
-    name: string,
-    tree: field-tree,
-}
-```
-
-A function call's parameters surface as a `list<field>` (each field
-carries its parameter name + a tree). The result surfaces as
-`option<field-tree>` (none for void; results are unnamed in WIT, so no
-`field` wrapper).
+The authoritative schema lives in
+[`wit/common/world.wit`](../../wit/common/world.wit).
 
 Every WIT type constructor maps to a distinct `cell` variant case, so
 the lifted value is self-describing — middleware code can pattern-match
@@ -106,21 +67,20 @@ consumer can render a value correctly even without the WIT.
 
 ### Memory savings from the side-table split
 
-Cell stride drops from **32 bytes** (with metadata inline) to **16 bytes**
-(metadata in side tables). For typical lifted-value trees:
+Without the split (metadata inline in cell variant cases), the
+cell stride is dominated by the largest case's payload size
+padded to alignment — every cell pays for the worst case
+regardless of which case is present. Pulling nominal metadata
+into side tables caps every cell payload at 8 bytes (`s64`),
+collapsing the stride to whatever the smallest viable shape
+allows.
 
-| Tree shape                                  | Inline-metadata (32 B/cell) | Side-table (16 B/cell + side) | Savings |
-|---------------------------------------------|---------------------------:|----------------------------:|--------:|
-| 100 primitive cells (e.g., a flat tuple)    |                      3200 B|                       1600 B|     50% |
-| 1 record + 50 primitive children            |                      1632 B|                        846 B|     48% |
-| 50 records + 50 primitives                  |                      3200 B|                       3100 B|      3% |
-| HTTP body lifted as `bytes` (1 cell + body) |             32 B + body    |             16 B + body     | negligible |
-
-Primitive-dominated trees (the realistic shape — record leaves are
-mostly primitives) win the most. Record-heavy trees roughly break
-even because each nominal cell trades 16 B of cell padding for ~24 B
-of side-table entry. Never meaningfully worse, often dramatically
-better.
+For primitive-dominated trees (the realistic shape — record
+leaves are mostly primitives) this is roughly **50% savings**
+vs. the inline alternative. Record-heavy trees roughly break
+even, because each nominal cell trades the padding it would have
+paid for a side-table entry of comparable size. Never
+meaningfully worse, often dramatically better.
 
 The cost is one extra `tree.<kind>_infos[idx]` lookup in middleware
 code per nominal cell. Helper libraries hide this; without one, the
@@ -160,16 +120,16 @@ calls later").
 
 The canonical ABI defines `error-context.debug-message`, which would
 let the wrapper read the debug string in its own component (no
-cross-component hop needed for the string itself). We deliberately do
-**not** call it today: wasmtime ≤44 ships an incomplete
+cross-component hop needed for the string itself). We deliberately
+do **not** call it today: wasmtime currently ships an incomplete
 `error-context` implementation ("very incomplete" per its own
 `wasm_component_model_error_context` config docstring). The
-`error_context_transfer` libcall fired by the FACT trampoline crashes
-with `unknown handle index` when an `error-context` crosses any
-component boundary — including a wrapper interposed via splicer or
-even a wac-shim in a fan-in topology. The wrapper's wasm code never
-runs, so option-2 (read the debug message) cannot be validated end-
-to-end on current hosts.
+`error_context_transfer` libcall fired by the FACT trampoline
+crashes with `unknown handle index` when an `error-context`
+crosses any component boundary — including a wrapper interposed
+via splicer or even a wac-shim in a fan-in topology. The wrapper's
+wasm code never runs, so option-2 (read the debug message) cannot
+be validated end-to-end on current hosts.
 
 When wasmtime's error-context support matures, this will be upgraded
 to surface the debug string. The on-the-wire shape will change (likely
@@ -180,7 +140,7 @@ to switch.
 
 ### Oversized lists trap
 
-The lift codegen reserves slabs sized `count * elem_bytes` (cell-tree
+The lift codegen reserves slabs sized `count * elem_bytes` (cells
 slab) and `len * 4` (per-list child-index buffer). Both go through
 `cabi_realloc`, whose size param is canonical-ABI i32 (signed). When a
 runtime `len` would make the multiplication overflow signed i32 — at
@@ -247,20 +207,10 @@ case justifies the implementation cost.
 ## Tier-2 hook interfaces
 
 The tier-2 WIT package mirrors tier-1's split-by-hook structure:
-
-```wit
-package splicer:tier2@0.1.0;
-
-interface before {
-    use splicer:common/types@0.1.0.{call-id, field};
-    on-call: async func(call: call-id, args: list<field>);
-}
-
-interface after {
-    use splicer:common/types@0.1.0.{call-id, field-tree};
-    on-return: async func(call: call-id, result: option<field-tree>);
-}
-```
+two interfaces, `before` and `after`. `before::on-call(call,
+args)` carries the function's params as a `list<field>`;
+`after::on-return(call, result)` carries the return as
+`option<field-tree>` (`none` for void). Both hooks are `async`.
 
 **Receiver convention.** For resource methods (`request.body()`, etc.),
 the receiver `borrow<request>` / `own<request>` surfaces as the first
@@ -295,12 +245,12 @@ A trap-observability hook (`on-trap(call, reason)`) was scoped but
 intentionally not shipped. The motivating use case is real:
 instrumenting a target interface and seeing when a downstream call
 fails. The blocker is at the runtime layer rather than our codegen:
-canon-async (wasmtime 41.0.1) propagates child-task traps as wasm
-traps that unwind the parent's stack — the parent guest never gets
-a chance to observe the trap before unwinding alongside it. There's
-no `Status::Failed` or `Event::TaskFailed` for the parent's
-wait-loop to dispatch on, neither for guest-implemented nor
-host-implemented targets.
+canon-async on current wasmtime releases propagates child-task
+traps as wasm traps that unwind the parent's stack — the parent
+guest never gets a chance to observe the trap before unwinding
+alongside it. There's no `Status::Failed` or `Event::TaskFailed`
+for the parent's wait-loop to dispatch on, neither for guest-
+implemented nor host-implemented targets.
 
 Wiring `on-trap` would require either (1) canon-async growing a
 guest-visible terminal-error event the parent can poll for, or (2)
@@ -370,7 +320,5 @@ This pattern gives both worlds:
   cases. If perf matters, drop the adapter-adapter and walk cells
   directly.
 
-Tracked in
-[`docs/TODO/adapter-comp-planning.md`](../TODO/adapter-comp-planning.md).
 Not in scope for tier-2 v1; the cell wire format is forward-compatible
 with this shim landing later.
