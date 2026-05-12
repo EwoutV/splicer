@@ -10,6 +10,7 @@ on:
         options:
           - common
           - tier1
+          - tier2
       description:
         description: "Package description shown on GHCR"
         required: false
