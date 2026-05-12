@@ -220,3 +220,27 @@ fn integration_nonblock1() {
 fn integration_nonblock_n() {
     run_config("nonblockN");
 }
+
+#[test]
+#[ignore]
+fn integration_tier1_all() {
+    run_config("tier1-all");
+}
+
+#[test]
+#[ignore]
+fn integration_tier2() {
+    run_config("tier2");
+}
+
+#[test]
+#[ignore]
+fn integration_tier2_all() {
+    run_config("tier2-all");
+}
+
+#[test]
+#[ignore]
+fn integration_hello_builtin_config() {
+    run_config("hello-builtin-config");
+}
