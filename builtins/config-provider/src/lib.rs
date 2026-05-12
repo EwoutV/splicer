@@ -1,25 +1,11 @@
 //! Provider template for the `splicer:builtin-config` substrate.
 //!
-//! Builds into a generic wasm component exporting
-//! `splicer:builtin-config/get`. The actual key/value table lives in
-//! a fixed-capacity `static` buffer (`SPLICER_CONFIG_BLOB`) marked with
-//! a known magic prefix; splicer's `config_provider::build_provider`
-//! finds the magic by byte-scan in the built wasm and overwrites the
-//! payload at splice time. Every inject site that wants config gets
-//! its own patched copy of this component.
-//!
-//! Wire format inside the blob (after `MAGIC`):
-//!   [u32 LE payload_len]
-//!   [payload_len bytes:
-//!     [u32 LE count]
-//!     repeat count times:
-//!       [u32 LE key_len][key bytes]
-//!       [u32 LE val_len][val bytes]
-//!   ]
-//!   [padding to CAPACITY]
-//!
-//! Initial state (unpatched): `payload_len == 0`, so every `get`
-//! returns `none` and consumers fall back to their hardcoded defaults.
+//! Exports `splicer:builtin-config/get`. The KV table lives in
+//! `SPLICER_CONFIG_BLOB` — a fixed-capacity `static` prefixed with
+//! `MAGIC_BYTES` so splicer's `build_provider` can locate and patch
+//! it by byte-scan. Unpatched (`payload_len == 0`), every `get`
+//! returns `none` and consumers fall back to their hardcoded
+//! defaults. Wire format details: see `wire_format.rs`.
 
 mod bindings {
     wit_bindgen::generate!({
@@ -33,27 +19,17 @@ use std::sync::OnceLock;
 
 use bindings::exports::splicer::builtin_config::get::Guest;
 
-// Wire-format constants AND codec (serialize_table / deserialize_table
-// / read_u32_le) shared with splicer's `src/config_provider.rs`, which
-// loads the same file via `#[path = "..."] mod wire_format;`. Do not
-// duplicate the format here.
-//
-// IMPORTANT: only reference `wire_format::MAGIC_BYTES` in const-eval
-// contexts (inside `const` / `static` initializers). A runtime
-// `&MAGIC_BYTES` forces rustc to emit the bytes as a separately-
-// addressable static next to the byte-identical prefix of
-// `SPLICER_CONFIG_BLOB`, which the splicer-side byte-scan then sees
-// as a duplicate match.
+// Wire-format constants + codec shared with splicer's
+// `src/config_provider.rs`. See `wire_format.rs` for the
+// "only-in-const-eval" invariant on `MAGIC_BYTES`.
 mod wire_format;
 
 use wire_format::{
     deserialize_table, read_u32_le, CAPACITY, LEN_PREFIX_BYTES, MAGIC_BYTES, MAGIC_LEN,
 };
 
-/// Storage for the splice-time KV table. The first `MAGIC_LEN` bytes
-/// are the sentinel the splicer-side patcher byte-scans for; the
-/// next `LEN_PREFIX_BYTES` are the payload length (little-endian);
-/// the rest holds the serialized table followed by 0xAA padding.
+/// `MAGIC_BYTES` + `[u32 LE payload_len]` + serialized table + 0xAA
+/// padding. Patched in place by splicer at splice time.
 #[no_mangle]
 pub static SPLICER_CONFIG_BLOB: [u8; CAPACITY] = {
     let mut b = [0xAA_u8; CAPACITY];
@@ -71,21 +47,17 @@ pub static SPLICER_CONFIG_BLOB: [u8; CAPACITY] = {
     b
 };
 
-/// Cached table parsed from `SPLICER_CONFIG_BLOB` on the first call;
-/// every subsequent `get` reuses the same `&'static HashMap`, so the
-/// byte-scan parse runs once per wasm-instance lifetime.
+/// Parsed once per wasm-instance lifetime; subsequent `get` calls
+/// reuse the cached `&'static HashMap`.
 fn table() -> &'static HashMap<String, String> {
     static T: OnceLock<HashMap<String, String>> = OnceLock::new();
     T.get_or_init(parse_table)
 }
 
 fn parse_table() -> HashMap<String, String> {
-    // `black_box` forces the compiler to treat the static as opaque,
-    // so it can't fold the parse against the compile-time initial
-    // (empty) blob and drop the runtime lookup.
+    // `black_box` keeps the compiler from folding the parse against
+    // the compile-time-empty blob.
     let blob: &[u8] = std::hint::black_box(&SPLICER_CONFIG_BLOB);
-    // Skip past the magic prefix; peel off the payload-length header;
-    // hand the payload bytes to the shared deserializer.
     let body = &blob[MAGIC_LEN..];
     let Some(payload_len) = read_u32_le(body, 0) else {
         return HashMap::new();

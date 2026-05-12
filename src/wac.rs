@@ -1157,12 +1157,10 @@ fn create_tier1_mdl(
         .as_ref()
         .map(|_| format!("{real_var}-config"));
 
-    // Real middleware. The unpatched assumption is that builtins only
-    // have host imports (so `{ ... }` covers everything); a builtin
-    // that imports `splicer:builtin-config` needs the patched
-    // provider wired explicitly because the host doesn't satisfy
-    // that interface. Emit both `let`s once per mdl.name; adapters
-    // on later rules reuse the vars.
+    // Real middleware. Substrate-consuming builtins need their
+    // patched provider wired explicitly — the host doesn't satisfy
+    // `splicer:builtin-config`. Emit once per mdl.name; adapters on
+    // later rules reuse the vars.
     if emitted_mdl_vars.insert(real_var.clone()) {
         if let Some(cfg_var) = config_provider_var.as_ref() {
             wac_lines.push(format!(

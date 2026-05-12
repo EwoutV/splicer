@@ -143,12 +143,9 @@ fn main() {
     generate_builtin_config_constants(&out_dir);
 }
 
-/// Parse `wit/builtin-config/world.wit` and emit a Rust file at
-/// `$OUT_DIR/builtin_config_constants.rs` with the package /
-/// version / per-interface name + versioned-handle constants
-/// `src/config_provider.rs` consumes. Single source of truth lives
-/// in the WIT file; bumping the package version there is the only
-/// edit needed to bump it everywhere.
+/// Emit `BUILTIN_CONFIG_*` constants for `src/config_provider.rs`
+/// from `wit/builtin-config/world.wit`. Bumping the package version
+/// in the WIT propagates everywhere.
 fn generate_builtin_config_constants(out_dir: &str) {
     let dest = Path::new(out_dir).join("builtin_config_constants.rs");
     let wit_path = Path::new("wit").join("builtin-config").join("world.wit");

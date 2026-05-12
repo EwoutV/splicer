@@ -8,8 +8,7 @@
 ///
 /// Values are string-typed at the WIT boundary. Each builtin
 /// parses the strings it cares about into typed config at init
-/// time. See `docs/TODO/builtin-config-substrate.md` for the full
-/// rationale (notably why we don't use typed records).
+/// time.
 package splicer:builtin-config@0.1.0;
 
 interface get {

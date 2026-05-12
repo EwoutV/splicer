@@ -14,14 +14,9 @@ use crate::bindings::splicer::builtin_config::get::get as get_config;
 use crate::bindings::splicer::common::types::CallId;
 
 /// Print prefix. Read from the `greeting` config key on first call
-/// via `splicer:builtin-config/get` (async — wit-bindgen generates
-/// every imported func as async when the world is `async: true`) and
-/// cached for the rest of the instance's lifetime. Falls back to
-/// `"hello-tier1"` when no `config:` block sets `greeting`.
-///
-/// Concurrent racers that both find `G` uninitialized will each call
-/// `get_config` once and then race on `get_or_init`; the loser's
-/// value is dropped and both return the same `&'static str`.
+/// (defaults to `"hello-tier1"`) and cached for the rest of the
+/// instance's lifetime. Async because wit-bindgen generates every
+/// imported func as async when the world is `async: true`.
 async fn greeting() -> &'static str {
     static G: OnceLock<String> = OnceLock::new();
     if let Some(g) = G.get() {

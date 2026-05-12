@@ -8,6 +8,7 @@ on:
         required: true
         type: choice
         options:
+          - config-provider
           - hello-tier1
           - otel-bare-logs
           - otel-bare-metrics

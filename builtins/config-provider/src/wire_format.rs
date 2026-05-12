@@ -1,39 +1,27 @@
-// Shared wire-format constants and codec between the config-provider
-// template (`builtins/config-provider/src/lib.rs`) and the splicer-
-// side patcher (`src/config_provider.rs`). Both files `include!` this
-// file; do not edit it in just one place.
+// Shared wire-format constants + codec between the config-provider
+// template and the splicer-side patcher. Loaded via `mod wire_format;`
+// from both crates (the splicer side uses `#[path = "…"]`).
 //
-// IMPORTANT: in the provider template, `MAGIC_BYTES` MUST only be
-// referenced in const-eval contexts (inside `const` / `static`
-// initializers). A runtime `&MAGIC_BYTES` forces rustc to emit the
-// bytes as a separately-addressable static next to the byte-identical
-// prefix of `SPLICER_CONFIG_BLOB`, which trips the patcher's
-// "magic appears exactly once" check.
+// IMPORTANT: in the provider template, `MAGIC_BYTES` may only be
+// referenced in const-eval contexts. A runtime `&MAGIC_BYTES` forces
+// rustc/lld to emit a separately-addressable copy next to the
+// byte-identical prefix of `SPLICER_CONFIG_BLOB`, which trips the
+// patcher's "magic appears exactly once" check.
 
-/// Sentinel the splicer-side patcher byte-scans for to locate the KV
-/// buffer in the built component. Picked to be very unlikely to appear
-/// in any other section (non-ASCII wrapper bytes around an ASCII tag).
 pub(crate) const MAGIC_BYTES: [u8; 29] = *b"\x00\xefSPLICER_BUILTIN_CONFIG_V1\xef\x00";
-
-/// Byte length of the magic sentinel.
 pub(crate) const MAGIC_LEN: usize = MAGIC_BYTES.len();
 
-/// Total bytes reserved for the magic sentinel + length header +
-/// serialized table + padding. Patching fails if the serialized
-/// table doesn't fit.
+/// Magic + length header + serialized table + padding. Patching
+/// fails when the serialized table doesn't fit.
 pub(crate) const CAPACITY: usize = 16 * 1024;
 
-/// Width of every length-prefix field in the wire format
-/// (`payload_len`, `count`, `key_len`, `val_len`).
+/// Width of every length-prefix field (`payload_len`, `count`,
+/// `key_len`, `val_len`).
 pub(crate) const LEN_PREFIX_BYTES: usize = std::mem::size_of::<u32>();
 
-/// Serialize a key-value table into the on-wire payload. Returns the
-/// inner-payload bytes (the `MAGIC` and `payload_len` framing are
-/// added by the caller). Sorted iteration over a `BTreeMap` gives
-/// byte-deterministic output — two builds with the same `values`
-/// produce identical patched-provider bytes.
-///
-/// Format: `[u32 LE count][u32 LE key_len][key bytes][u32 LE val_len][val bytes]...`
+/// Wire format: `[u32 LE count][u32 LE key_len][key bytes][u32 LE val_len][val bytes]...`
+/// `BTreeMap` iteration order gives byte-deterministic output across
+/// runs with identical inputs.
 pub(crate) fn serialize_table(values: &std::collections::BTreeMap<String, String>) -> Vec<u8> {
     let count = values.len() as u32;
     let mut buf = Vec::new();
@@ -49,13 +37,13 @@ pub(crate) fn serialize_table(values: &std::collections::BTreeMap<String, String
     buf
 }
 
-/// Deserialize an on-wire payload back to a `HashMap`. Returns an
-/// empty map on any malformed framing (bad length, truncated entry,
-/// non-UTF-8 string): the wire format is internal to splicer, so a
-/// malformed table signals a build/patch bug rather than user input.
-/// Callers fall back to per-builtin defaults regardless.
+/// Deserialize an on-wire payload back to a `HashMap`. Malformed
+/// framing returns an empty map — the format is splicer-internal, so
+/// a bad table signals a build/patch bug and consumers fall back to
+/// per-builtin defaults either way.
 ///
-/// `#[allow(dead_code)]` since this is called by the patcher in `splicer/src` only.
+/// `#[allow(dead_code)]` because the splicer-side `include!` of this
+/// file only calls it from tests.
 #[allow(dead_code)]
 pub(crate) fn deserialize_table(payload: &[u8]) -> std::collections::HashMap<String, String> {
     let mut out = std::collections::HashMap::new();

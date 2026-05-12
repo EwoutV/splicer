@@ -56,11 +56,9 @@ pub enum BuiltinSpec {
         /// Optional override for the WAC variable name. Defaults to
         /// `name` when omitted.
         alias: Option<String>,
-        /// Builtin-specific configuration sealed into the
-        /// `splicer:builtin-config` provider at splice time. Scalars
-        /// (strings, numbers, booleans) are stringified verbatim and
-        /// the builtin parses them on its end. Lists and maps are
-        /// rejected — encode them inside a single string scalar.
+        /// Sealed into the `splicer:builtin-config` provider at
+        /// splice time. Scalars only — lists/maps are rejected;
+        /// encode structure inside a single string value.
         #[serde(default)]
         config: BTreeMap<String, serde_yaml::Value>,
     },
@@ -150,21 +148,16 @@ pub struct Injection {
     /// need to know about builtins.
     #[serde(skip)]
     pub builtin: Option<String>,
-    /// Builtin-specific configuration parsed from
-    /// `inject: [{ builtin: { config: { ... } } }]`. Values are
-    /// stringified at YAML parse time so the splice pipeline can hand
-    /// them verbatim to the `splicer:builtin-config` provider patcher.
-    /// `BTreeMap` for deterministic patched-provider bytes.
+    /// YAML `builtin.config:` values, stringified at parse time so
+    /// the splice pipeline can hand them verbatim to the provider
+    /// patcher. `BTreeMap` for deterministic patched-provider bytes.
     #[serde(skip)]
     pub builtin_config: BTreeMap<String, String>,
-    /// Populated by `ensure_provider_for` when this injection is a
-    /// builtin that imports `splicer:builtin-config/get` — points at
-    /// the patched provider component splicer wrote alongside the
-    /// materialized builtin. `None` means no provider was needed
-    /// (not a builtin, or the builtin doesn't import the substrate).
-    /// Not part of the YAML config and not user-settable — callers
-    /// who want to bring their own provider component should use a
-    /// user-form injection (`name` + `path`) instead.
+    /// Stamped by `ensure_provider_for` when the builtin imports
+    /// `splicer:builtin-config/get` — points at the patched provider
+    /// alongside the materialized builtin. Not user-settable; callers
+    /// who want their own provider use a user-form (`name` + `path`)
+    /// injection instead.
     #[serde(skip)]
     pub(crate) config_provider_path: Option<String>,
     /// Populated at runtime by `add_to_inject_plan` when this injection
@@ -530,14 +523,10 @@ fn into_injection(yaml: YamlInjection) -> Injection {
     }
 }
 
-/// Convert a YAML scalar config map to the string-keyed/string-valued
-/// shape the `splicer:builtin-config` provider patcher consumes.
-///
-/// YAML scalars (string, number, bool) stringify in the obvious way.
-/// Null, sequences, mappings, and tagged values are rejected — the
-/// substrate is intentionally string-only; a builtin that wants
-/// structured config encodes it inside a single string value (JSON,
-/// newline-separated, etc.) and parses on its end.
+/// Convert a YAML config map to the string-keyed/string-valued
+/// shape the provider patcher consumes. Scalars stringify
+/// naturally; null/sequence/mapping/tagged values are rejected so
+/// silently dropping structured config can't happen.
 fn stringify_config(
     rule_num: usize,
     inj_num: usize,
