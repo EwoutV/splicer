@@ -2,10 +2,7 @@
 
 use wit_parser::{InterfaceId, Resolve};
 
-/// Find an interface by its unversioned qname (e.g. `splicer:common/types`),
-/// ignoring any `@x.y.z` suffix the WIT carries. Panics with a clear message
-/// if no matching interface is loaded — every call site uses this for known
-/// fixture WIT, so absence is a fixture bug, not a runtime condition.
+/// Find an interface by its unversioned qname, ignoring any `@x.y.z` suffix.
 pub(super) fn iface_by_unversioned_qname(resolve: &Resolve, qname: &str) -> InterfaceId {
     resolve
         .interfaces

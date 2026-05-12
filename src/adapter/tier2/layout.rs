@@ -1,13 +1,6 @@
-//! Static-memory layout phase: takes the [`FuncClassified`] list
-//! produced by classification, reserves data + scratch slabs for
-//! every blob the wrapper body references at runtime, and assembles
-//! immutable [`FuncDispatch`] records combining each
-//! [`FuncClassified`] with its computed offsets.
-//!
-//! Phase boundary: [`lay_out_static_memory`] takes ownership of the
-//! classify output and returns a fully-built dispatch list. There's
-//! no halfway state where some [`FuncDispatch`] fields are
-//! placeholders waiting for a later phase to back-fill them.
+//! Static-memory layout phase: takes the `FuncClassified` list,
+//! reserves data + scratch slabs, and returns an immutable
+//! `FuncDispatch` list with every offset filled in.
 
 use anyhow::{bail, Result};
 use wit_parser::{Function as WitFunction, Type};
@@ -33,47 +26,33 @@ use super::{AfterSetup, FuncClassified, FuncDispatch, FuncShape};
 
 // ─── ABI-anchored constants (not WIT-schema-derivable) ────────────
 
-/// Size + alignment of the `waitable-set.wait` event record slot.
-/// This is wit-component runtime ABI, not anything from our WIT.
+/// `waitable-set.wait` event record slot (wit-component runtime ABI).
 const EVENT_SLOT_SIZE: u32 = 8;
 const EVENT_SLOT_ALIGN: u32 = 4;
 
 // ─── Layout-phase size budget ─────────────────────────────────────
 //
-// Wasm encodes static-data offsets as `i32.const` in the instruction
-// stream, so the layout phase has to keep every offset in signed-i32
-// range. One pre-check at the top of `lay_out_static_memory` bounds
-// every per-fn / per-param count that downstream `count * size`
-// arithmetic multiplies; one post-check at the end verifies the
-// final layout end. No per-site checked arithmetic needed.
+// Wasm encodes static-data offsets as `i32.const`, so every offset
+// must fit in signed-i32. One pre-check bounds the per-fn/param
+// counts; one post-check verifies the final end.
 
-/// Final layout end (data + scratch + bump-allocator base) must fit
-/// in a signed i32.
+/// Final layout end must fit in signed i32.
 const LAYOUT_SIZE_BUDGET: u32 = i32::MAX as u32;
 
-/// Per-fn flat-slot count cap. Canonical-ABI direct-call flattens up
-/// to 16 args before retptr; nested-record flatten can go past that.
-/// 65 536 sits well above any realistic shape. Reduced under
-/// `cfg(test)` so the bail can be exercised without generating a WIT
-/// at the production limit.
+/// Per-fn flat-slot count cap. Reduced under `cfg(test)` to exercise
+/// the bail without a WIT at the production limit.
 #[cfg(not(test))]
 const MAX_FLAT_SLOTS_PER_FN: u32 = 1 << 16;
 #[cfg(test)]
 const MAX_FLAT_SLOTS_PER_FN: u32 = 16;
 
-/// Per-param (and per-result) cell-tree cap. Bounds `cell_count *
-/// cell_size` slab sizes and the cell index used as `i32.const` in
-/// `emit_lift_plan`. Reduced under `cfg(test)` so the bail can be
-/// exercised without generating a WIT at the production limit.
+/// Per-param (and per-result) cell-tree cap.
 #[cfg(not(test))]
 const MAX_CELLS_PER_PARAM: u32 = 1 << 20;
 #[cfg(test)]
 const MAX_CELLS_PER_PARAM: u32 = 8;
 
-/// Bound every per-fn / per-param count the layout phase relies on.
-/// Once this returns `Ok`, the body of `lay_out_static_memory` can
-/// use ordinary `u32` arithmetic; the schema-derived `cell_size` /
-/// `field_size` factors are small constants, so the products fit.
+/// Bound per-fn / per-param counts so downstream `u32` arithmetic fits.
 fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
     for (fn_idx, fd) in per_func.iter().enumerate() {
         for (p_idx, p) in fd.params.iter().enumerate() {
@@ -102,39 +81,35 @@ fn check_layout_budget(per_func: &[FuncClassified]) -> Result<()> {
     Ok(())
 }
 
-/// Per-fn fills for a Direct (sync flat) result. Adding a kind =
-/// one struct field + one [`single_cell_side_data`] arm. Mirrors
-/// [`CellFillSources`]'s shape but per-fn instead of per-cell.
+/// Per-fn fills for a Direct (sync flat) result.
 struct SingleCellFills<'a> {
     flags_fill: &'a Option<FlagsRuntimeFill>,
     char_scratch: &'a Option<i32>,
     handle_fill: &'a Option<HandleRuntimeFill>,
 }
 
-/// Wrap the per-fn fills into a [`CellSideData`] for a Direct
-/// result. Match is exhaustive — multi-slot + compound + un-wired
-/// kinds are `unreachable!()` because [`super::lift::classify_result_lift`]
+/// Wrap per-fn fills into a `CellSideData` for a Direct result.
+/// Compound/un-wired kinds are unreachable — classify_result_lift
 /// routes them through Compound.
 fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideData {
     match cell {
-        Cell::Flags { .. } => {
-            CellSideData::Flags(Box::new(fills.flags_fill.clone().expect(
-                "flags single-cell result → flags-info builder must produce a fill",
-            )))
-        }
+        Cell::Flags { .. } => CellSideData::Flags(Box::new(
+            fills
+                .flags_fill
+                .clone()
+                .expect("flags-info fill must exist"),
+        )),
         Cell::Char { .. } => CellSideData::Char {
             scratch: CharScratch::Static {
-                scratch_addr: fills.char_scratch.expect(
-                    "char single-cell result → char-info builder must produce a scratch addr",
-                ),
+                scratch_addr: fills.char_scratch.expect("char-info scratch must exist"),
             },
         },
-        Cell::Handle { .. } => {
-            CellSideData::Handle(Box::new(fills.handle_fill.clone().expect(
-                "handle single-cell result → handle-info builder must produce a fill",
-            )))
-        }
-        // Direct-eligible kinds with no side-table contribution.
+        Cell::Handle { .. } => CellSideData::Handle(Box::new(
+            fills
+                .handle_fill
+                .clone()
+                .expect("handle-info fill must exist"),
+        )),
         Cell::Bool { .. }
         | Cell::IntegerSignExt { .. }
         | Cell::IntegerZeroExt { .. }
@@ -144,7 +119,6 @@ fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideDa
         | Cell::Text { .. }
         | Cell::Bytes { .. }
         | Cell::EnumCase { .. } => CellSideData::None,
-        // Compound + un-wired — classify_result_lift filters these out.
         Cell::RecordOf { .. }
         | Cell::TupleOf { .. }
         | Cell::Option { .. }
@@ -156,24 +130,16 @@ fn single_cell_side_data(cell: &Cell, fills: &SingleCellFills<'_>) -> CellSideDa
     }
 }
 
-/// Output of the static-memory layout phase: the addresses the
-/// emit-code phase needs to reference, plus the data segments
-/// ready to feed `emit_data_section`.
+/// Output of the static-memory layout phase.
 pub(super) struct StaticDataPlan {
     pub(super) bump_start: u32,
     pub(super) event_ptr: i32,
-    /// Byte offset of the on-call indirect-params scratch buffer.
-    /// `Some` iff `schema.before_hook` is wired (the buffer only
-    /// exists to be passed to the before-hook).
+    /// On-call indirect-params scratch; `Some` iff before-hook is wired.
     pub(super) hook_params_ptr: Option<u32>,
     pub(super) data_segments: Vec<(u32, Vec<u8>)>,
 }
 
-/// Side-table absolute pointers for one field-tree. Each kind's
-/// `BlobSlice` patches into the matching `field-tree.<kind>-infos`
-/// list pair; `BlobSlice::EMPTY` leaves the slot zeroed (i.e. the
-/// field doesn't carry that kind). Adding a new kind means adding
-/// a field here + a [`FieldSideTables::write_to_tree`] line.
+/// Side-table absolute pointers for one field-tree.
 #[derive(Clone, Copy, Default)]
 struct FieldSideTables {
     enum_infos: BlobSlice,
@@ -218,10 +184,8 @@ fn write_field_record(
 }
 
 /// Build the contiguous fields blob: one `field` record per
-/// (fn, param). `param_side_tables[fn][p]` carries the param's
-/// per-kind side-table pointers (or `EMPTY` slots for kinds the
-/// param doesn't carry). The field-tree's `cells.ptr` is left at
-/// `0` — the wrapper body patches it per call after `cabi_realloc`.
+/// (fn, param). `cells.ptr` is left at `0` — wrapper body patches it
+/// per call after `cabi_realloc`.
 fn build_fields_blob(
     per_func: &[FuncClassified],
     schema: &SchemaLayouts,
@@ -230,10 +194,6 @@ fn build_fields_blob(
     let mut blob: Vec<u8> = Vec::new();
     for (fn_idx, fd) in per_func.iter().enumerate() {
         for (i, p) in fd.params.iter().enumerate() {
-            // `cells.ptr = 0` placeholder; `cells.len = plan.cell_count()`;
-            // `root` is the index recorded by the plan-builder
-            // (children-first ordering means root is the last-pushed
-            // cell for compound shapes, `0` for primitives).
             write_field_record(
                 &mut blob,
                 schema,
@@ -250,11 +210,9 @@ fn build_fields_blob(
     blob
 }
 
-/// Build the contiguous on-return params blob: one record per fn,
-/// with `result: option::some(field-tree)` pre-wired for funcs that
-/// have a result lift, `option::none` for the rest. The field-tree's
-/// `cells.ptr` is left at `0` — the wrapper body patches it per call
-/// after `cabi_realloc`.
+/// On-return params blob: one record per fn. `result` is
+/// `some(field-tree)` pre-wired for funcs with a result lift,
+/// `none` otherwise. `cells.ptr` patched per call.
 fn build_after_params_blob(
     per_func: &[FuncClassified],
     schema: &SchemaLayouts,
@@ -280,10 +238,8 @@ fn build_after_params_blob(
             entry.write_option_some(&mut blob, ON_RET_RESULT);
             let tree_base = entry.field_offset(ON_RET_RESULT) + schema.option_payload_off as usize;
             let tree = RecordWriter::at(&schema.tree_layout, tree_base);
-            // Compound result: cells.len = plan.cell_count (slab
-            // holds the full cell tree) and root = plan.root()
-            // (children-first ordering puts the parent at the
-            // end of the slab). Direct result: len = 1, root = 0.
+            // Compound: cells.len = plan.cell_count, root = plan.root.
+            // Direct: len = 1, root = 0.
             let (cells_len, root) = fd
                 .result_lift
                 .as_ref()
@@ -306,8 +262,7 @@ fn build_after_params_blob(
     blob
 }
 
-/// Place one segment, register its symbol, queue its cross-segment
-/// relocs (no-op when `seg.relocs` is empty). Returns the placed base.
+/// Place a segment, register its symbol, queue relocs.
 fn place_segment(
     layout: &mut StaticLayout,
     symbols: &mut SymbolBases,
@@ -320,9 +275,7 @@ fn place_segment(
     base
 }
 
-/// Resolve a per-(fn, param) and per-fn pair of `SymRef` grids to
-/// absolute `BlobSlice` grids. Mechanical mapping shared by every
-/// per-cell side-table kind whose ranges land in `FieldSideTables`.
+/// Resolve `SymRef` grids to absolute `BlobSlice` grids.
 fn resolve_param_result_ranges(
     symbols: &SymbolBases,
     per_param_sym: Vec<Vec<Option<SymRef>>>,
@@ -339,18 +292,9 @@ fn resolve_param_result_ranges(
     (per_param, per_result)
 }
 
-/// Reserve scratch + place data segments for everything the wrapper
-/// body references at runtime, then assemble immutable
-/// [`FuncDispatch`] records combining each [`FuncClassified`] with
-/// its computed offsets. Each allocation goes through `StaticLayout`
-/// so alignment is enforced.
-///
-/// Phase boundary: this fn takes ownership of the classify output
-/// and returns a fully-built dispatch list. There's no halfway state
-/// where some FuncDispatch fields are placeholders waiting for a
-/// later phase to back-fill them. Reordering the steps inside this
-/// fn can still produce wrong offsets, but it can't leave the type
-/// system holding a `: 0  // back-filled later` lie.
+/// Reserve scratch + place data segments, then assemble immutable
+/// `FuncDispatch` records. Takes ownership of the classify output and
+/// returns a fully-built dispatch list — no back-fill state possible.
 pub(super) fn lay_out_static_memory(
     per_func: Vec<FuncClassified>,
     funcs: &[&WitFunction],
@@ -367,12 +311,6 @@ pub(super) fn lay_out_static_memory(
 
     check_layout_budget(&per_func)?;
 
-    // All side-table strings (record-, enum-, flags-, handle-,
-    // variant-info) are interned at plan-build time and live on their
-    // cells. The shared name blob below picks them up via the
-    // already-populated `NameInterner`; no per-kind registration
-    // pass needed here.
-
     let mut layout = StaticLayout::new();
     let mut symbols = SymbolBases::new();
     let mut relocs = RelocPlan::new();
@@ -380,16 +318,13 @@ pub(super) fn lay_out_static_memory(
     let name_blob = names.into_bytes();
     let _ = layout.place_data(1, &name_blob);
 
-    // Reserve per-Cell::Flags scratch *before* building the flags-info
-    // entries so each entry's `set-flags.ptr` can land as an absolute
-    // address (no reloc needed). 4-byte alignment matches string
-    // `(ptr, len)` i32 pairs.
+    // Reserve flags scratch before building flags-info so each entry's
+    // `set-flags.ptr` lands as an absolute address (no reloc).
     let flags_scratch_addrs: Vec<u32> = flags_scratch_sizes(&per_func)
         .into_iter()
         .map(|n_bytes| layout.reserve_scratch(4, n_bytes))
         .collect();
-    // Per-Cell::Char utf-8 scratch — 4 bytes (max sequence length)
-    // per cell, byte-aligned (utf-8 stores are i32.store8).
+    // Char scratch: 4 bytes per cell, byte-aligned (i32.store8).
     let char_scratch_addrs: Vec<u32> = char_scratch_sizes(&per_func)
         .into_iter()
         .map(|n_bytes| layout.reserve_scratch(1, n_bytes))
@@ -404,12 +339,9 @@ pub(super) fn lay_out_static_memory(
         maps
     };
 
-    // Build the per-(fn, field) enum-info and record-info side
-    // tables. Each builder produces [`Segment`]s carrying their bytes
-    // + any in-segment relocs (record-info's `entries` references
-    // `tuples`); placement order below is now commutative because
-    // every cross-segment ptr is a queued reloc, not a write that
-    // gets patched after the fact.
+    // Per-(fn, field) enum-info / record-info side tables. Builders
+    // emit `Segment`s with in-segment relocs; placement order is
+    // commutative because every cross-segment ptr is a queued reloc.
     let enum_info_id = symbols.alloc();
     let record_tuples_id = symbols.alloc();
     let tuple_indices_id = symbols.alloc();
@@ -419,12 +351,8 @@ pub(super) fn lay_out_static_memory(
         per_param: enum_per_param_sym,
         per_result: enum_per_result_sym,
     } = enum_info;
-    // Flags-info doesn't pre-bake a static segment — the wrapper body
-    // allocates a per-(fn, param | result) buffer per call, writes
-    // type-name + set-flags.ptr (build-time-const) + set-flags.len
-    // (runtime bit-walked), and patches `field_tree.flags_infos`.
-    // The set-flags scratch slabs (per-cell static today) are still
-    // baked into the data segment.
+    // Flags-info entries are per-call (wrapper allocates the buffer);
+    // only the set-flags scratch slabs are baked statically.
     let mut flags_scratch_iter = flags_scratch_addrs.iter().copied();
     let FlagsInfoMaps {
         per_cell_fill: flags_per_cell_fill,
@@ -434,15 +362,11 @@ pub(super) fn lay_out_static_memory(
     } = build_flags_info_maps(&per_func, &mut flags_scratch_iter);
     debug_assert!(
         flags_scratch_iter.next().is_none(),
-        "flags scratch reservations must be consumed exactly once per Cell::Flags",
+        "flags scratch reservations must be consumed once per Cell::Flags",
     );
-    // Record-info doesn't pre-bake an entries segment — the wrapper
-    // body allocates a per-(fn, param | result) buffer per call,
-    // writes type-name + fields slice (build-time-const), and patches
-    // `field_tree.record_infos`. The `(field-name, child-cell-idx)`
-    // tuples each entry's fields slice points at *do* stay baked
-    // (in `record_tuples_seg`); list-element records (commit-2) will
-    // get a separate per-call tuples buffer.
+    // Record-info entries are per-call; static records' field-tuples
+    // stay baked in `record_tuples_seg` (list-element records get
+    // their own per-call tuples buffer).
     let RecordInfoMaps {
         tuples: record_tuples_seg,
         per_cell_fill: mut record_per_cell_fill,
@@ -457,18 +381,13 @@ pub(super) fn lay_out_static_memory(
         segment: tuple_indices_seg,
         per_cell_idx: tuple_indices_per_cell,
     } = build_tuple_indices_blob(&per_func, tuple_indices_id);
-    // Variant-info doesn't pre-bake a static segment — the wrapper
-    // body allocates a per-(fn, param | result) buffer per call and
-    // patches `field_tree.variant_infos`. Type-name + per-cell case
-    // dispatch are written per call from data on the cell.
+    // Variant-info entries are per-call.
     let VariantInfoMaps {
         per_cell_fill: variant_per_cell_fill,
         per_param_count: variant_per_param_count,
         per_result_count: variant_per_result_count,
     } = build_variant_info_maps(&per_func);
-    // Handle-info doesn't pre-bake a static segment — the wrapper
-    // body allocates a per-(fn, param | result) buffer per call,
-    // writes type-name + id, and patches `field_tree.handle_infos`.
+    // Handle-info entries are per-call.
     let HandleInfoMaps {
         per_cell_fill: handle_per_cell_fill,
         per_result_single_fill: handle_per_result_single_fill,
@@ -476,35 +395,18 @@ pub(super) fn lay_out_static_memory(
         per_result_count: handle_per_result_count,
     } = build_handle_info_maps(&per_func);
 
-    // Order doesn't matter for correctness — each placement assigns
-    // a base, relocs land later. Coalesced same-alignment segments
-    // sit back-to-back as a side effect of the order chosen here.
+    // Placement order is commutative; each placement assigns a base
+    // and relocs land later.
     let record_tuples_base =
         place_segment(&mut layout, &mut symbols, &mut relocs, record_tuples_seg);
     place_segment(&mut layout, &mut symbols, &mut relocs, enum_segment);
     place_segment(&mut layout, &mut symbols, &mut relocs, tuple_indices_seg);
 
-    // Static record fills carry segment-relative `fields_ptr`; rebase
-    // to absolute now that the tuples segment has a base. List-element
-    // records (commit-2) compute `fields_ptr` per call.
+    // Static record fills' `fields_ptr` is segment-relative; rebase now.
     back_fill_record_fields_ptrs(&mut record_per_cell_fill, record_tuples_base);
 
-    // Variant-info: no static segment to place. Fills already carry
-    // their (range-relative) `entry_idx` + the per-cell type-name +
-    // case-names; the per-call buffer is allocated in the wrapper
-    // body. Same shape as flags / record / handle.
-
-    // Resolve per-(fn, param) and per-fn `SymRef`s to absolute
-    // `BlobSlice`s now that every segment has a base. Tuple-indices
-    // stay symbolic until the FuncDispatch assembly resolves them
-    // per (fn, param | result) via `PerCellIndices::resolve_*`.
     let (enum_per_param, enum_per_result) =
         resolve_param_result_ranges(&symbols, enum_per_param_sym, enum_per_result_sym);
-    // handle-infos / variant-infos / record-info entries have no
-    // static segments — the wrapper body allocates per-call buffers
-    // and patches each `*_infos.ptr`. The `len` is build-time-const
-    // (entry count per (fn, param | result)), baked into the static
-    // field-tree below.
 
     // Bundle every kind's per-(fn, param) and per-(fn, result)
     // pointers into one `FieldSideTables` per field-tree, so the
@@ -556,8 +458,7 @@ pub(super) fn lay_out_static_memory(
         })
         .collect();
 
-    // Fields blob (data) — `cells.ptr` left zero (patched at runtime
-    // per call); per-kind side-table pointers baked in per-param.
+    // `cells.ptr` left zero (patched per call); side-table pointers baked.
     let fields_blob = build_fields_blob(&per_func, schema, &param_side_tables);
     let (fields_base, _) = layout.place_data(schema.field_layout.align, &fields_blob);
     let fields_buf_offsets: Vec<u32> = {
@@ -597,8 +498,7 @@ pub(super) fn lay_out_static_memory(
         .as_ref()
         .map(|h| layout.reserve_scratch(h.params_layout.align, h.params_layout.size));
 
-    // Per-fn retptr scratch — only for funcs whose canonical-ABI
-    // shape uses one.
+    // Per-fn retptr scratch (only when sig uses one).
     let retptr_offsets: Vec<Option<i32>> = per_func
         .iter()
         .zip(funcs.iter())
@@ -616,10 +516,8 @@ pub(super) fn lay_out_static_memory(
         })
         .collect();
 
-    // Per-fn indirect-params record scratch — only for async funcs
-    // whose flat params overflowed `MAX_FLAT_ASYNC_PARAMS`, switching
-    // canon-lower-async to pass-by-record. Size + align come from
-    // `SizeAlign::record` over the WIT param list.
+    // Async indirect-params scratch (canon-lower-async overflowed
+    // MAX_FLAT_ASYNC_PARAMS).
     let params_record_offsets: Vec<Option<i32>> = per_func
         .iter()
         .zip(funcs.iter())
@@ -635,22 +533,15 @@ pub(super) fn lay_out_static_memory(
         })
         .collect();
 
-    // Align the bump-allocator start past the largest alignment we
-    // placed; today that's `cell` (8) but pulling from `cell_layout`
-    // keeps it tied to the schema instead of a literal.
+    // Bump-allocator start aligned to the schema's max (`cell`).
     let bump_start = layout.end().next_multiple_of(schema.cell_layout.align);
     if bump_start > LAYOUT_SIZE_BUDGET {
         bail!("static-data layout end {bump_start} exceeds i32 budget {LAYOUT_SIZE_BUDGET}");
     }
     let mut data_segments = layout.into_segments();
-    // Resolve every queued cross-segment pointer in one pass. Has to
-    // happen after `into_segments` so the segments aren't being
-    // mutated through the layout's coalescing path.
+    // After `into_segments` so segments aren't being mutated.
     relocs.resolve(&symbols, &mut data_segments);
 
-    // Assemble FuncDispatch from each FuncClassified + its offsets.
-    // Owns the move from classify-time → post-layout types — every
-    // offset is known here, nothing is "0 // back-filled later".
     let dispatches: Vec<FuncDispatch> = per_func
         .into_iter()
         .enumerate()
@@ -763,19 +654,8 @@ pub(super) fn lay_out_static_memory(
 
 #[cfg(test)]
 mod tests {
-    //! Each test should be a few lines: build a [`LayoutEnv`] with
-    //! [`env`] (or [`env_with`] for hook-wiring variants), then assert
-    //! against the dispatches / plan / schema it carries. New
-    //! invariants are mostly one-liners over [`LayoutEnv::params`] /
-    //! [`LayoutEnv::dispatch`].
-    //!
-    //! The fixture WIT exposes every retptr/result branch the layout
-    //! code takes (no-args, primitive params + result, string param,
-    //! string return via retptr, multi-cell record param). Adding a
-    //! new branch = adding a function to [`TARGET_WIT`].
-    //!
-    //! Failure messages are intentionally absent — `cargo test` prints
-    //! the test name + line, which is enough to localize.
+    //! Layout-phase tests: build a `LayoutEnv`, assert against its
+    //! dispatches / plan / schema.
     use super::super::build_per_func_classified;
     use super::super::schema::{compute_schema, SchemaLayouts};
     use super::super::synthesize_adapter_world_wit;
@@ -795,10 +675,7 @@ mod tests {
         }
     "#;
 
-    /// Bundle returned by [`env`] / [`env_with`]: a fully-laid-out
-    /// dispatch list paired with the schema + plan it was produced
-    /// against. Tests destructure `env.dispatches` / `env.plan` /
-    /// `env.schema` directly.
+    /// Fully-laid-out dispatch list paired with its schema + plan.
     struct LayoutEnv {
         dispatches: Vec<FuncDispatch>,
         plan: StaticDataPlan,
@@ -806,9 +683,7 @@ mod tests {
     }
 
     impl LayoutEnv {
-        /// Look up a dispatch by export-name substring. Tests use
-        /// the WIT function name as the substring (mangling adds
-        /// the interface prefix but preserves the name).
+        /// Find a dispatch by export-name substring (e.g. the WIT fn name).
         fn dispatch(&self, name: &str) -> &FuncDispatch {
             self.dispatches
                 .iter()

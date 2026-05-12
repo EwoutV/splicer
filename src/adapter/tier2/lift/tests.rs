@@ -1,7 +1,5 @@
-//! Each test should be a few lines: build a minimal config (a WIT
-//! type, a list of function-param-type names), call the helper,
-//! `assert_eq!` against an expected value. New cases are mostly
-//! one-liners that delegate to a helper.
+//! Tests: build a minimal config, call the helper, assert_eq against
+//! an expected. New cases are mostly one-liners over the helpers.
 
 use wasm_encoder::{
     CodeSection, EntityType, Function, FunctionSection, ImportSection, MemoryType, Module,
@@ -25,8 +23,7 @@ use super::*;
 
 // ─── Fixture WIT + Resolve helpers ────────────────────────────
 
-/// Single-interface fixture WIT. New tests pull types/functions
-/// from `test:lift/t` via [`type_named`] / [`func_named`].
+/// Single-interface fixture WIT used by every test.
 const TEST_WIT: &str = r#"
     package test:lift@0.0.1;
     interface t {
@@ -158,10 +155,7 @@ fn test_resolve() -> Resolve {
     r
 }
 
-/// One-shot fixture init — pairs the standard test resolve with a
-/// fresh interner. Tests that thread the interner through both the
-/// plan-builder and a `record_of` assertion fixture rely on dedup
-/// across both sides, so they share one interner per test.
+/// Pair the standard test resolve with a fresh interner.
 fn setup() -> (Resolve, NameInterner) {
     (test_resolve(), NameInterner::new())
 }
@@ -189,13 +183,8 @@ fn func_named<'a>(resolve: &'a Resolve, name: &str) -> &'a WitFunction {
 
 // ─── Plan-builder + assertion fixture constructors ────────────
 
-/// Thin alias for [`LiftPlan::for_type`] — keeps the in-test call
-/// sites short. Tests that don't compare against a [`Cell::RecordOf`]
-/// fixture pass a fresh interner; tests that do thread the same one
-/// through both the plan-builder and [`record_of`] so the
-/// pre-interned [`BlobSlice`]s match (the interner dedupes).
-/// Unwraps the [`Result`] so positive tests don't have to repeat the
-/// `.expect(...)`. Negative cases call `LiftPlan::for_type` directly.
+/// Thin alias for `LiftPlan::for_type`. Unwraps; negative cases call
+/// `LiftPlan::for_type` directly.
 fn plan_for(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
     LiftPlan::for_type(ty, resolve, names).expect("test fixture must classify")
 }
@@ -204,17 +193,12 @@ fn plan_for_named(name: &str, resolve: &Resolve, names: &mut NameInterner) -> Li
     plan_for(&type_named(resolve, name), resolve, names)
 }
 
-/// Plan for the first param of `func_name` in the fixture WIT — the
-/// shape `plan_for(&func_named(r, name).params[0].ty, r, names)` shows
-/// up everywhere because the fixture funcs are written as
-/// `f-X(p: ty)`, with `p` carrying the type under test.
+/// Plan for the first param of `func_name` in the fixture WIT.
 fn plan_for_param(func_name: &str, resolve: &Resolve, names: &mut NameInterner) -> LiftPlan {
     plan_for(&func_named(resolve, func_name).params[0].ty, resolve, names)
 }
 
-/// Pin a plan's full shape — cells, root, flat-slot count — in one
-/// call. `#[track_caller]` makes the assertion failure point at the
-/// test, not this helper.
+/// Pin a plan's full shape (cells, root, flat-slot count) in one call.
 #[track_caller]
 fn assert_plan(plan: &LiftPlan, cells: Vec<Cell>, root: u32, slot_count: u32) {
     assert_eq!(plan.cells, cells);
@@ -222,17 +206,14 @@ fn assert_plan(plan: &LiftPlan, cells: Vec<Cell>, root: u32, slot_count: u32) {
     assert_eq!(plan.flat_slot_count, slot_count);
 }
 
-/// Like [`assert_plan`] for the handful of tests that don't pin
-/// `root` (because the cell layout already determines it implicitly).
+/// `assert_plan` minus `root` for tests where cell layout already pins it.
 #[track_caller]
 fn assert_plan_no_root(plan: &LiftPlan, cells: Vec<Cell>, slot_count: u32) {
     assert_eq!(plan.cells, cells);
     assert_eq!(plan.flat_slot_count, slot_count);
 }
 
-/// `Cell::Flags` shorthand for fixtures. Interns `type_name` and
-/// each item name; mirrors plan-build's interning so [`BlobSlice`]s
-/// match by-value regardless of which side ran first.
+/// `Cell::Flags` shorthand. Interns through `names` so BlobSlices match.
 fn flags_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, items: &[&str]) -> Cell {
     let type_name = names.intern(type_name);
     let flag_names = items.iter().map(|n| names.intern(n)).collect();
@@ -243,9 +224,7 @@ fn flags_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, items: 
     }
 }
 
-/// `Cell::EnumCase` shorthand for fixtures. Same shape as
-/// [`flags_cell`] — interns through `names` so fixture and plan
-/// converge on the same [`BlobSlice`]s.
+/// `Cell::EnumCase` shorthand. Same shape as `flags_cell`.
 fn enum_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, cases: &[&str]) -> Cell {
     let type_name = names.intern(type_name);
     let case_names = cases.iter().map(|n| names.intern(n)).collect();
@@ -256,8 +235,7 @@ fn enum_cell(names: &mut NameInterner, flat_slot: u32, type_name: &str, cases: &
     }
 }
 
-/// `Cell::Variant` shorthand for fixtures. Like [`enum_cell`] but
-/// also carries the disc slot and per-case payload child indices.
+/// `Cell::Variant` shorthand. Carries disc slot + per-case payloads.
 fn variant_cell(
     names: &mut NameInterner,
     disc_slot: u32,
@@ -275,10 +253,7 @@ fn variant_cell(
     }
 }
 
-/// `Cell::RecordOf` shorthand for fixtures. Interns `type_name` and
-/// each field name into `names`; pass the same interner that built
-/// the actual plan and the dedup keeps the [`BlobSlice`]s aligned
-/// regardless of which side ran first.
+/// `Cell::RecordOf` shorthand. Pass the same interner used for the plan.
 fn record_of(names: &mut NameInterner, type_name: &str, fields: &[(&str, u32)]) -> Cell {
     let type_name = names.intern(type_name);
     let fields = fields.iter().map(|(n, i)| (names.intern(n), *i)).collect();
@@ -303,10 +278,8 @@ fn make_param(ty: &Type, resolve: &Resolve, names: &mut NameInterner) -> ParamLi
     }
 }
 
-/// Build a [`FuncClassified`] whose params are the WIT-named types
-/// in `param_names`. Plans are plan-relative — no cumulative cursor
-/// to thread. Other fields are dummies — the side-table builders
-/// only read `params` / `result_lift`.
+/// Build a `FuncClassified` with the given WIT param types; other
+/// fields are dummies (side-table builders only read params/result).
 fn func_with_params(
     resolve: &Resolve,
     names: &mut NameInterner,
@@ -405,14 +378,9 @@ fn synth_info_layout(record_name: &str) -> RecordLayout {
     RecordLayout::for_record_typedef(&sizes, &resolve, record_id)
 }
 
-/// Wasm `ValType` per flat slot — sourced from the canonical-ABI
-/// `flat_types(plan.source_ty)`, the same computation canon-lower runs
-/// to produce the wrapper's flat-param signature. Joined-flat widening
-/// (from `result` / `variant` arms) falls out naturally — `flat_types`
-/// returns the joined types for those slots. Pinning the test's
-/// declared params to this single source means a drift between
-/// emit_cell_op and the cell's expected wasm type surfaces as a
-/// validation error rather than two-wrongs-cancel.
+/// Wasm `ValType` per flat slot from canonical-ABI `flat_types` —
+/// pinning the test's declared params to this single source surfaces
+/// emit_cell_op/expected drift as a validation error.
 fn plan_param_types(plan: &LiftPlan, resolve: &Resolve) -> Vec<ValType> {
     use super::super::super::abi::emit::wasm_type_to_val;
     use super::super::super::abi::flat_types;
@@ -423,31 +391,19 @@ fn plan_param_types(plan: &LiftPlan, resolve: &Resolve) -> Vec<ValType> {
         .collect()
 }
 
-/// Synthesize the [`CellSideData`] sequence a real layout phase
-/// would attach to `plan.cells` — record/tuple/flags entries get
-/// stub addresses (just need to be in-memory for wasm validation);
-/// runtime value-correctness is the canned-shape harness's job.
-/// Outer plan only, mirroring [`super::sidetable::fold_cell_side_data`].
+/// Synthesize `CellSideData` with stub addresses; runtime value
+/// correctness is the canned-shape harness's job.
 fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
-    /// Bytes per child-index in `tuple-indices` (canonical-ABI u32).
     const U32_BYTES: u32 = 4;
-    /// Mid-page cursor for the synth flags-scratch buffer — anywhere
-    /// in linear memory works; sitting away from page 0 keeps stub
-    /// addresses clearly distinct from null.
+    /// Mid-page so stub addresses don't alias null.
     const FLAGS_SCRATCH_BASE: u32 = 0x1000;
-    /// Stride between stub flag-name `(off, len)` slices.
     const STUB_FLAG_NAME_STRIDE: u32 = 16;
-    /// Stub flag-name length (any non-zero u32 works).
     const STUB_FLAG_NAME_LEN: u32 = 4;
 
-    /// Mid-page cursor for the synth record-tuples buffer — anywhere
-    /// in linear memory works.
     const RECORD_TUPLES_BASE: u32 = 0x4000;
-    /// Stub tuples-slot stride — each record's `(name, idx)` slot is
-    /// `STRING_FLAT_BYTES + 4` bytes wide; rounding up to 16 is fine
-    /// for the validator (it only checks address shape, not contents).
+    /// Each record slot is `STRING_FLAT_BYTES + 4`; 16 covers it for
+    /// the validator (which only checks address shape).
     const RECORD_TUPLES_STRIDE: u32 = 16;
-    /// Stub type-name length for record fills.
     const STUB_RECORD_NAME_LEN: u32 = 4;
 
     let mut record_idx: u32 = 0;
@@ -569,11 +525,8 @@ fn auto_cell_side_data(plan: &LiftPlan) -> Vec<CellSideData> {
         .collect()
 }
 
-/// Round-trip a plan through `emit_lift_plan` and validate the
-/// resulting wasm module. Allocates per-list emit locals via the
-/// production helper and imports a stub `cabi_realloc` so the
-/// validator can resolve the calls the list-of arm emits. The
-/// function is never invoked, only validated.
+/// Run `emit_lift_plan` and validate the wasm. Imports a stub
+/// `cabi_realloc` so list-of arm calls resolve; never invokes.
 fn validate_emit_lift_plan(plan: &LiftPlan, resolve: &Resolve) {
     use super::super::super::indices::LocalsBuilder;
     use crate::adapter::indices::FrozenLocals;
@@ -1272,8 +1225,7 @@ fn list_of_tuple_u32_string_element_plan_shape() {
     assert_eq!(element_plan.root(), 2);
 }
 
-/// Pull the element_plan out of a top-level `Cell::ListOf`. Helper
-/// for the `walk_element_plan` lockstep tests below.
+/// Pull the element_plan out of a top-level `Cell::ListOf`.
 fn list_element_plan(plan: &LiftPlan, cell_idx: usize) -> &LiftPlan {
     match &plan.cells[cell_idx] {
         Cell::ListOf { element_plan, .. } => element_plan,
@@ -1732,11 +1684,9 @@ fn list_inside_nested_arms_stacks_guards_outer_to_inner() {
     );
 }
 
-/// Walk `plan` from the root and assert each `Cell::ListOf` carries
-/// exactly one [`ArmGuard`] per `Result` / `Variant` ancestor on the
-/// path (option / record / tuple don't count — their slots aren't
-/// joined). Pins the joined-arm rule documented on [`Cell`]:
-/// side-effecting cells must disc-gate when nested in joined arms.
+/// Assert each `Cell::ListOf` carries exactly one `ArmGuard` per
+/// `Result` / `Variant` ancestor (option/record/tuple don't count —
+/// their slots aren't joined). Pins the joined-arm rule.
 fn assert_arm_guards_match_joined_ancestry(plan: &LiftPlan) {
     fn walk(plan: &LiftPlan, idx: u32, depth: usize) {
         match &plan.cells[idx as usize] {

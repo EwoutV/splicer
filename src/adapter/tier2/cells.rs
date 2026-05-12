@@ -1,40 +1,8 @@
-//! Cell-construction helpers for tier-2's lifted-value representation.
-//!
-//! Each primitive WIT type maps to one `cell` variant case (see
-//! [`splicer:common/types`](../../../wit/common/world.wit) — the
-//! `variant cell { ... }` declaration). This module emits the
-//! canonical-ABI wasm that writes a single cell into linear memory at
-//! a caller-supplied address.
-//!
-//! ## Memory layout (canonical ABI, computed by `wit-parser::SizeAlign`)
-//!
-//! A `cell` is a variant with 18 cases. The discriminant fits in a
-//! `u8` (≤256 cases). Variant alignment = max alignment of all
-//! payloads — `integer(s64)` forces alignment 8. Total cell size is
-//! 8 (disc + padding) + max-payload-size (padded to 8).
-//!
-//! Every nominal-typed case (record-of, variant-case, handle, etc.)
-//! is a `u32` index into a per-kind side table on `field-tree`, not
-//! an inline payload. This caps the variant's max payload at 8 bytes
-//! (`s64`), so `CELL_SIZE = 8 + 8 = 16` bytes. See
-//! `docs/tiers/tier-2.md` for the design rationale (memory savings
-//! of ~50% on primitive-dominated trees vs. an inline-metadata
-//! layout). If a future cell case widens the max payload past 8
-//! bytes, [`CELL_SIZE`] must update.
-//!
-//! ## Discriminant ordering
-//!
-//! The numeric discriminants below MUST stay in lockstep with the
-//! `variant cell { ... }` declaration in `wit/common/world.wit`.
-//! A test in [`tests`] pins this by re-decoding the published WIT
-//! and asserting the case ordering matches.
-//!
-//! ## Future optimization
-//!
-//! This file emits cells one-at-a-time into a `cabi_realloc`-grown
-//! buffer for simplicity (see `docs/tiers/tier-2.md`). A two-pass
-//! mode (pre-count + bulk-allocate) would avoid per-cell realloc
-//! traffic; defer until benchmarks show it matters.
+//! Cell-construction helpers: emit canonical-ABI wasm that writes one
+//! `cell` variant case (per `splicer:common/types`) into linear memory
+//! at a caller-supplied address. Discriminant numbering must match the
+//! `variant cell` declaration in `wit/common/world.wit` — pinned by
+//! `cell_discriminants_match_wit_declaration_order` in [`tests`].
 
 use std::collections::HashMap;
 
@@ -43,11 +11,8 @@ use wit_parser::{Resolve, SizeAlign, Type, TypeId};
 
 use super::super::abi::emit::{I8_STORE_LOG2_ALIGN, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET};
 
-/// `cell` variant case names that the codegen knows how to emit, in
-/// the order they appear in `wit/common/world.wit`. Used by
-/// [`CellLayout::from_resolve`] to validate the WIT and the codegen
-/// agree on the case set — a removal or rename in the WIT fires
-/// loudly here rather than producing wasm that lies about disc values.
+/// `cell` variant case names in WIT-declaration order. Validates the
+/// WIT and codegen agree on the case set.
 const EXPECTED_CELL_CASES: &[&str] = &[
     "bool",
     "integer",
@@ -70,12 +35,9 @@ const EXPECTED_CELL_CASES: &[&str] = &[
     "error-context-handle",
 ];
 
-/// Schema-derived layout of the `cell` variant: total size,
-/// alignment, the byte offset where each case's payload starts
-/// (variants put all payloads at the same offset), and a map from WIT
-/// case name to discriminant value. All emit helpers hang off this
-/// struct so the canonical-ABI numbers — including the discriminant
-/// ordering — are read from the live WIT once and never duplicated.
+/// Schema-derived layout of the `cell` variant. Emit helpers hang off
+/// this so canonical-ABI numbers (including disc ordering) are read
+/// from the live WIT once and never duplicated.
 pub(crate) struct CellLayout {
     pub size: u32,
     pub align: u32,
@@ -84,8 +46,7 @@ pub(crate) struct CellLayout {
 }
 
 impl CellLayout {
-    /// Compute the layout from `splicer:common/types.cell`. `cell_id`
-    /// must point at the variant typedef.
+    /// Compute layout from `splicer:common/types.cell`.
     pub(crate) fn from_resolve(sizes: &SizeAlign, resolve: &Resolve, cell_id: TypeId) -> Self {
         use wit_parser::TypeDefKind;
         let typedef = &resolve.types[cell_id];
@@ -131,11 +92,9 @@ impl CellLayout {
         }
     }
 
-    /// Look up the discriminant value for a `cell` case by its WIT
-    /// case name (kebab-case, exactly as declared in
-    /// `wit/common/world.wit`). Panics if `name` isn't a case;
-    /// `from_resolve` validates the WIT against `EXPECTED_CELL_CASES`,
-    /// so reaching the panic implies an emit-side typo.
+    /// Discriminant value for a `cell` case by kebab-case name.
+    /// Panics on unknown name (implies an emit-side typo —
+    /// `from_resolve` validates WIT against `EXPECTED_CELL_CASES`).
     fn disc_of(&self, name: &str) -> u8 {
         *self
             .discs
@@ -146,27 +105,13 @@ impl CellLayout {
 
 // ─── Primitive cell-emit helpers ──────────────────────────────────
 //
-// Each `emit_<kind>_cell` helper writes one cell into linear memory
-// at the address held in `addr_local`, with case-specific payload
-// values supplied in additional locals. After the helper returns,
-// the cell has been written; the wasm value stack is unchanged.
-//
-// Helpers are one-liners over [`emit_cell`], which factors the
-// disc-write + per-part payload-write loop. Each helper's only job
-// is to declare its discriminant + a slice of [`PayloadPart`]s
-// describing where each value goes inside the payload area.
-//
-// All locals must be allocated by the caller; helpers don't allocate.
-// Callers also own cell-cursor advancement (incrementing the
-// cells-array count + recomputing the next cell's address).
-//
-// Canonical-ABI doesn't require padding bytes between disc and
-// payload (or unused payload bytes for narrow cases like `bool`)
-// to be zeroed — readers gate on the discriminant.
+// Each `emit_<kind>_cell` writes one cell at `addr_local`. Helpers
+// are one-liners over `emit_cell` (disc-write + per-part payload-
+// write loop). Callers own locals + cell-cursor advancement.
+// Canonical-ABI doesn't require padding / unused payload bytes to be
+// zeroed — readers gate on the discriminant.
 
-/// Width of a single payload-part store. Each variant maps to
-/// exactly one `wasm-encoder` store instruction; `natural_align`
-/// returns the log2 alignment that store implicitly requires.
+/// Width of a single payload-part store; one wasm-encoder store insn.
 #[derive(Clone, Copy)]
 enum StoreKind {
     /// `i32.store8` — 1 byte.
@@ -180,8 +125,7 @@ enum StoreKind {
 }
 
 impl StoreKind {
-    /// Log2 alignment that the store requires. `MemArg::align` is in
-    /// log2 form (so `2` means 4-byte alignment).
+    /// Log2 alignment (so `2` means 4-byte).
     fn natural_align(self) -> u32 {
         match self {
             StoreKind::I8 => 0,
@@ -191,47 +135,29 @@ impl StoreKind {
     }
 }
 
-/// Where one payload word's value comes from.
-///
-/// Most cells source from a wasm local holding the runtime-lifted
-/// value (`Local`). A few cells — notably `record-of`, where the
-/// side-table index is computed at adapter-build time — source from
-/// an `i32.const` (`ConstI32`); pre-materializing the constant into
-/// a wasm local first would just be wasted instructions.
-///
-/// Public to the adapter crate so list-element emit can pass a
-/// runtime-staged local (option/result child indices computed as
-/// `elem_cell_base + relative_idx` per iteration) through the same
-/// helper that static cells call with `ConstI32`.
+/// Where one payload word's value comes from. `Local` for runtime-
+/// lifted values; `ConstI32` for build-time-known indices (record-of,
+/// static option/result child idx) — list-element emit reuses `Local`
+/// for the per-iteration `elem_cell_base + relative_idx`.
 #[derive(Clone, Copy)]
 pub(crate) enum PayloadSource {
     Local(u32),
     ConstI32(i32),
 }
 
-/// One value to write into a cell's payload area.
-///
-/// Callers describe each cell as a list of these — the loop in
-/// [`emit_cell`] does the rest. `offset` is relative to the start of
-/// the payload area (i.e. the actual store happens at
-/// `addr + PAYLOAD_OFFSET + offset`).
+/// One value to write into a cell's payload area. `offset` is
+/// relative to the payload-area start.
 #[derive(Clone, Copy)]
 struct PayloadPart {
-    /// Source for the value being stored. Must already match the
-    /// type `kind` expects — caller is responsible for any narrowing
-    /// or extension before reaching here.
     source: PayloadSource,
     kind: StoreKind,
-    /// Byte offset within the payload area.
     offset: u32,
 }
 
 impl CellLayout {
-    /// Emit wasm that writes one cell at `addr_local`: a 1-byte
-    /// discriminant at offset 0 followed by each `parts[i]` written
-    /// into the payload area at its declared sub-offset.
+    /// Emit wasm that writes one cell at `addr_local`: 1-byte disc at
+    /// offset 0 + each `parts[i]` at its payload sub-offset.
     fn emit_cell(&self, f: &mut Function, addr_local: u32, disc: u8, parts: &[PayloadPart]) {
-        // Discriminant byte at offset 0.
         f.instructions().local_get(addr_local);
         f.instructions().i32_const(disc as i32);
         f.instructions().i32_store8(MemArg {
@@ -239,7 +165,6 @@ impl CellLayout {
             align: 0,
             memory_index: 0,
         });
-        // Payload parts.
         for part in parts {
             f.instructions().local_get(addr_local);
             match part.source {
@@ -264,9 +189,7 @@ impl CellLayout {
         }
     }
 
-    /// Emit a single-payload primitive cell — body is identical
-    /// across `bool` / `integer` / `floating`, only the case name and
-    /// store width differ.
+    /// Single-payload primitive cell (bool / integer / floating).
     fn emit_single_payload(
         &self,
         f: &mut Function,
@@ -287,24 +210,22 @@ impl CellLayout {
         );
     }
 
-    /// `cell::bool(bool)` — `payload_local` is the i32 flat form (0 or 1).
+    /// `cell::bool(bool)` — payload is i32 flat form (0 or 1).
     pub(crate) fn emit_bool(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
         self.emit_single_payload(f, addr_local, "bool", StoreKind::I8, payload_local);
     }
 
-    /// `cell::integer(s64)` — `payload_local` is i64, already widened
-    /// from any narrower integer.
+    /// `cell::integer(s64)` — caller has widened narrower integers.
     pub(crate) fn emit_integer(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
         self.emit_single_payload(f, addr_local, "integer", StoreKind::I64, payload_local);
     }
 
-    /// `cell::floating(f64)` — `payload_local` is f64, already
-    /// promoted from f32 if necessary.
+    /// `cell::floating(f64)` — caller has promoted f32.
     pub(crate) fn emit_floating(&self, f: &mut Function, addr_local: u32, payload_local: u32) {
         self.emit_single_payload(f, addr_local, "floating", StoreKind::F64, payload_local);
     }
 
-    /// `cell::text(string)` — `(ptr, len)` pair pointing at utf-8.
+    /// `cell::text(string)` — `(ptr, len)` of utf-8.
     pub(crate) fn emit_text(
         &self,
         f: &mut Function,
@@ -337,20 +258,10 @@ impl CellLayout {
     }
 
     // ─── Compound / structural cell emitters ───────────────────────
-    //
-    // One helper per non-primitive `cell` variant, in WIT-declaration
-    // order. Keeping the contract on `CellLayout` (rather than in the
-    // lift codegen) documents the lowest-level shape: "to lift a
-    // record, call `cell_layout.emit_record_of(addr, side_table_idx)`".
 
-    /// `cell::text` for a `char` source. UTF-8 encodes the i32 code
-    /// point into the scratch buffer pointed at by `scratch_addr_local`
-    /// (1–4 bytes), sets `len_local` to the byte count, then writes
-    /// `cell::text(scratch, len)` at `addr_local`. The caller stages
-    /// the scratch base into `scratch_addr_local`: a 4-byte slab
-    /// reserved at adapter-build time for top-level char cells, or
-    /// a per-iteration offset into a `cabi_realloc`'d list buffer for
-    /// `Cell::Char` element cells.
+    /// `cell::text` for a `char` source. UTF-8 encodes the code point
+    /// into the scratch buffer at `scratch_addr_local` (1–4 bytes),
+    /// sets `len_local`, then writes `cell::text(scratch, len)`.
     pub(crate) fn emit_char(
         &self,
         f: &mut Function,
@@ -360,7 +271,6 @@ impl CellLayout {
         len_local: u32,
     ) {
         emit_utf8_encode(f, code_point_local, scratch_addr_local, len_local);
-        // cell::text payload: (ptr=scratch_addr_local, len=len_local).
         self.emit_cell(
             f,
             addr_local,
@@ -380,8 +290,7 @@ impl CellLayout {
         );
     }
 
-    /// `cell::list-of(list<u32>)` — `(ptr, len)` of a runtime
-    /// child-cell-index array.
+    /// `cell::list-of(list<u32>)` — `(ptr, len)` of a runtime child-idx array.
     pub(crate) fn emit_list_of(
         &self,
         f: &mut Function,
@@ -397,12 +306,8 @@ impl CellLayout {
         );
     }
 
-    /// `cell::tuple-of(list<u32>)` — payload `(ptr, len)` of a
-    /// child-index array. `indices_off_source` is `ConstI32` for
-    /// static cells (build-time-known offset into the `tuple-indices`
-    /// segment) and `Local` for list-element cells (per-iteration
-    /// slot ptr in a `cabi_realloc`'d buffer). `indices_len` is
-    /// always build-time-known per type.
+    /// `cell::tuple-of(list<u32>)` — `(ptr, len)` of a child-idx array.
+    /// `indices_off_source`: `ConstI32` (static) or `Local` (list-element).
     pub(crate) fn emit_tuple_of(
         &self,
         f: &mut Function,
@@ -430,9 +335,6 @@ impl CellLayout {
     }
 
     /// `cell::option-some(u32)` — inner cell-array index.
-    /// `inner_idx_source` is `ConstI32` for static cells (the cell
-    /// idx is build-time-known) and `Local` for list-element cells
-    /// (per-iteration runtime idx = `elem_cell_base + relative_idx`).
     pub(crate) fn emit_option_some(
         &self,
         f: &mut Function,
@@ -456,9 +358,8 @@ impl CellLayout {
         self.emit_cell(f, addr_local, self.disc_of("option-none"), &[]);
     }
 
-    /// `cell::result-ok(option<u32>)`. `inner_idx_source` follows the
-    /// same `ConstI32` (static) vs `Local` (list-element) split as
-    /// [`Self::emit_option_some`]; ignored when `has_payload` is false.
+    /// `cell::result-ok(option<u32>)`. `inner_idx_source` ignored when
+    /// `has_payload` is false.
     pub(crate) fn emit_result_ok(
         &self,
         f: &mut Function,
@@ -469,7 +370,7 @@ impl CellLayout {
         self.emit_result_arm(f, addr_local, "result-ok", has_payload, inner_idx_source);
     }
 
-    /// `cell::result-err(option<u32>)`. See [`Self::emit_result_ok`].
+    /// `cell::result-err(option<u32>)`.
     pub(crate) fn emit_result_err(
         &self,
         f: &mut Function,
@@ -480,11 +381,8 @@ impl CellLayout {
         self.emit_result_arm(f, addr_local, "result-err", has_payload, inner_idx_source);
     }
 
-    /// Shared body for both result arms: cell disc + an inline
-    /// `option<u32>` in the cell payload (option-disc at +0, inner
-    /// idx at +4 when has_payload). Skipping the +4 store on `none`
-    /// matches `emit_option_none`'s "disc only" pattern; readers gate
-    /// on the option-disc.
+    /// Shared body for both result arms: cell disc + inline
+    /// `option<u32>` (option-disc at +0, inner idx at +4 when payload).
     fn emit_result_arm(
         &self,
         f: &mut Function,
@@ -509,9 +407,6 @@ impl CellLayout {
     }
 
     /// `cell::record-of(u32)` — index into `field-tree.record-infos`.
-    /// `payload` is `ConstI32(idx)` for static cells (build-time idx)
-    /// or `Local(local)` for list-element cells (runtime-staged idx
-    /// off `list_elem_record_base`).
     pub(crate) fn emit_record_of(&self, f: &mut Function, addr_local: u32, payload: PayloadSource) {
         self.emit_cell(
             f,
@@ -526,9 +421,6 @@ impl CellLayout {
     }
 
     /// `cell::flags-set(u32)` — index into `field-tree.flags-infos`.
-    /// `payload` is `ConstI32(idx)` for static cells (build-time idx)
-    /// or `Local(local)` for list-element cells (runtime-staged idx
-    /// off `list_elem_flags_base`).
     pub(crate) fn emit_flags_set(&self, f: &mut Function, addr_local: u32, payload: PayloadSource) {
         self.emit_cell(
             f,
@@ -543,10 +435,8 @@ impl CellLayout {
     }
 
     /// `cell::enum-case(u32)` — index into `field-tree.enum-infos`.
-    /// Caller passes a local holding the side-table index (the runtime
-    /// disc value, since enum-info entries are laid out per-case in
-    /// disc order); we write disc 13 at offset 0 and the i32 index at
-    /// the payload offset.
+    /// Enum-info entries are laid out per-case in disc order, so the
+    /// side-table index equals the runtime disc.
     pub(crate) fn emit_enum_case(&self, f: &mut Function, addr_local: u32, side_table_idx: u32) {
         self.emit_cell(
             f,
@@ -561,11 +451,7 @@ impl CellLayout {
     }
 
     /// `cell::variant-case(u32)` — index into `field-tree.variant-infos`.
-    /// `payload` is `ConstI32(idx)` for static cells (build-time idx)
-    /// or `Local(local)` for list-element cells (runtime-staged idx
-    /// off `list_elem_variant_base`). The pointed-at entry's
-    /// `case-name` and `payload` are patched at runtime by the
-    /// dispatch emitted alongside this.
+    /// The entry's `case-name` + `payload` are patched at runtime.
     pub(crate) fn emit_variant_case(
         &self,
         f: &mut Function,
@@ -585,12 +471,8 @@ impl CellLayout {
     }
 
     /// `cell::{resource,stream,future,error-context}-handle(u32)` —
-    /// index into `field-tree.handle-infos`. `disc_case` picks which
-    /// cell-disc to emit. `side_table_idx_source` is `ConstI32` for
-    /// static cells (build-time-known idx) and `Local` for
-    /// list-element cells (per-iteration runtime idx). The pointed-at
-    /// entry's `id` (and possibly `type-name`) is filled alongside
-    /// this by the wrapper.
+    /// index into `field-tree.handle-infos`. The entry's `id` (and
+    /// possibly `type-name`) is filled by the wrapper.
     pub(crate) fn emit_handle_cell(
         &self,
         f: &mut Function,
@@ -611,8 +493,7 @@ impl CellLayout {
     }
 }
 
-/// Shared `(ptr, len)` payload layout used by `text` and `bytes`
-/// (and, later, by any cell carrying a flat `list<T>` reference).
+/// Shared `(ptr, len)` payload layout for `text` / `bytes` / `list-of`.
 fn ptr_len_parts(ptr_local: u32, len_local: u32) -> [PayloadPart; 2] {
     [
         PayloadPart {
@@ -628,14 +509,9 @@ fn ptr_len_parts(ptr_local: u32, len_local: u32) -> [PayloadPart; 2] {
     ]
 }
 
-/// At runtime, look at the code point in `code_point_local` and
-/// write its 1–4 UTF-8 bytes to the scratch buffer whose base address
-/// lives in `scratch_addr_local`, storing the byte count in
-/// `len_local`. Four branches by code-point range pick the right
-/// sequence length + bit pattern. Caller reserves 4 bytes of scratch
-/// (max sequence length); reading the base from a local lets static
-/// per-cell scratch and per-iteration list-element scratch share one
-/// codegen path.
+/// UTF-8 encode the code point at `code_point_local` into the
+/// scratch buffer based at `scratch_addr_local`, storing the 1–4 byte
+/// length in `len_local`. Caller reserves 4 bytes of scratch.
 fn emit_utf8_encode(
     f: &mut Function,
     code_point_local: u32,
@@ -776,18 +652,9 @@ mod tests {
         ValType,
     };
 
-    /// Build a minimal wasm module containing one function whose body
-    /// is whatever `emit_body` emits. Validates the produced bytes
-    /// round-trip through wasmparser.
-    ///
-    /// `param_types` are the function's params (also become locals
-    /// 0..n at the start of the function body — caller passes the
-    /// matching local indices into the cell-emit helper).
-    ///
-    /// This is a structural smoke test — it confirms our emit doesn't
-    /// produce ill-formed bytecode (alignments, store sizes, local
-    /// indices in range). End-to-end "did the right value land in
-    /// memory" coverage comes via the runtime fuzz harness.
+    /// Build a minimal wasm module with one function body from
+    /// `emit_body` and round-trip it through wasmparser. Structural
+    /// smoke test only — runtime correctness is the fuzz harness's job.
     fn build_and_validate(param_types: &[ValType], emit_body: impl FnOnce(&mut Function)) {
         let mut module = Module::new();
 
@@ -826,12 +693,8 @@ mod tests {
             .expect("emitted module should validate");
     }
 
-    /// Synthetic `CellLayout` matching today's `cell` variant
-    /// (size=16, align=8, payload_offset=8). The structural fuzz
-    /// tests don't have a `Resolve` to derive from, so they pin the
-    /// expected canonical-ABI numbers here. End-to-end "did the
-    /// right value land in memory" coverage runs against the live
-    /// schema-derived layout via `test_tier2_canned_primitives`.
+    /// Synthetic `CellLayout` (size=16, align=8, payload_offset=8)
+    /// for structural tests that lack a `Resolve`.
     fn synth_cell_layout() -> CellLayout {
         CellLayout {
             size: 16,
@@ -1026,27 +889,15 @@ mod tests {
         });
     }
 
-    /// Structural fuzz over the primitive cell-emit helpers — for each
-    /// random seed, pick a primitive at random, build a module that
-    /// emits that cell, validate the bytecode. Catches regressions in
-    /// alignment / store-size / local-index handling that single-shot
-    /// unit tests might miss.
-    ///
-    /// Bounded iteration count keeps it fast under default `cargo
-    /// test`. End-to-end "did the right value land in memory"
-    /// coverage is the job of the e2e tier-2 fuzz harness (task #29),
-    /// which runs the wasm under wasmtime.
+    /// Structural fuzz over primitive cell-emit helpers — picks a
+    /// helper at random per iteration and validates the bytecode.
     #[test]
     fn primitive_cells_structural_fuzz() {
-        // Deterministic seed-derived bytes — re-seeded if a regression
-        // bisects to a specific shape, run against a fresh seed.
         let seed: u64 = std::env::var("SPLICER_TIER2_FUZZ_SEED")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0xC0FF_EE00_DEAD_BEEF);
 
-        // 5 primitive kinds × 100 iterations of random alignment of
-        // helper choice. Cheap (each iter builds a tiny module).
         let cl = synth_cell_layout();
         for iter in 0..100u64 {
             let mixed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(iter);
@@ -1071,11 +922,8 @@ mod tests {
 
     #[test]
     fn cell_discriminants_match_wit_declaration_order() {
-        // Pin the discriminant numbering against the WIT cases listed
-        // in `wit/common/world.wit`. Built by loading the live WIT
-        // through `CellLayout::from_resolve`, so a reorder, rename, or
-        // removal in the WIT fires here before lift codegen miscompiles
-        // values into wrong cell cases.
+        // Pin disc numbering against live WIT so a reorder/rename/remove
+        // fires here before lift codegen miscompiles to a wrong case.
         let common_wit = include_str!("../../../wit/common/world.wit");
         let mut resolve = Resolve::new();
         resolve

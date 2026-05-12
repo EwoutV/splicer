@@ -1,20 +1,7 @@
-//! Flags-info layout. One entry per `Cell::Flags` appearance.
-//! Entries live in a per-(fn, param | result) buffer the wrapper
-//! allocates per call via `cabi_realloc`; the emitter writes the
-//! build-time-const `type-name` + `set-flags.ptr` and the
-//! runtime-bit-walked `set-flags.len` into each slot.
-//! `field_tree.flags_infos` is patched at runtime to point at the
-//! buffer.
-//!
-//! `set-flags.ptr` points at a per-cell scratch slab the bit-walker
-//! fills with `(name_ptr, name_len)` pairs each call. The slab is
-//! build-time-static for non-list-element flags (today); list-element
-//! flags will add a per-iteration scratch alongside the indices buffer
-//! when `Cell::Flags` is opened in `list_element_class`.
-//!
-//! Per-call (vs. baked-in-static) is forced by `list<flags>`: the
-//! count is len-dependent and `field_tree.flags_infos` must span all
-//! entries contiguously.
+//! Flags-info layout. One entry per `Cell::Flags`. Per-call buffer
+//! holds `type-name` + `set-flags.ptr` (const) + `set-flags.len`
+//! (runtime bit-walk). `set-flags.ptr` points at a per-cell scratch
+//! slab (static for outer cells; per-iter for list-element flags).
 
 use super::super::super::super::abi::emit::{BlobSlice, STRING_FLAT_BYTES};
 use super::super::super::FuncClassified;
@@ -22,67 +9,36 @@ use super::super::classify::ResultSource;
 use super::super::plan::{Cell, LiftPlan};
 use super::PerCellIndices;
 
-/// Where a `Cell::Flags`'s slot lives in the per-(fn, param | result)
-/// flags-info buffer, plus where its set-flags scratch slot is.
-/// Static cells use the build-time-const slab address; list-element
-/// cells stripe both the entry idx and the scratch ptr off per-iter
-/// bases.
+/// Where a `Cell::Flags`'s slot + scratch live.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FlagsSlotSource {
-    /// Outer-plan flags: entry idx is build-time-const; the scratch
-    /// slab is reserved at layout time at `scratch_addr`.
+    /// Outer-plan: build-time entry idx + reserved scratch_addr.
     Static { entry_idx: u32, scratch_addr: i32 },
-    /// List-element flags: entry idx is `list_elem_flags_base +
-    /// entry_offset_in_elem`; scratch is `list.flags_scratch_base +
-    /// j * flags_scratch_bytes_per_elem + scratch_offset_in_elem`.
-    /// Both `*_offset_in_elem`s are build-time-known (the cell's
-    /// position among the element-plan's flags cells); the runtime
-    /// locals are staged by the list-of-arm.
+    /// List-element: entry idx = `list_elem_flags_base + entry_offset_in_elem`;
+    /// scratch = `flags_scratch_base + j*stride + scratch_offset_in_elem`.
     PerIteration {
         entry_offset_in_elem: u32,
         scratch_offset_in_elem: u32,
     },
 }
 
-/// Per-(plan-cell) emit-phase data for one `Cell::Flags`. The
-/// wrapper writes `type-name` + `set-flags.ptr` + `set-flags.len`
-/// (the first two build-time-const for static cells / runtime-staged
-/// for list-element cells; `len` always runtime from the bit-walk)
-/// into the buffer slot resolved from `slot_source`. Cell payload
-/// is `cell::flags-set(idx)`.
 #[derive(Clone, Debug)]
 pub(crate) struct FlagsRuntimeFill {
-    /// Slot location + scratch source. See [`FlagsSlotSource`].
     pub slot_source: FlagsSlotSource,
-    /// `(off, len)` of the type-name into the shared name blob.
     pub type_name: BlobSlice,
-    /// Each flag's interned `(off, len)`, in bit-position order.
+    /// Flag names in bit-position order.
     pub flag_names: Vec<BlobSlice>,
 }
 
-/// Output of the per-cell walk over every `Cell::Flags` appearance.
-/// Mirrors [`super::handle_info::HandleInfoMaps`] — the buffer is
-/// per-call so there's no segment to lay out, just per-(fn, param |
-/// result) entry counts + per-cell fills.
 pub(crate) struct FlagsInfoMaps {
-    /// Per-cell fills for plan walks (param + compound result).
     pub per_cell_fill: PerCellIndices<FlagsRuntimeFill>,
-    /// Per-fn fill for a Direct (sync flat) `Cell::Flags` result.
     pub per_result_single_fill: Vec<Option<FlagsRuntimeFill>>,
-    /// Number of flags entries per (fn, param). Drives the per-call
-    /// buffer size + the static `field_tree.flags_infos.len` bake.
     pub per_param_count: Vec<Vec<u32>>,
-    /// Number of flags entries in each fn's result buffer (compound
-    /// or single-cell direct).
     pub per_result_count: Vec<u32>,
 }
 
-/// Walk every (fn, param | compound-result | direct-flags-result) to
-/// collect per-cell `FlagsRuntimeFill`s + per-(fn, param | result)
-/// entry counts. Caller supplies `scratch_addrs`, one pre-reserved
-/// address per `Cell::Flags` in the order this fn consumes them
-/// (matches [`flags_scratch_sizes`]). No segment is built — entries
-/// are written into a per-call `cabi_realloc`'d buffer at emit time.
+/// Collect per-cell `FlagsRuntimeFill`s + entry counts. `scratch_addrs`
+/// holds pre-reserved scratch addrs in `flags_scratch_sizes` order.
 pub(crate) fn build_flags_info_maps(
     per_func: &[FuncClassified],
     scratch_addrs: &mut impl Iterator<Item = u32>,
@@ -141,9 +97,8 @@ pub(crate) fn build_flags_info_maps(
 
 /// Walk one plan's outer cells, allocating range-relative
 /// `Static { entry_idx, scratch_addr }` per `Cell::Flags` and pulling
-/// type-name + flag-names off the cell. List-element flags use
-/// `PerIteration` (assigned by [`super::super::emit::walk_element_plan`])
-/// and don't participate in this static count.
+/// Walk outer cells, allocating Static(idx) per `Cell::Flags`.
+/// List-element flags are set by walk_element_plan.
 fn scan_plan(
     plan: &LiftPlan,
     scratch_addrs: &mut impl Iterator<Item = u32>,
@@ -185,10 +140,9 @@ fn build_static_fill(
     }
 }
 
-/// Per-`Cell::Flags` scratch byte count, in the same plan-walk order
-/// [`build_flags_info_maps`] consumes addresses. Walking these in
-/// sync is load-bearing: a divergence crashes the builder's
-/// `scratch_addrs.next()` expect.
+/// Per-`Cell::Flags` scratch byte counts in the same plan-walk order
+/// `build_flags_info_maps` consumes addresses (divergence crashes the
+/// builder's `scratch_addrs.next()` expect).
 pub(crate) fn flags_scratch_sizes(per_func: &[FuncClassified]) -> Vec<u32> {
     let mut sizes = Vec::new();
     for fd in per_func {

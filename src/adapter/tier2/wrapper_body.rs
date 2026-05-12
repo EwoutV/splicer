@@ -1,27 +1,11 @@
-//! Wrapper-body emit: builds the wasm function body for one
-//! exported wrapper.
+//! Wrapper-body emit: builds the wasm function body for one wrapper.
 //!
-//! ## Concurrency
-//!
-//! Wrappers assume one in-flight call per instance. State mutated
-//! in place over a call's lifetime that would corrupt under
-//! reentrancy:
-//!
-//! - Static side-table scratch (`flags-info.set-flags`,
-//!   `variant-info.case-name` + `payload`, per-cell char utf-8
-//!   scratch) — written per call; the cell tree points into them.
-//! - Per-call `handle-info` buffer — `cabi_realloc`'d per (fn, param
-//!   | result) with handle cells; the field-tree's
-//!   `handle-infos.ptr` (and `.len` for runtime-sized counts) is
-//!   patched to point at it.
-//! - Static field-tree `cells` slice — `ptr` and `len` patched
-//!   per call to point at the freshly-`cabi_realloc`'d slab.
-//! - Per-list indices buffer — `cabi_realloc`'d per call from the
-//!   wrapper's bump allocator, freed at exit via bump save/restore.
-//!
-//! A concurrent second call would see the first's scratch
-//! addresses and slab pointer mid-update. The canon-async runtime
-//! is expected to serialize per instance; revisit if that changes.
+//! **Concurrency**: wrappers assume one in-flight call per instance.
+//! Static side-table scratch (`set-flags`, `case-name`, char utf-8),
+//! per-call `handle-info` buffer, field-tree `cells` slice, and the
+//! per-list indices buffer all mutate in place. A concurrent second
+//! call would see the first mid-update. The canon-async runtime
+//! serializes per instance; revisit if that changes.
 
 use wasm_encoder::{CodeSection, Function};
 use wit_parser::{Function as WitFunction, Resolve};
@@ -47,43 +31,29 @@ use super::schema::{
 use super::section_emit::FuncIndices;
 use super::{FuncDispatch, FuncShape};
 
-/// Static context the wrapper-body emitter needs to read per-call
-/// from the layout phase. Bundles the schema + memory-layout
-/// addresses so the body emitter doesn't take a half-dozen positional args.
+/// Static context the wrapper-body emitter reads from the layout phase.
 pub(super) struct WrapperCtx<'a> {
     pub(super) schema: &'a SchemaLayouts,
     pub(super) resolve: &'a Resolve,
     pub(super) iface_name: BlobSlice,
-    /// `Some` iff the middleware exports `splicer:tier2/before` —
-    /// holds every per-build value the on-call emit path needs.
     pub(super) before_hook: Option<BeforeHook<'a>>,
-    /// `Some` iff the middleware exports `splicer:tier2/after` —
-    /// holds every per-build value the on-return emit path needs.
-    /// Per-fn after-hook offsets live on [`FuncDispatch::after`].
     pub(super) after_hook: Option<AfterHook<'a>>,
-    /// i64 counter global; bumped once per call to publish `call-id.id`.
+    /// i64 counter; bumped once per call to publish `call-id.id`.
     pub(super) call_id_counter_global: u32,
-    /// i32 bump-allocator global. Saved at wrapper entry, restored at
-    /// exit — per-call `cabi_realloc` traffic frees atomically.
+    /// Bump-allocator i32 global; save/restore frees per-call `cabi_realloc`.
     pub(super) bump_global: u32,
 }
 
-/// Per-build static values for the before-hook emit path. Bundling
-/// `idx` (import index), `layout` (on-call params record layout), and
-/// `params_ptr` (indirect-params scratch buffer offset) into a single
-/// `Option` lets the wrapper-body emitter take the "before-hook
-/// wired" branch with a single `if let Some(...)` arm rather than a
-/// trio of correlated `Option`s and `expect()`s.
+/// Per-build values for the before-hook emit path. Bundled so the
+/// wrapper takes one `if let Some(...)` arm vs three correlated Options.
 pub(super) struct BeforeHook<'a> {
     pub(super) idx: u32,
     pub(super) layout: &'a RecordLayout,
     pub(super) params_ptr: i32,
 }
 
-/// Per-build static values for the after-hook emit path. The per-fn
-/// params-buffer offset lives on [`FuncDispatch::after`]; the static
-/// parts (import index + on-return params layout) are shared across
-/// all wrappers. Result cells are `cabi_realloc`'d per call.
+/// Per-build values for the after-hook emit path. Per-fn params-buffer
+/// offset lives on `FuncDispatch::after`.
 pub(super) struct AfterHook<'a> {
     pub(super) idx: u32,
     pub(super) layout: &'a RecordLayout,
@@ -98,22 +68,16 @@ struct OnCallCallSite {
     id_local: u32,
 }
 
-/// Where the patched `cells: list<cell>` slice lives in linear memory,
-/// plus the per-plan info-buffer pre-pass seeds (build-time-known
-/// counts of outer `Cell::Handle` / `Cell::Flags` in the plan; the
-/// pre-pass adds list-element counts on top).
+/// Where the patched `cells: list<cell>` slice lives + per-plan
+/// pre-pass seeds (outer Handle/Flags counts; list elements layer on top).
 struct CellsTarget {
     fields_base_ptr: i32,
     cells_field_off: u32,
     static_info_counts: InfoCounts,
 }
 
-/// Cells-slab allocation for one (param | result) plan. Runs the
-/// per-list pre-pass (disc-gated for joined-arm lists; see
-/// [`emit_list_pre_pass`]), then `cabi_realloc`s the slab and
-/// patches `cells.ptr` + `cells.len`. `target.static_handle_count`
-/// seeds the parallel handle-info running counter inside the
-/// pre-pass — noop when the wrapper has no list-element handles.
+/// Cells-slab allocation for one plan: pre-pass (disc-gated for
+/// joined-arm lists), `cabi_realloc` the slab, patch `cells.ptr`/`.len`.
 fn emit_alloc_cells_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -154,17 +118,12 @@ fn emit_alloc_cells_for_plan(
     );
 }
 
-/// Byte offset of `field.tree.<field_name>` (a `list<...>` slice)
-/// within a `field` record. Pass the field-tree slice constant
-/// (`TREE_CELLS`, `TREE_HANDLE_INFOS`, …); used to address the slice
-/// the wrapper patches per call.
+/// Byte offset of `field.tree.<field_name>` within a `field` record.
 fn field_tree_slice_off(schema: &SchemaLayouts, tree_field: &str) -> u32 {
     schema.field_layout.offset_of(FIELD_TREE) + schema.tree_layout.offset_of(tree_field)
 }
 
-/// Byte offset of `result.<some>.tree.<field_name>` within the
-/// on-return params record. Twin of [`field_tree_slice_off`] for the
-/// after-hook side.
+/// After-hook twin of `field_tree_slice_off`.
 fn after_result_tree_slice_off(
     schema: &SchemaLayouts,
     after_layout: &RecordLayout,
@@ -175,12 +134,7 @@ fn after_result_tree_slice_off(
         + schema.tree_layout.offset_of(tree_field)
 }
 
-/// Closed set of per-cell side-table kinds with a per-call info
-/// buffer (handle / flags / record / variant). The only other gated
-/// list-element kind is `list<list<T>>`, which uses a separate
-/// indices model and doesn't fit this pattern. Drives uniform
-/// dispatch across the per-(param | result) alloc + the predicates
-/// that gate the corresponding wrapper locals.
+/// Per-cell side-table kinds with a per-call info buffer.
 #[derive(Clone, Copy)]
 enum InfoKind {
     Handle,
@@ -190,11 +144,8 @@ enum InfoKind {
 }
 
 impl InfoKind {
-    /// Lowercase singular suffix used in panic messages — must match
-    /// the same suffix in the gate-predicate names (`fn_has_*_cells`,
-    /// `fn_has_list_elem_*`, `next_*_idx`, `*_info_base`). A predicate
-    /// rename without updating this would silently produce a panic
-    /// message pointing at a non-existent function.
+    /// Suffix used in panic messages; must match the gate-predicate
+    /// names (`fn_has_*_cells`, `next_*_idx`, `*_info_base`, etc.).
     fn name(self) -> &'static str {
         match self {
             InfoKind::Handle => "handle",
@@ -247,15 +198,10 @@ struct InfoBufferTarget {
 /// Per-call info-buffer alloc + slice-ptr patch for one
 /// (param | result) plan.
 ///
-/// Two count regimes, picked per-plan (build-time-known):
-/// - **Runtime** (`target.runtime_sized = true`): the plan contains
-///   a list-element cell of this kind. The pre-pass accumulated
-///   `static_count + Σ_lists len * per_elem` into the matching
-///   `next_*_idx`; the alloc uses that local and patches `ptr` + `len`.
-/// - **Build-time-const** (`target.runtime_sized = false`): no list-
-///   element cells. Skipped entirely when `static_count == 0`;
-///   otherwise `cabi_realloc(static_count * entry_size)` + ptr patch
-///   (the slice's `len` was baked statically by `build_fields_blob`).
+/// Runtime path (list-element cells present): pre-pass-accumulated
+/// `next_*_idx` sizes the slab; ptr + len both patched. Build-time
+/// path: `static_count * entry_size` slab; only ptr patched (len was
+/// baked by `build_fields_blob`). Skip when both are zero.
 fn emit_alloc_info_buffer_for_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -274,16 +220,14 @@ fn emit_alloc_info_buffer_for_plan(
     if runtime_sized {
         let count_local = count_local_opt.unwrap_or_else(|| {
             panic!(
-                "next_{kind}_idx unset — fn_has_list_elem_{kind} gate disagrees \
-                 with the plan's list_specs",
-                kind = kind.name(),
+                "fn_has_list_elem_{kind} gate disagrees with plan",
+                kind = kind.name()
             )
         });
         let base_local = base_local_opt.unwrap_or_else(|| {
             panic!(
-                "{kind}_info_base local unset — fn_has_{kind}_cells gate disagrees \
-                 with fn_has_list_elem_{kind}",
-                kind = kind.name(),
+                "fn_has_{kind}_cells gate disagrees with fn_has_list_elem_{kind}",
+                kind = kind.name()
             )
         });
         emit_cabi_realloc_call_runtime(
@@ -303,17 +247,13 @@ fn emit_alloc_info_buffer_for_plan(
     }
     let base_local = base_local_opt.unwrap_or_else(|| {
         panic!(
-            "{kind}_info_base local unset — fn_has_{kind}_cells gate disagrees \
-             with the per-(param|result) {kind}_count",
-            kind = kind.name(),
+            "fn_has_{kind}_cells gate disagrees with {kind}_count",
+            kind = kind.name()
         )
     });
-    let buf_size = static_count.checked_mul(entry_size).unwrap_or_else(|| {
-        panic!(
-            "{kind}_info buffer size overflowed u32 — count * entry_size",
-            kind = kind.name(),
-        )
-    });
+    let buf_size = static_count
+        .checked_mul(entry_size)
+        .unwrap_or_else(|| panic!("{kind}_info buffer size overflowed u32", kind = kind.name()));
     emit_cabi_realloc_call(f, ctx.cabi_realloc_idx, align, buf_size, base_local);
     emit_store_slice_ptr_runtime(f, base_ptr, slice_field_off, base_local);
 }
@@ -352,12 +292,8 @@ pub(super) fn emit_wrapper_function(
     let schema = ctx.schema;
     let nparams = fd.export_sig.params.len() as u32;
     let builder = LocalsBuilder::new(nparams);
-    // `alloc_wrapper_locals` consumes the builder: it allocates every
-    // wrapper local (incl. compound-result synth locals + task.return
-    // bindgen scratch + the call-id local), pre-builds the lift load
-    // sequences, and returns a `FrozenLocals`. After this point there
-    // is no `LocalsBuilder` in scope, so additional `alloc_local` calls
-    // are a compile error.
+    // `alloc_wrapper_locals` consumes the builder, returns `FrozenLocals`;
+    // additional `alloc_local` after this point is a compile error.
     let (lcl, result_emit, frozen) = alloc_wrapper_locals(
         ctx.resolve,
         &schema.size_align,
@@ -394,9 +330,8 @@ pub(super) fn emit_wrapper_function(
 
     // ── Phase 1: on-call (only if before-hook wired) ──
     if let Some(before) = ctx.before_hook.as_ref() {
-        // Plan cells reference plan-relative flat slots; thread the
-        // cumulative cursor as the per-param `local_base` so cell N
-        // resolves to absolute wasm-local `local_base + N`.
+        // Cumulative `local_base` threads plan-relative slots into
+        // absolute wasm-locals.
         let mut local_base: u32 = 0;
         let cells_slice_off = field_tree_slice_off(schema, TREE_CELLS);
         let handle_infos_slice_off = field_tree_slice_off(schema, TREE_HANDLE_INFOS);
@@ -489,15 +424,10 @@ pub(super) fn emit_wrapper_function(
         canon_async::emit_call_and_wait(&mut f, before.idx, lcl.st, lcl.ws, async_funcs);
     }
 
-    // ── Phase 2: forward to handler. Bridges callee-returns ↔
-    // caller-allocates for compound results via the shared
-    // abi/emit helpers. For async, the import returns a packed
-    // canon-lower-async status that we wait on. Two arg shapes per
-    // canon-lower-async:
-    //   - direct: `emit_handler_call` pushes each flat function param.
-    //   - indirect: replay the pre-built lower-to-memory sequence,
-    //     then push the params-record pointer (capped at retptr if
-    //     the import also caller-allocates a result buffer).
+    // ── Phase 2: forward to handler. Two arg shapes per
+    // canon-lower-async: direct pushes each flat param; indirect
+    // replays the lower-to-memory sequence + pushes the params-record
+    // ptr (capped at retptr if the import also caller-allocates).
     let handler_imp_idx = func_idx.handler_imp_base + i as u32;
     if let Some(seq) = lcl.params_lower_seq.as_ref() {
         for inst in seq {
@@ -534,9 +464,7 @@ pub(super) fn emit_wrapper_function(
     }
 
     // ── Phase 3: on-return (only if after-hook wired) ──
-    // `ctx.after_hook` (per-build static) and `fd.after` (per-fn
-    // offsets) are populated in lockstep at layout time; the
-    // unreachable arm pins that contract.
+    // `ctx.after_hook` + `fd.after` are wired in lockstep.
     let after_zip = match (ctx.after_hook.as_ref(), fd.after.as_ref()) {
         (Some(s), Some(pf)) => Some((s, pf)),
         (None, None) => None,
@@ -638,8 +566,7 @@ pub(super) fn emit_wrapper_function(
                 );
             }
             ResultEmitPlan::Direct { .. } => {
-                // Single-cell direct result: build-time-sized cells slab,
-                // patch ptr (len is static-filled), `lcl.addr = cells_base`.
+                // Single-cell: build-time-sized slab, patch ptr (len is static).
                 emit_cabi_realloc_call(
                     &mut f,
                     func_idx.cabi_realloc_idx,
@@ -653,9 +580,7 @@ pub(super) fn emit_wrapper_function(
                     cells_field_off,
                     lcl.cells_base,
                 );
-                // Direct result is single-cell flat; lists never reach
-                // this branch, so list-element cells can't appear
-                // here — `runtime_sized: false` always.
+                // Direct is single-cell flat; lists can't reach here.
                 for target in [
                     InfoBufferTarget {
                         kind: InfoKind::Handle,
@@ -696,8 +621,7 @@ pub(super) fn emit_wrapper_function(
             }
             ResultEmitPlan::None => {}
         }
-        // iface/fn are prewritten by `build_after_params_blob`;
-        // only `call.id` changes per call, so patch it at runtime.
+        // iface/fn prewritten by `build_after_params_blob`; patch id.
         let id_field_off =
             after_static.layout.offset_of(ON_RET_CALL) + schema.callid_layout.id_off();
         emit_store_i64_local(&mut f, after_pf.params_offset, id_field_off, lcl.id_local);
@@ -705,13 +629,12 @@ pub(super) fn emit_wrapper_function(
         canon_async::emit_call_and_wait(&mut f, after_static.idx, lcl.st, lcl.ws, async_funcs);
     }
 
-    // Drop borrow handles before tail emit — runtime-required.
+    // Drop borrow handles before tail (runtime-required).
     emit_borrow_drops(&mut f, &fd.borrow_drops, &func_idx.resource_drop);
 
     emit_bump_restore(&mut f, bump_reset);
 
-    // ── Phase 4: tail. Async fns publish the result via task.return;
-    // sync fns return the direct value (or static retptr).
+    // ── Phase 4: tail (async: task.return; sync: direct return).
     match &fd.shape {
         FuncShape::Async(_) => {
             emit_task_return(&mut f, fd, func_idx, i, &lcl);
@@ -724,12 +647,8 @@ pub(super) fn emit_wrapper_function(
     code.function(&f);
 }
 
-/// Emit the async tail: call `task.return` with the appropriate
-/// args. Three shapes:
-/// - void result → no args.
-/// - `tr_sig.indirect_params` (compound result) → push retptr scratch.
-/// - flat result → load each value from retptr via the pre-built
-///   `lift_from_memory` instruction sequence.
+/// Async tail. Three shapes: void (no args); indirect_params (push
+/// retptr scratch); flat (replay `lift_from_memory` loads).
 fn emit_task_return(
     f: &mut Function,
     fd: &FuncDispatch,

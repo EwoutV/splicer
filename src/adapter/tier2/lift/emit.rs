@@ -26,14 +26,18 @@ use super::sidetable::variant_info::VariantRuntimeFill;
 use super::sidetable::{CellSideData, CharScratch, TupleIdxSource};
 use wit_parser::abi::WasmType;
 
-/// Locals + pre-built load sequences used by the wrapper body.
-/// Allocated once up front so all downstream emit phases (param lift,
-/// hook calls, result lift, async task.return load) reference the same
-/// indices. Result-lift-only locals (Compound addr + synth slot locals,
-/// plus the pre-built `lift_from_memory` instruction sequence) live on
-/// [`ResultEmitPlan`] instead — that type bundles the result emit's
-/// per-variant data so the four-fields-must-agree invariant disappears
-/// into the sum-type discriminant.
+/// Wrapper-body locals, allocated up front so all downstream emit
+/// phases share the same indices. Result-lift-only locals live on
+/// [`ResultEmitPlan`].
+///
+/// **Stage-then-consume invariant** (applies to the `Option<u32>`
+/// staging slots: `tuple_slot_ptr`, `list_elem_handle_base`,
+/// `list_elem_flags_base`, `list_elem_record_base`,
+/// `list_elem_variant_base`, `handle_info_base`, etc.): each is a
+/// single shared local set immediately before its consumer emits.
+/// Interleaving any emit between stage and consume silently clobbers
+/// it. Future refactors that reorder must keep stage→consume
+/// contiguous, or split into one local per consumer.
 pub(crate) struct WrapperLocals {
     /// Scratch for the cell write address.
     pub addr: u32,
@@ -47,194 +51,101 @@ pub(crate) struct WrapperLocals {
     pub(super) ext_f64: u32,
     /// Scratch i32 locals for joined-flat widening reads. `_a` lands
     /// the bitcast for any i32-arm leaf; `_b` is reserved for the
-    /// second slot of a `Cell::Text` / `Cell::Bytes` so the ptr
-    /// scratch survives the len read. Both unconditional — wasm
-    /// liveness analysis drops them when unused.
+    /// second slot of `Cell::Text` / `Cell::Bytes`. Liveness analysis
+    /// drops them when unused.
     pub(super) widen_i32_a: u32,
     pub(super) widen_i32_b: u32,
-    /// Scratch f32 local for joined-flat F32 widening. Lets
-    /// [`pin_leaf_flat`] handle `Cell::FloatingF32` uniformly with the
-    /// other single-slot kinds; rare in practice (only fires when an
-    /// F32 leaf shares a joined slot with a wider arm).
+    /// Scratch f32 local for joined-flat F32 widening — rare (only
+    /// when an F32 leaf shares a joined slot with a wider arm).
     pub(super) widen_f32: u32,
-    /// Cursor + count locals for the `Cell::Flags` bit-walk
-    /// (re-used across every flags cell in a sequential wrapper body).
+    /// `Cell::Flags` bit-walk cursor + count.
     pub(super) flags_addr: u32,
     pub(super) flags_count: u32,
-    /// `Cell::Char` utf-8 encoder locals: byte length + scratch-buffer
-    /// base. The base is a shared staging slot — caller writes either
-    /// a static slab address or a per-iteration list-element offset
-    /// before each char-cell emit. Both `Some` iff the wrapper has any
-    /// `Cell::Char` (top-level or list-element); `None` skips the
-    /// otherwise-unused locals.
+    /// `Cell::Char` utf-8 encoder locals. Both `Some` iff any
+    /// `Cell::Char` (top-level or list-element).
     pub(super) char_len: Option<u32>,
     pub(super) char_scratch_addr: Option<u32>,
-    /// Shared staging slot for list-element child cell-array indices
-    /// (Option/Result payloads). `Some` iff the wrapper has any
-    /// list-element cell of the [`super::plan::ListElementClass::PrestagedChildIdx`]
-    /// kind; `None` skips the local in wrappers that never need it.
+    /// Staging slot for list-element child cell-array indices
+    /// (Option/Result payloads in `PrestagedChildIdx` element class).
     pub(super) list_elem_child_idx: Option<u32>,
-    /// Shared staging slot for list-element TupleOf cells' per-call
-    /// indices-buffer slot ptr. `Some` iff the wrapper has any
-    /// list-element [`super::plan::ListElementClass::PrestagedTupleIndices`]
-    /// cell.
-    ///
-    /// **Stage-then-consume invariant.** Single shared local re-staged
-    /// per TupleOf cell. Correct only because [`emit_list_of_arm`]
-    /// stages it via [`emit_stage_tuple_slot`] *immediately* before
-    /// invoking [`emit_cell_op`] for the matching TupleOf cell.
-    /// Interleaving any emit between stage and consume silently
-    /// clobbers it. Future refactors that reorder the per-cell loop
-    /// must keep stage→emit_cell_op contiguous (or split into one
-    /// local per TupleOf cell in element_plan).
+    /// Staging slot for list-element TupleOf cells' per-call
+    /// indices-buffer slot ptr. Stage-then-consume.
     pub(super) tuple_slot_ptr: Option<u32>,
-    /// Direct-return value when the export sig has a single flat
-    /// result; `None` otherwise.
+    /// Direct-return value when the export sig has a single flat result.
     pub result: Option<u32>,
-    /// Address local that drives `lift_from_memory` for async
-    /// `task.return` flat loads. `None` for sync, void async, and
-    /// async with retptr-passthrough task.return.
+    /// Address local for async `task.return` flat loads. `None` for
+    /// sync, void async, and async with retptr-passthrough.
     pub tr_addr: Option<u32>,
-    /// i64 call-id local. Tier-2 always wires at least one hook
-    /// (`build_tier2_adapter` bails otherwise), so this is always live.
+    /// i64 call-id local. Tier-2 always wires at least one hook.
     pub id_local: u32,
-    /// Pre-built bindgen load sequence for async `task.return` flat
-    /// args. `Some` exactly when [`Self::tr_addr`] is `Some`, sourced
-    /// from `lift_from_memory` driven by the same builder that allocated
-    /// every other local. Stored here (not synthesized at emit time) so
-    /// every local the bindgen needed is already in [`FrozenLocals`].
+    /// Pre-built bindgen load sequence for async `task.return`.
+    /// Stored here so every local the bindgen needed is in `FrozenLocals`.
     pub task_return_loads: Option<Vec<Instruction<'static>>>,
-    /// Pre-built bindgen lower sequence that writes the wrapper's
-    /// flat function params into the canonical params record. `Some`
-    /// iff the async target uses `indirect_params` (canon-lower-async
-    /// switched to pass-by-record); replayed at the handler-call site
-    /// before the record's pointer is pushed. Sourced from
-    /// `wit_bindgen_core::abi::lower_to_memory` driven by the same
-    /// builder that allocated every other local — same rationale as
-    /// [`Self::task_return_loads`].
+    /// Pre-built bindgen lower for async indirect_params. Same
+    /// FrozenLocals rationale as `task_return_loads`.
     pub params_lower_seq: Option<Vec<Instruction<'static>>>,
-    /// Bump-pointer snapshot at wrapper entry; restored at exit
-    /// for stack-reset semantics on per-call `cabi_realloc`.
+    /// Bump snapshot at wrapper entry; restored at exit.
     pub saved_bump: u32,
-    /// Base address of the active plan's cells slab. Set by the
-    /// wrapper-body emitter before each [`emit_lift_plan`] call;
-    /// reused across plans (each set overwrites the previous).
+    /// Active plan's cells slab base; rewritten per plan.
     pub cells_base: u32,
-    /// Running cell-index counter driving the per-plan pre-pass;
-    /// holds `total_cells` after the pass. Reused across plans.
+    /// Running cell-index counter; holds `total_cells` after pre-pass.
     pub next_cell_idx: u32,
-    /// Per-iteration `handle_slot_base + j * handles_per_elem` —
-    /// staged once per list iteration; consumed by
-    /// [`emit_handle_runtime_fill`] and [`stage_handle_cell_payload`].
-    /// Stage-then-consume invariant, same shape as `tuple_slot_ptr`.
-    /// `Some` iff [`fn_has_list_elem_handle`].
+    /// Per-iteration `handle_slot_base + j * handles_per_elem`. Stage-
+    /// then-consume; `Some` iff [`fn_has_list_elem_handle`].
     pub list_elem_handle_base: Option<u32>,
-    /// Per-iteration `flags_slot_base + j * flags_per_elem` (entry
-    /// idx) and `flags_scratch_buf_base + j * scratch_bytes_per_elem`
-    /// (scratch base). Both staged once per iter by the list-of-arm;
-    /// `Some` iff [`fn_has_list_elem_flags`].
+    /// Per-iteration `flags_slot_base + j * flags_per_elem` + scratch
+    /// base. Stage-then-consume; `Some` iff [`fn_has_list_elem_flags`].
     pub list_elem_flags_base: Option<u32>,
     pub list_elem_flags_scratch_base: Option<u32>,
-    /// Scratch for the runtime entry-address (list-element flags only;
-    /// static slots fold the offset into a memarg).
+    /// Runtime entry-address scratch (list-element flags only).
     pub flags_slot_addr: Option<u32>,
-    /// Scratch for the runtime cell-payload idx
-    /// (`list_elem_flags_base + entry_offset_in_elem`).
+    /// Runtime cell-payload idx scratch.
     pub flags_payload_idx: Option<u32>,
-    /// Scratch for the runtime slot byte-address (list-element only;
-    /// static slots fold the offset into a memarg).
+    /// Runtime slot byte-address scratch (list-element handles only).
     pub handle_slot_addr: Option<u32>,
-    /// Scratch for the runtime cell-payload idx (list-element with
-    /// `offset_in_elem != 0`; the zero-offset case reuses
-    /// `list_elem_handle_base` directly).
+    /// Runtime cell-payload idx (list-element handles, non-zero offset).
     pub handle_payload_idx: Option<u32>,
-    /// Running handle-info entry count: pre-pass initializes to the
-    /// plan's static count, bumps by `len * handles_per_elem` per
-    /// list, ends at the runtime total. Sizes the `cabi_realloc` +
-    /// patches `handle_infos.len`. `Some` iff
-    /// [`fn_has_list_elem_handle`] (otherwise fully build-time).
+    /// Running handle-info entry count: starts at static count, bumps
+    /// by `len * handles_per_elem` per list. Sizes `cabi_realloc` +
+    /// patches `handle_infos.len`. `Some` iff list-elem-handle present.
     pub next_handle_idx: Option<u32>,
-    /// Companion to [`Self::next_handle_idx`] for flags-info entries.
-    /// `Some` iff [`fn_has_list_elem_flags`].
     pub next_flags_idx: Option<u32>,
-    /// Companion to [`Self::next_handle_idx`] for record-info entries.
-    /// `Some` iff [`fn_has_list_elem_record`].
     pub next_record_idx: Option<u32>,
-    /// Per-iteration `record_slot_base + j * records_per_elem` (entry
-    /// idx) and `record_tuples_buf_base + j * record_tuples_bytes_per_elem`
-    /// (tuples sub-region base). Both staged once per iter by the
-    /// list-of-arm; `Some` iff [`fn_has_list_elem_record`].
+    /// Per-iteration `record_slot_base + j * records_per_elem` +
+    /// tuples sub-region base. Stage-then-consume.
     pub list_elem_record_base: Option<u32>,
     pub list_elem_record_tuples_base: Option<u32>,
-    /// Scratch for the runtime entry-address (list-element records
-    /// only; static slots fold the offset into a memarg).
     pub record_slot_addr: Option<u32>,
-    /// Scratch for the runtime cell-payload entry idx
-    /// (`list_elem_record_base + entry_offset_in_elem`).
     pub record_payload_idx: Option<u32>,
-    /// Scratch for the runtime per-record field-tuples sub-slice base
-    /// (`list_elem_record_tuples_base + tuples_offset_in_elem`).
-    /// Reused across the per-tuple field writes.
+    /// Runtime per-record field-tuples sub-slice base; reused across
+    /// per-tuple field writes.
     pub record_tuples_slice_addr: Option<u32>,
-    /// Base address of the active plan's record-info buffer.
-    /// `Some` iff [`fn_has_record_cells`]. Same stage-then-consume
-    /// invariant as [`Self::handle_info_base`].
+    /// Active plan's record-info buffer base. Stage-then-consume.
     pub record_info_base: Option<u32>,
-    /// Base address of the active plan's variant-info buffer.
-    /// `Some` iff [`fn_has_variant_cells`]. Same stage-then-consume
-    /// invariant as [`Self::handle_info_base`].
+    /// Active plan's variant-info buffer base. Stage-then-consume.
     pub variant_info_base: Option<u32>,
-    /// Companion to [`Self::next_handle_idx`] for variant-info entries.
-    /// `Some` iff [`fn_has_list_elem_variant`].
     pub next_variant_idx: Option<u32>,
-    /// Per-iteration `variant_slot_base + j * variants_per_elem` —
-    /// staged once per iter by the list-of-arm; `Some` iff
-    /// [`fn_has_list_elem_variant`].
     pub list_elem_variant_base: Option<u32>,
-    /// Scratch for the runtime entry-address (list-element variants
-    /// only; static slots fold the offset into a memarg).
     pub variant_slot_addr: Option<u32>,
-    /// Scratch for the runtime cell-payload entry idx
-    /// (`list_elem_variant_base + entry_offset_in_elem`).
     pub variant_payload_idx: Option<u32>,
-    /// Base address of the active plan's flags-info buffer.
-    /// `Some` iff [`fn_has_flags_cells`]. Same stage-then-consume
-    /// invariant as [`Self::handle_info_base`].
+    /// Active plan's flags-info buffer base. Stage-then-consume.
     pub flags_info_base: Option<u32>,
-    /// Base address of the active plan's handle-info buffer.
-    /// `Some` iff [`fn_has_handle_cells`] holds; `None` for
-    /// handle-free wrappers (saves the local).
-    ///
-    /// **Stage-then-consume invariant.** Single shared local, set by
-    /// the wrapper body via `emit_alloc_handle_info_for_plan`
-    /// immediately before that plan's [`emit_lift_plan`] /
-    /// [`emit_lift_result`] runs, and consumed only by
-    /// [`emit_handle_runtime_fill`]. The "leave the local stale
-    /// between plans" claim is load-bearing on (1) only `Cell::Handle`
-    /// reads it — no other cell variant in `emit_cell_op` /
-    /// `emit_single_slot_cell` touches `lcl.handle_info_base`; and
-    /// (2) per-plan alloc happens immediately before the plan's lift
-    /// body — no interleaved emit between alloc and use. A future
-    /// refactor that interleaves handle-fills outside `emit_lift_plan`,
-    /// or adds a non-handle reader, must restage (or split into one
-    /// local per plan).
+    /// Active plan's handle-info buffer base. Stage-then-consume —
+    /// load-bearing on (1) only `Cell::Handle` reads it and (2) per-
+    /// plan alloc immediately precedes the plan's lift. A future
+    /// reader or interleaved fill must restage or split per plan.
     pub handle_info_base: Option<u32>,
-    /// Per-param list emit locals. `param_list_locals[i]` is parallel
-    /// to `params[i].lift.plan.list_specs()`; empty for list-free params.
+    /// Per-param list emit locals; `param_list_locals[i]` parallels
+    /// `params[i].lift.plan.list_specs()`.
     pub param_list_locals: Vec<Vec<ListEmitLocals>>,
 }
 
-/// Per-function emit-time bundle for the result-side lift. Built once
-/// in [`alloc_wrapper_locals`] from the layout-phase
-/// [`super::classify::ResultLayout`] + the locals just allocated, then
-/// consumed by phase-3 of the wrapper-body emitter via a pattern
-/// match. Direct carries side-data inline; Compound borrows it.
+/// Result-side lift bundle. Direct carries side-data inline;
+/// Compound borrows it from the layout phase.
 pub(crate) enum ResultEmitPlan<'a> {
     /// Void or unsupported result: no lift fires.
     None,
     /// Sync flat return — source already in `source_local`.
-    /// `side_data` carries any per-kind bookkeeping (Flags / Char /
-    /// Handle); `None` for primitives that need none.
     Direct {
         cell: Cell,
         source_local: u32,
@@ -242,8 +153,8 @@ pub(crate) enum ResultEmitPlan<'a> {
     },
     /// Retptr-loaded result. `addr_local` drives the
     /// `lift_from_memory`-built `loads` sequence; the wrapper
-    /// `local.set`s values into `synth_locals` (LIFO) for the plan
-    /// walker, with `local_base = synth_locals[0]`.
+    /// `local.set`s values into `synth_locals` (LIFO), with
+    /// `local_base = synth_locals[0]`.
     Compound {
         plan: &'a LiftPlan,
         retptr_offset: i32,
@@ -257,17 +168,15 @@ pub(crate) enum ResultEmitPlan<'a> {
 }
 
 /// Per-plan-cell side-table data borrowed off `ParamLayout` /
-/// `ResultSourceLayout::Compound` for [`emit_lift_plan`]. One entry
-/// per cell — adding a new side-table kind is a [`CellSideData`]
-/// variant + a [`emit_cell_op`] arm, no field-shape changes here.
+/// `ResultSourceLayout::Compound`. One entry per cell.
 #[derive(Clone, Copy)]
 pub(crate) struct CellSideRefs<'a> {
     pub cell_side: &'a [CellSideData],
 }
 
-/// Per-build context shared across every lift emit in a wrapper.
-/// Bundles `cell_layout` + `cabi_realloc_idx` + per-call buffer
-/// geometries so per-cell helpers don't pay `offset_of` per emit.
+/// Per-build context shared across every lift emit. Bundles
+/// `cell_layout` + `cabi_realloc_idx` + per-call buffer geometries
+/// so per-cell helpers don't pay `offset_of` per emit.
 #[derive(Clone, Copy)]
 pub(crate) struct LiftEmitCtx<'a> {
     pub cell_layout: &'a CellLayout,
@@ -392,28 +301,22 @@ impl RecordInfoOffsets {
     }
 }
 
-/// Per-plan-walk cursor: the plan being emitted and the wrapper-local
-/// offset added to every cell's plan-relative flat slot. Both travel
-/// together — the plan is consulted for `widening_for(slot)` while
-/// `local_base` resolves slots to absolute wrapper-local indices —
-/// so they're bundled at every plan-walk boundary.
+/// Per-plan-walk cursor: the plan + the wrapper-local offset added to
+/// each cell's plan-relative flat slot. `elem_cell_base` is `Some`
+/// inside list-element bodies — Option/Result resolve runtime idx as
+/// `elem_cell_base + relative_idx`; top-level walks use build-time-
+/// known absolute idx.
 #[derive(Clone, Copy)]
 pub(crate) struct PlanCursor<'a> {
     pub plan: &'a LiftPlan,
     pub local_base: u32,
-    /// Per-iteration cell-array base for list-element bodies — local
-    /// holding `start_i + j*elem_count`. Cells whose payload carries
-    /// a child cell-array index (Option/Result) compute the runtime
-    /// idx as `elem_cell_base + relative_idx` when this is `Some`;
-    /// `None` for top-level walks (build-time-known absolute idx).
     pub elem_cell_base: Option<u32>,
 }
 
-/// Per-`Cell::ListOf` emit-time bundle. One entry per list-of cell
-/// in plan order — parallel to [`LiftPlan::list_specs`].
+/// Per-`Cell::ListOf` emit-time bundle. One entry per list-of cell;
+/// parallel to [`LiftPlan::list_specs`].
 pub(crate) struct ListEmitLocals {
-    /// Cell-idx where this list's element cells begin (captured
-    /// from the pre-pass running counter).
+    /// Cell-idx where this list's element cells begin.
     pub start_i: u32,
     /// Captured source `len` flat slot value.
     pub len: u32,
@@ -423,93 +326,54 @@ pub(crate) struct ListEmitLocals {
     pub j: u32,
     /// Per-iter source element address; drives `elem_loads`.
     pub elem_addr: u32,
-    /// One local per element-plan flat slot, contiguous so plan
-    /// slot N maps to `elem_flat_locals[0] + N`.
+    /// One local per element-plan flat slot, contiguous so plan slot
+    /// N maps to `elem_flat_locals[0] + N`.
     pub elem_flat_locals: Vec<u32>,
-    /// Pre-built `lift_from_memory` loads — pushes element flat
-    /// values for capture into `elem_flat_locals` (LIFO).
+    /// Pre-built `lift_from_memory` loads — pushes element flat values
+    /// for capture into `elem_flat_locals` (LIFO).
     pub elem_loads: Vec<Instruction<'static>>,
     /// Canonical-ABI byte size of one element.
     pub elem_byte_size: u32,
-    /// Side-data parallel to `element_plan.cells`. Built by
-    /// [`elem_cell_side_data`]; scratch-bearing kinds fold to a
-    /// `Prestaged` marker that the per-iteration emit body fills in.
+    /// Side-data parallel to `element_plan.cells`.
     pub elem_cell_side: Vec<CellSideData>,
-    /// Per-call utf-8 scratch buffer for `Cell::Char` element cells.
-    /// `Some` iff `chars_per_elem > 0`. The k-th char (0..chars_per_elem)
-    /// in iteration j consumes the slot at
-    /// `(j * chars_per_elem + k) * MAX_UTF8_LEN`.
+    /// Per-call utf-8 scratch for `Cell::Char` element cells. The k-th
+    /// char in iteration j lives at `(j * chars_per_elem + k) * MAX_UTF8_LEN`.
     pub char_scratch_base: Option<u32>,
-    /// `Cell::Char` count in `element_plan`. Drives the per-call
-    /// scratch-buffer size + per-iteration scratch indexing so
-    /// multi-char elements (e.g. `tuple<char, char>`) don't alias.
     pub chars_per_elem: u32,
     /// Per-call buffer for `Cell::TupleOf` element cells —
-    /// `len * tuple_idx_count_per_elem * 4` bytes. Each iteration
-    /// writes runtime-resolved child cell-array indices into
-    /// per-cell sub-slots; the cell payload `(ptr, len)` reads back
-    /// the same slot. `Some` iff `tuple_idx_count_per_elem > 0`.
+    /// `len * tuple_idx_count_per_elem * 4` bytes.
     pub tuple_idx_buf_base: Option<u32>,
-    /// Total `Cell::TupleOf` child-index slots across all TupleOf
-    /// cells in `element_plan` (`Σ children.len()`). 0 when there
-    /// are no list-element TupleOf cells.
     pub tuple_idx_count_per_elem: u32,
-    /// Per-iteration cell-array base (`start_i + j*elem_count`),
-    /// staged once at iteration start and reused by
-    /// [`emit_set_elem_cell_addr`], the indices_ptr write, and any
-    /// list-element option/result child-idx resolution. Always
-    /// allocated — saves 1–2 instructions per cell per iteration vs
-    /// recomputing `start_i + j*elem_count` at each use site.
+    /// Per-iteration cell-array base (`start_i + j*elem_count`).
+    /// Always allocated — saves 1–2 insns per cell per iter vs recomputing.
     pub elem_cell_base: u32,
-    /// Starting slot in the handle-info buffer for this list's
-    /// elements; captured before the pre-pass bumps the running
-    /// total. `Some` iff `handles_per_elem > 0`.
+    /// Handle-info buffer starting slot for this list's elements.
     pub handle_slot_base: Option<u32>,
-    /// `Cell::Handle` count in `element_plan`. Drives the per-list
-    /// bump (`len * handles_per_elem`) + the per-iteration stage
-    /// (`handle_slot_base + j * handles_per_elem`).
     pub handles_per_elem: u32,
-    /// Flags counterpart of [`Self::handle_slot_base`].
     pub flags_slot_base: Option<u32>,
-    /// Flags counterpart of [`Self::handles_per_elem`].
     pub flags_per_elem: u32,
-    /// Per-call set-flags scratch buffer base for this list — sized at
-    /// `len * flags_scratch_bytes_per_elem`. `Some` iff
-    /// `flags_scratch_bytes_per_elem > 0`.
+    /// Per-call set-flags scratch buffer base; sized at
+    /// `len * flags_scratch_bytes_per_elem`.
     pub flags_scratch_buf_base: Option<u32>,
-    /// `Σ info.item_names.len() * STRING_FLAT_BYTES` over all
-    /// `Cell::Flags` cells in `element_plan` — variable per cell, so
-    /// each cell carries its own `scratch_offset_in_elem` and the
-    /// stride is the sum.
+    /// `Σ info.item_names.len() * STRING_FLAT_BYTES` across element-
+    /// plan `Cell::Flags` cells — variable per cell, so each carries
+    /// its own `scratch_offset_in_elem`.
     pub flags_scratch_bytes_per_elem: u32,
-    /// Starting slot in the record-info buffer for this list's
-    /// elements; captured before the pre-pass bumps the running total.
-    /// `Some` iff `records_per_elem > 0`.
     pub record_slot_base: Option<u32>,
-    /// `Cell::RecordOf` count in `element_plan`. Drives the per-list
-    /// bump (`len * records_per_elem`) + the per-iteration stage
-    /// (`record_slot_base + j * records_per_elem`).
     pub records_per_elem: u32,
-    /// Per-call field-tuples scratch buffer base for this list — sized
-    /// at `len * record_tuples_bytes_per_elem`. `Some` iff
-    /// `record_tuples_bytes_per_elem > 0`.
+    /// Per-call field-tuples scratch base; sized at
+    /// `len * record_tuples_bytes_per_elem`.
     pub record_tuples_buf_base: Option<u32>,
-    /// `Σ fields.len() * tuple_size` over all `Cell::RecordOf` cells
-    /// in `element_plan` — variable per cell.
+    /// `Σ fields.len() * tuple_size` across element-plan `Cell::RecordOf`
+    /// cells — variable per cell.
     pub record_tuples_bytes_per_elem: u32,
-    /// Starting slot in the variant-info buffer for this list's
-    /// elements; captured before the pre-pass bumps the running
-    /// total. `Some` iff `variants_per_elem > 0`.
     pub variant_slot_base: Option<u32>,
-    /// `Cell::Variant` count in `element_plan`. Drives the per-list
-    /// bump (`len * variants_per_elem`) + the per-iteration stage.
     pub variants_per_elem: u32,
 }
 
 /// Allocate per-list emit locals + pre-build the `lift_from_memory`
-/// loads for every `Cell::ListOf` in `plan`. Runs while the
-/// [`LocalsBuilder`] is still live since the bindgen may allocate
-/// scratch locals.
+/// loads for every `Cell::ListOf` in `plan`. Runs while the builder
+/// is live (bindgen may allocate scratch locals).
 pub(super) fn alloc_list_emit_locals(
     plan: &LiftPlan,
     resolve: &Resolve,
@@ -536,8 +400,7 @@ fn build_one_list_emit_locals(
     let indices_ptr = builder.alloc_local(ValType::I32);
     let j = builder.alloc_local(ValType::I32);
     let elem_addr = builder.alloc_local(ValType::I32);
-    // Contiguous element flat-slot locals: plan slot N maps to
-    // `elem_flat_locals[0] + N`.
+    // Contiguous flat-slot locals: plan slot N → elem_flat_locals[0] + N.
     let elem_ty = spec.element_plan.source_ty;
     let flat = flat_types(resolve, &elem_ty, None)
         .expect("list element type must flatten within MAX_FLAT_PARAMS");
@@ -604,10 +467,8 @@ fn build_one_list_emit_locals(
     }
 }
 
-/// Whether any list-element cell across the wrapper's plans (
-/// params + compound result) has the given [`ListElementClass`]. Gates
-/// shared wrapper locals (e.g. `list_elem_child_idx`, `tuple_slot_ptr`)
-/// so wrappers without that pattern shed unused locals.
+/// Whether any list-element cell across the wrapper's plans has the
+/// given [`ListElementClass`]. Gates shared wrapper locals.
 fn fn_has_list_elem_class(fd: &FuncDispatch, want: ListElementClass) -> bool {
     let plan_has = |plan: &LiftPlan| {
         plan.list_specs().any(|spec| {
@@ -650,8 +511,7 @@ fn fn_has_list_elem_variant(fd: &FuncDispatch) -> bool {
     fn_has_list_elem_class(fd, ListElementClass::PrestagedVariant)
 }
 
-/// Any `Cell::Char` in the wrapper (params or result, including
-/// list-element plans). Gates `char_len` + `char_scratch_addr`.
+/// Any `Cell::Char` in the wrapper. Gates `char_len` + `char_scratch_addr`.
 fn fn_contains_char(fd: &FuncDispatch) -> bool {
     if fd.params.iter().any(|p| p.lift.plan.contains_char()) {
         return true;
@@ -666,13 +526,8 @@ fn fn_contains_char(fd: &FuncDispatch) -> bool {
     }
 }
 
-/// Any `Cell::Handle` in the wrapper (params or result, including
-/// Any cell of `kind` in the wrapper (params or result, including
-/// list-element plans). Gates the matching `WrapperLocals.*_info_base`
-/// — kind-free wrappers don't allocate that local. Static cells come
-/// from the layout-phase per-(param | result) `info_counts.<kind>`;
-/// list-element cells route through [`fn_has_list_elem_class`] with
-/// the matching [`ListElementClass::Prestaged*`].
+/// Any cell of `kind` in the wrapper. Gates the matching
+/// `WrapperLocals.*_info_base`.
 fn fn_has_info_cells(
     fd: &FuncDispatch,
     kind: ListElementClass,
@@ -699,56 +554,27 @@ fn fn_has_variant_cells(fd: &FuncDispatch) -> bool {
     fn_has_info_cells(fd, ListElementClass::PrestagedVariant, |c| c.variant)
 }
 
-/// Per-class counts collected by [`walk_element_plan`]. Drives the
-/// per-list shared-buffer / shared-local allocation decisions.
+/// Per-class counts driving per-list allocation decisions.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ElementCounts {
-    /// Count of `Cell::Char` cells in `element_plan` (sized via
-    /// `len * chars * MAX_UTF8_LEN`).
     pub chars: u32,
-    /// Sum of `children.len()` across `Cell::TupleOf` cells (sized
-    /// via `len * tuple_idx_slots * 4`).
+    /// Sum of `children.len()` across `Cell::TupleOf` cells.
     pub tuple_idx_slots: u32,
-    /// `Cell::Handle` count in `element_plan` — slots per iteration
-    /// at `handle_slot_base + j * handles + offset_in_elem`.
     pub handles: u32,
-    /// `Cell::Flags` count in `element_plan` — uniform-stride entry
-    /// slots at `flags_slot_base + j * flags + entry_offset_in_elem`.
     pub flags: u32,
-    /// Total set-flags scratch bytes across all `Cell::Flags` cells
-    /// in `element_plan` — variable-stride per cell, sized at
-    /// `Σ info.item_names.len() * STRING_FLAT_BYTES`. Per iteration
-    /// each cell's slab lives at `flags_scratch_base + j * scratch_bytes
-    /// + scratch_offset_in_elem`.
+    /// Total set-flags scratch bytes across `Cell::Flags` cells —
+    /// variable-stride per cell.
     pub flags_scratch_bytes: u32,
-    /// `Cell::RecordOf` count in `element_plan` — uniform-stride
-    /// entry slots at `record_slot_base + j * records +
-    /// entry_offset_in_elem`.
     pub records: u32,
-    /// Total field-tuples bytes across all `Cell::RecordOf` cells in
-    /// `element_plan` — variable-stride per cell, sized at
-    /// `Σ fields.len() * record_field_tuple_layout.size`. Per
-    /// iteration each cell's tuples sub-slice lives at
-    /// `record_tuples_buf_base + j * record_tuples_bytes
-    /// + tuples_offset_in_elem`.
+    /// Total field-tuples bytes across `Cell::RecordOf` cells —
+    /// variable-stride per cell.
     pub record_tuples_bytes: u32,
-    /// `Cell::Variant` count in `element_plan` — uniform-stride
-    /// entry slots at `variant_slot_base + j * variants +
-    /// entry_offset_in_elem`.
     pub variants: u32,
 }
 
-/// Single walk over `element_plan.cells` producing both the
-/// per-cell side data and the per-class counts. Replaces three
-/// independent iterations whose drift would silently produce
-/// stale side-data vs. mis-sized buffers. Driven off
-/// [`Cell::list_element_class`] so adding a class forces a fold
-/// arm at compile time.
-///
-/// All per-cell side data (incl. flags type-name + flag-names
-/// BlobSlices) is read directly off the cell — no layout-phase
-/// strings table is needed; the slices were interned at plan-build
-/// time (see [`Cell::Flags`]).
+/// Single walk over `element_plan.cells` producing per-cell side
+/// data + per-class counts. Driven off [`Cell::list_element_class`] so
+/// adding a class forces a fold arm at compile time.
 pub(super) fn walk_element_plan(
     element_plan: &LiftPlan,
     record_tuple_size: u32,
@@ -772,8 +598,7 @@ pub(super) fn walk_element_plan(
                         scratch: CharScratch::Prestaged,
                     }
                 }
-                // Option/Result resolve their child idx inline at
-                // emit time via PlanCursor.elem_cell_base.
+                // Option/Result resolve child idx via PlanCursor.elem_cell_base.
                 ListElementClass::PrestagedChildIdx => CellSideData::None,
                 ListElementClass::PrestagedTupleIndices => {
                     let Cell::TupleOf { children } = cell else {
@@ -875,15 +700,10 @@ pub(super) fn walk_element_plan(
     (side, counts)
 }
 
-/// Allocate every local the wrapper body will reference, build the
-/// (data-driven) compound-result and async-task-return load sequences,
-/// then [`LocalsBuilder::freeze`] the result and hand back the frozen
-/// locals list. Taking `builder` by value is the typestate hinge: the
-/// caller surrenders its ability to allocate further locals before
-/// receiving the [`FrozenLocals`] that feeds
-/// `Function::new_with_locals_types`, so "allocate after freeze" is a
-/// compile error rather than a runtime panic when wasm validation
-/// trips on out-of-range locals.
+/// Allocate every wrapper-body local + build compound-result and
+/// task-return load sequences, then freeze the locals list. Taking
+/// `builder` by value is the typestate hinge: post-freeze allocation
+/// is a compile error rather than a runtime trap.
 pub(crate) fn alloc_wrapper_locals<'a>(
     resolve: &Resolve,
     size_align: &SizeAlign,
@@ -932,21 +752,16 @@ pub(crate) fn alloc_wrapper_locals<'a>(
     let variant_slot_addr = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
     let variant_payload_idx = needs_list_variant_locals.then(|| builder.alloc_local(ValType::I32));
     let result = direct_return_type(&fd.export_sig).map(|t| builder.alloc_local(t));
-    // Async with a non-retptr-passthrough task.return needs an
-    // i32 addr local so `lift_from_memory` can flat-load result
-    // values out of the retptr scratch.
+    // Non-retptr-passthrough async task.return: i32 addr drives
+    // `lift_from_memory` flat-load out of the retptr scratch.
     let tr_uses_flat_loads = fd
         .shape
         .task_return()
         .is_some_and(|tr| !tr.sig.indirect_params && fd.result_ty.is_some());
     let tr_addr = tr_uses_flat_loads.then(|| builder.alloc_local(ValType::I32));
 
-    // Result-emit plan: discriminate on the layout-phase `ResultLayout`
-    // and pull together the variant-specific locals/offsets/loads.
-    // Compound allocates extra locals (one i32 addr + one synth per
-    // flat slot) AND drives the bindgen for `lift_from_memory` —
-    // bindgen may allocate further scratch locals, so this must run
-    // before the locals list freezes.
+    // Compound: extra locals + bindgen-driven `lift_from_memory` may
+    // allocate scratch locals — must run before freeze.
     let result_emit = match fd.result_lift.as_ref() {
         None => ResultEmitPlan::None,
         Some(rl) => match &rl.source {
@@ -975,9 +790,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
                     compound.plan.flat_slot_count as usize,
                     "canonical-ABI flat count (emit) must match classify-time plan"
                 );
-                // Synth locals are allocated contiguously; the emit
-                // phase passes `synth_locals[0]` to `emit_lift_plan`
-                // as the plan's `local_base`, so cell N's flat slot
+                // Contiguous synth locals: cell N's flat slot
                 // resolves to `synth_locals[0] + N = synth_locals[N]`.
                 let synth_locals: Vec<u32> = flat
                     .into_iter()
@@ -1010,8 +823,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         },
     };
 
-    // Per-param list-of locals — must allocate before freeze. Empty
-    // inner Vec for params with no list cells.
+    // Must allocate before freeze; empty inner Vec for list-free params.
     let param_list_locals: Vec<Vec<ListEmitLocals>> = fd
         .params
         .iter()
@@ -1026,9 +838,7 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         })
         .collect();
 
-    // Async task.return flat-loads run a second `lift_from_memory`
-    // pass over `result_ty`; that bindgen may allocate scratch locals
-    // too, so it has to happen before we freeze.
+    // Second `lift_from_memory` pass; must run before freeze.
     let task_return_loads: Option<Vec<Instruction<'static>>> = tr_addr.map(|addr_local| {
         let result_ty = fd
             .result_ty
@@ -1039,10 +849,8 @@ pub(crate) fn alloc_wrapper_locals<'a>(
         bindgen.into_instructions()
     });
 
-    // Indirect-params lower-to-memory sequence for async fns whose
-    // flat params overflowed `MAX_FLAT_ASYNC_PARAMS`. Driven by
-    // `wit_bindgen_core::abi::lower_to_memory` through the same
-    // builder, so any addr / store-tmp scratch lands in `frozen`.
+    // Indirect-params lower (async overflowed MAX_FLAT_ASYNC_PARAMS);
+    // driven through the same builder so scratch lands in `frozen`.
     let params_lower_seq: Option<Vec<Instruction<'static>>> =
         fd.import_sig.indirect_params.then(|| {
             let base = fd
@@ -1057,8 +865,6 @@ pub(crate) fn alloc_wrapper_locals<'a>(
             )
         });
 
-    // i64 call-id local. Tier-2 generation requires at least one hook
-    // (`build_tier2_adapter` bails otherwise), so this is always live.
     let id_local = builder.alloc_local(ValType::I64);
     let saved_bump = builder.alloc_local(ValType::I32);
     let cells_base = builder.alloc_local(ValType::I32);
@@ -1128,19 +934,9 @@ pub(crate) fn alloc_wrapper_locals<'a>(
 }
 
 /// Emit the wasm that lifts one plan into its cells slab. Walks
-/// `plan.cells` in allocation order and, for each cell, sets
-/// `lcl.addr` to that cell's absolute address (`cells_base + i *
-/// cell_size`, computed at runtime from the `cells_base` local set
-/// by the caller) and dispatches on the cell's variant. Cells
-/// reference plan-relative flat slots; `local_base` is added per-cell
-/// to recover the absolute wasm-local index — params pass the
-/// cumulative slot cursor, compound results pass `synth_locals[0]`.
-///
-/// `list_locals` is parallel to [`LiftPlan::list_specs`] order; for
-/// each `Cell::ListOf` encountered the matching slot drives the
-/// per-list element loop. Empty for plans without lists.
-/// `cabi_realloc_idx` lets the list-of arm allocate the per-list
-/// indices buffer at runtime.
+/// `plan.cells` in allocation order, setting `lcl.addr` per cell and
+/// dispatching on the cell variant. `local_base` resolves
+/// plan-relative flat slots to absolute wrapper-local indices.
 pub(crate) fn emit_lift_plan(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1188,18 +984,9 @@ pub(crate) fn emit_lift_plan(
     }
 }
 
-/// Resolve a leaf-level flat-slot read, applying any joined-flat
-/// widening bitcast recorded in `plan`. The returned `u32` is always
-/// an absolute wrapper-local index — either the wrapper's flat-param
-/// slot (`local_base + flat_slot`) when no bitcast is needed, or one
-/// of the typed scratches (`lcl.widen_i32_a` / `lcl.ext64` /
-/// `lcl.ext_f64` / `lcl.widen_f32`) materialized via
-/// `local.get + bitcast + local.set`.
-///
-/// Widened single-source cells routed through
-/// [`emit_single_slot_cell`]'s extend/promote bodies pay one extra
-/// `local.set + local.get` pair vs the pre-refactor inline path —
-/// only fires on slots the joined-flat layout actually widens.
+/// Resolve a leaf-level flat-slot read, applying joined-flat widening
+/// bitcast when needed. Returns the absolute wrapper-local — either
+/// `local_base + flat_slot` (no widening) or a typed scratch.
 fn pin_leaf_flat(
     f: &mut Function,
     plan: &LiftPlan,
@@ -1211,10 +998,8 @@ fn pin_leaf_flat(
     pin_leaf_flat_with_i32_scratch(f, plan, local_base, flat_slot, arm, lcl.widen_i32_a, lcl)
 }
 
-/// Inner form of [`pin_leaf_flat`] that lets the caller name the i32
-/// scratch — only `Cell::Text` / `Cell::Bytes` need this (their two
-/// i32 slots can both widen in the same cell). Other arm types ignore
-/// `scratch_i32` and pick `lcl.ext64` / `lcl.ext_f64` by `arm`.
+/// Form of [`pin_leaf_flat`] taking a caller-supplied i32 scratch —
+/// only Text / Bytes need this (two i32 slots can both widen).
 fn pin_leaf_flat_with_i32_scratch(
     f: &mut Function,
     plan: &LiftPlan,
@@ -1229,8 +1014,7 @@ fn pin_leaf_flat_with_i32_scratch(
     };
     let bc = cast(joined, arm);
     if matches!(bc, wit_bindgen_core::abi::Bitcast::None) {
-        // Joined matches this arm's per-position type — another arm
-        // widened the slot, but we don't need to.
+        // Another arm widened the slot, but this arm doesn't need it.
         return local_base + flat_slot;
     }
     f.instructions().local_get(local_base + flat_slot);
@@ -1307,21 +1091,12 @@ fn emit_close_arm_guards(f: &mut Function, n: usize) {
     }
 }
 
-/// Pre-pass that initializes `lcl.next_cell_idx` to the plan's
-/// static cell count, then bumps it by `len · elem_count` per list
-/// (capturing each list's `start_i` and `len` along the way).
-/// Lists nested in joined arms disc-gate the bump so the inactive
-/// arm's bytes can't bloat the slab — locals zero-init keeps
-/// `ll.len` / `ll.start_i` defined on the inactive path. Per-list
-/// trap guards the `i32` mul + add against silent wrap; see
-/// `emit_trap_if_list_overflows_cell_slab`.
-///
-/// When `lcl.next_handle_idx` is `Some` (the plan or any of its
-/// element plans contains `Cell::Handle`), the same walk maintains
-/// a parallel running counter for handle-info entries: initialized
-/// to `static_handle_count`, captured into `ll.handle_slot_base`,
-/// then bumped by `len · handles_per_elem` for lists with element
-/// handles.
+/// Pre-pass: init `lcl.next_cell_idx` to the plan's static cell count,
+/// then bump by `len · elem_count` per list (capturing `start_i` and
+/// `len`). Joined-arm lists disc-gate the bump so an inactive arm's
+/// bytes can't bloat the slab — zero-init keeps `ll.len`/`ll.start_i`
+/// defined on the inactive path. Parallel running counters for
+/// handle/flags/record/variant-info entries follow the same shape.
 pub(crate) fn emit_list_pre_pass(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1372,10 +1147,8 @@ pub(crate) fn emit_list_pre_pass(
         }
         f.instructions().i32_add();
         f.instructions().local_set(lcl.next_cell_idx);
-        // Mirror the per-list bump for handle-info + flags-info
-        // running counters when this list contributes element
-        // entries of those kinds. The `next_*_idx` locals are
-        // `Some` iff any list in any sibling plan does.
+        // Mirror the per-list bump on each kind's running counter
+        // when this list contributes element entries of that kind.
         if let (Some(next_handle_idx), Some(handle_slot_base)) =
             (lcl.next_handle_idx, ll.handle_slot_base)
         {
@@ -1436,17 +1209,8 @@ pub(crate) fn emit_list_pre_pass(
     }
 }
 
-/// Emit one cell's worth of wasm at the address held in `lcl.addr`.
-/// `local_base` is added to each plan-relative flat-slot. `list_slot`
-/// is `Some` exactly for `Cell::ListOf`. New [`Cell`] variants add an
-/// arm here (no `_` catchall). `plan` carries the joined-flat widening
-/// table consulted at every leaf flat-slot read.
-///
-/// Single-source kinds (one flat or disc slot drives the cell write)
-/// pin the slot via [`pin_leaf_flat`] and delegate to
-/// [`emit_single_slot_cell`]; multi-slot, side-table-only, and list
-/// kinds stay inline. [`emit_lift_result`]'s Direct branch reuses the
-/// same dispatch with `source = lcl.result` + `for_direct = true`.
+/// Emit one cell at `lcl.addr`. `list_slot` is `Some` exactly for
+/// `Cell::ListOf`. New `Cell` variants add an arm (no `_` catchall).
 fn emit_cell_op(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1464,7 +1228,6 @@ fn emit_cell_op(
     let addr = lcl.addr;
     let cell_layout = ctx.cell_layout;
     match op {
-        // Single-source variants — pin the source slot, delegate.
         Cell::Bool { flat_slot }
         | Cell::IntegerSignExt { flat_slot }
         | Cell::IntegerZeroExt { flat_slot }
@@ -1493,7 +1256,6 @@ fn emit_cell_op(
             let src = pin_leaf_flat(f, plan, local_base, *disc_slot, WasmType::I32, lcl);
             emit_single_slot_cell(f, ctx, op, side_data, src, lcl, elem_cell_base);
         }
-        // Two-flat-slot kinds.
         Cell::Text { ptr_slot, len_slot } => {
             let (ptr, len) = pin_text_bytes_slots(f, plan, local_base, *ptr_slot, *len_slot, lcl);
             cell_layout.emit_text(f, addr, ptr, len);
@@ -1516,7 +1278,6 @@ fn emit_cell_op(
             };
             emit_tuple_of_cell(f, cell_layout, addr, children, src_kind, lcl);
         }
-        // List arm — own special-cased loop.
         Cell::ListOf {
             ptr_slot,
             element_plan,
@@ -1525,8 +1286,8 @@ fn emit_cell_op(
         } => {
             let ll =
                 list_slot.expect("ListOf cell must arrive with a matching ListEmitLocals slot");
-            // Disc-gate cabi_realloc + the element loop so an inactive
-            // sibling arm's bytes don't surface as `len`.
+            // Disc-gate cabi_realloc + element loop so an inactive
+            // sibling arm's bytes can't surface as `len`.
             emit_open_arm_guards(f, plan, local_base, arm_guards);
             let ptr = pin_leaf_flat(f, plan, local_base, *ptr_slot, WasmType::I32, lcl);
             emit_list_of_arm(f, ctx, ll, ptr, element_plan, lcl);
@@ -1535,12 +1296,9 @@ fn emit_cell_op(
     }
 }
 
-/// Emit one single-source cell at `lcl.addr`, reading the source value
-/// from local `source`. Shared by [`emit_cell_op`] (params + compound
-/// result) and [`emit_lift_result`]'s Direct branch.
-///
-/// `elem_cell_base = Some` inside list-element bodies; resolves
-/// Option/Result child indices via `stage_child_idx_source`.
+/// Emit one single-source cell at `lcl.addr`, reading from `source`.
+/// Shared by `emit_cell_op` and `emit_lift_result`'s Direct branch.
+/// `elem_cell_base = Some` inside list-element bodies.
 fn emit_single_slot_cell(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1587,19 +1345,16 @@ fn emit_single_slot_cell(
             let CellSideData::Char { scratch } = side_data else {
                 panic!("Char cell paired with non-Char side data {side_data:?}");
             };
-            let scratch_addr_local = lcl.char_scratch_addr.expect(
-                "char_scratch_addr unset — fn_contains_char predicate \
-                 must agree with the cells reaching emit_single_slot_cell",
-            );
-            let len_local = lcl
-                .char_len
-                .expect("char_len unset — same gate as char_scratch_addr");
+            let scratch_addr_local = lcl
+                .char_scratch_addr
+                .expect("fn_contains_char must agree with cells reaching here");
+            let len_local = lcl.char_len.expect("same gate as char_scratch_addr");
             match scratch {
                 CharScratch::Static { scratch_addr } => {
                     f.instructions().i32_const(*scratch_addr);
                     f.instructions().local_set(scratch_addr_local);
                 }
-                // Caller (emit_list_of_arm) wrote `scratch_addr_local`.
+                // Caller (emit_list_of_arm) wrote scratch_addr_local.
                 CharScratch::Prestaged => {}
             }
             cell_layout.emit_char(f, addr, source, scratch_addr_local, len_local);
@@ -1613,8 +1368,7 @@ fn emit_single_slot_cell(
             cell_layout.emit_handle_cell(f, addr, kind.cell_disc_case(), payload);
         }
         Cell::Option { child_idx, .. } => {
-            // Stage inside the `some` arm — none-iterations skip it
-            // entirely. Symmetric with `Cell::Result` below.
+            // Stage inside the `some` arm; none skips it entirely.
             f.instructions().local_get(source);
             f.instructions().if_(BlockType::Empty);
             let child_idx_source = stage_child_idx_source(f, lcl, elem_cell_base, *child_idx);
@@ -1626,10 +1380,7 @@ fn emit_single_slot_cell(
         Cell::Result {
             ok_idx, err_idx, ..
         } => {
-            // Each arm references its own child idx; staging happens
-            // inside whichever branch runs, and unit arms skip the
-            // staging entirely (emit_result_arm ignores `inner_idx`
-            // when has_payload == false).
+            // Stage per arm; unit arms skip (has_payload == false).
             f.instructions().local_get(source);
             f.instructions().if_(BlockType::Empty);
             // wasm `if` fires on non-zero, so err goes in the if block.
@@ -1654,7 +1405,6 @@ fn emit_single_slot_cell(
             let payload = stage_variant_cell_payload(f, lcl, fill);
             cell_layout.emit_variant_case(f, addr, payload);
         }
-        // Multi-slot + side-table-only + list — caller's responsibility.
         Cell::Text { .. }
         | Cell::Bytes { .. }
         | Cell::RecordOf { .. }
@@ -1665,15 +1415,9 @@ fn emit_single_slot_cell(
     }
 }
 
-/// Emit one `Cell::ListOf` arm: write the list-of cell payload at
-/// `lcl.addr`, allocate the per-call buffers (indices + any per-iter
-/// scratch), then loop `j ∈ 0..len` lifting each element.
-///
-/// Element-plan cells are walked in plan order. For each iteration j
-/// every element cell `k ∈ 0..elem_count` lands at runtime cell-array
-/// index `start_i + j*elem_count + k`. Today β is single-cell elements
-/// (`elem_count == 1`), but the loop is structured for the future
-/// multi-cell case so growing the allow-list doesn't reshape it.
+/// Emit one `Cell::ListOf` arm: write the list-of payload, allocate
+/// per-call buffers, loop `j ∈ 0..len` lifting each element. Each
+/// element cell `k` lands at `start_i + j*elem_count + k`.
 fn emit_list_of_arm(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -1685,10 +1429,7 @@ fn emit_list_of_arm(
     let cell_layout = ctx.cell_layout;
     let elem_count = element_plan.cell_count();
     emit_cabi_realloc_call_runtime(f, ctx.cabi_realloc_idx, 4, ll.len, 4, ll.indices_ptr);
-    // Per-element utf-8 scratch sized at `chars_per_elem * MAX_UTF8_LEN`
-    // bytes. Multi-Char-per-element shapes (future, e.g. `tuple<char,
-    // char>`) get one slot per char per iteration; single-Char today
-    // degenerates to `MAX_UTF8_LEN` bytes per iteration.
+    // Per-element utf-8 scratch: chars_per_elem * MAX_UTF8_LEN bytes.
     if let Some(scratch_base) = ll.char_scratch_base {
         emit_cabi_realloc_call_runtime(
             f,
@@ -1699,8 +1440,7 @@ fn emit_list_of_arm(
             scratch_base,
         );
     }
-    // Per-element tuple-indices buffer: `tuple_idx_count_per_elem`
-    // u32 slots per iteration, each holding one resolved child idx.
+    // Per-element tuple-indices buffer: tuple_idx_count_per_elem u32 slots.
     if let Some(buf_base) = ll.tuple_idx_buf_base {
         let elem_bytes = ll
             .tuple_idx_count_per_elem
@@ -1708,9 +1448,7 @@ fn emit_list_of_arm(
             .expect("tuple_idx_count_per_elem * 4 overflowed u32");
         emit_cabi_realloc_call_runtime(f, ctx.cabi_realloc_idx, 4, ll.len, elem_bytes, buf_base);
     }
-    // Per-element flags set-flags scratch: `flags_scratch_bytes_per_elem`
-    // bytes per iteration. Each Cell::Flags element has its own
-    // sub-slice (`scratch_offset_in_elem`), allowing multi-flags elements.
+    // Per-element flags set-flags scratch.
     if let Some(buf_base) = ll.flags_scratch_buf_base {
         emit_cabi_realloc_call_runtime(
             f,
@@ -1721,10 +1459,7 @@ fn emit_list_of_arm(
             buf_base,
         );
     }
-    // Per-element record field-tuples scratch:
-    // `record_tuples_bytes_per_elem` bytes per iteration. Each
-    // Cell::RecordOf element has its own tuples sub-slice
-    // (`tuples_offset_in_elem`), allowing multi-record elements.
+    // Per-element record field-tuples scratch.
     if let Some(buf_base) = ll.record_tuples_buf_base {
         emit_cabi_realloc_call_runtime(
             f,
@@ -1765,9 +1500,7 @@ fn emit_list_of_arm(
         f.instructions().local_set(local);
     }
 
-    // elem_cell_base = start_i + j*elem_count — staged once,
-    // reused by emit_set_elem_cell_addr, the indices_ptr write, and
-    // any list-element option/result child-idx resolution.
+    // elem_cell_base = start_i + j*elem_count — staged once per iter.
     f.instructions().local_get(ll.start_i);
     f.instructions().local_get(ll.j);
     if elem_count != 1 {
@@ -1778,15 +1511,10 @@ fn emit_list_of_arm(
     f.instructions().local_set(ll.elem_cell_base);
 
     // list_elem_handle_base = handle_slot_base + j * handles_per_elem
-    // Staged once per iteration so each element-plan handle cell
-    // resolves its absolute slot idx as
-    // `list_elem_handle_base + offset_in_elem` without recomputing.
     if let Some(slot_base) = ll.handle_slot_base {
-        let dest = lcl.list_elem_handle_base.expect(
-            "list_elem_handle_base unset on a wrapper with list-element \
-             Cell::Handle — fn_has_list_elem_handle gate disagrees with \
-             ListEmitLocals.handle_slot_base",
-        );
+        let dest = lcl
+            .list_elem_handle_base
+            .expect("fn_has_list_elem_handle disagrees with handle_slot_base");
         f.instructions().local_get(slot_base);
         f.instructions().local_get(ll.j);
         if ll.handles_per_elem != 1 {
@@ -1797,15 +1525,12 @@ fn emit_list_of_arm(
         f.instructions().local_set(dest);
     }
 
-    // list_elem_flags_base = flags_slot_base + j * flags_per_elem
-    // list_elem_flags_scratch_base = flags_scratch_buf_base + j * scratch_bytes
-    // Both staged once so per-cell `emit_flags_runtime_fill` adds
-    // the build-time-const offsets without recomputing.
+    // list_elem_flags_base = flags_slot_base + j * flags_per_elem,
+    // list_elem_flags_scratch_base = flags_scratch_buf_base + j * scratch_bytes.
     if let Some(slot_base) = ll.flags_slot_base {
-        let dest = lcl.list_elem_flags_base.expect(
-            "list_elem_flags_base unset — fn_has_list_elem_flags gate \
-             disagrees with ListEmitLocals.flags_slot_base",
-        );
+        let dest = lcl
+            .list_elem_flags_base
+            .expect("fn_has_list_elem_flags disagrees with flags_slot_base");
         f.instructions().local_get(slot_base);
         f.instructions().local_get(ll.j);
         if ll.flags_per_elem != 1 {
@@ -1816,15 +1541,10 @@ fn emit_list_of_arm(
         f.instructions().local_set(dest);
     }
     if let Some(buf_base) = ll.flags_scratch_buf_base {
-        let dest = lcl.list_elem_flags_scratch_base.expect(
-            "list_elem_flags_scratch_base unset — fn_has_list_elem_flags \
-             gate disagrees with ListEmitLocals.flags_scratch_buf_base",
-        );
-        // Stride is `Σ(per-cell item_names.len() * STRING_FLAT_BYTES)`
-        // — minimum is `1 * STRING_FLAT_BYTES = 8` when at least one
-        // cell exists (gated by `Some(buf_base)`). No `!= 1` short-
-        // circuit makes sense here (cf. char scratch, where 1-byte
-        // stride is real).
+        let dest = lcl
+            .list_elem_flags_scratch_base
+            .expect("fn_has_list_elem_flags disagrees with flags_scratch_buf_base");
+        // Stride min is 1 cell's `STRING_FLAT_BYTES` (gated by Some).
         debug_assert!(
             ll.flags_scratch_bytes_per_elem >= STRING_FLAT_BYTES,
             "flags_scratch_bytes_per_elem ({}) below 1 cell's worth of \
@@ -1840,16 +1560,12 @@ fn emit_list_of_arm(
         f.instructions().local_set(dest);
     }
 
-    // list_elem_record_base = record_slot_base + j * records_per_elem
-    // list_elem_record_tuples_base = record_tuples_buf_base
-    //                              + j * record_tuples_bytes_per_elem
-    // Both staged once so per-cell `emit_record_runtime_fill` adds the
-    // build-time-const offsets without recomputing.
+    // list_elem_record_base = record_slot_base + j * records_per_elem,
+    // list_elem_record_tuples_base = record_tuples_buf_base + j * ...
     if let Some(slot_base) = ll.record_slot_base {
-        let dest = lcl.list_elem_record_base.expect(
-            "list_elem_record_base unset — fn_has_list_elem_record gate \
-             disagrees with ListEmitLocals.record_slot_base",
-        );
+        let dest = lcl
+            .list_elem_record_base
+            .expect("fn_has_list_elem_record disagrees with record_slot_base");
         f.instructions().local_get(slot_base);
         f.instructions().local_get(ll.j);
         if ll.records_per_elem != 1 {
@@ -1860,10 +1576,9 @@ fn emit_list_of_arm(
         f.instructions().local_set(dest);
     }
     if let Some(buf_base) = ll.record_tuples_buf_base {
-        let dest = lcl.list_elem_record_tuples_base.expect(
-            "list_elem_record_tuples_base unset — fn_has_list_elem_record \
-             gate disagrees with ListEmitLocals.record_tuples_buf_base",
-        );
+        let dest = lcl
+            .list_elem_record_tuples_base
+            .expect("fn_has_list_elem_record disagrees with record_tuples_buf_base");
         f.instructions().local_get(buf_base);
         f.instructions().local_get(ll.j);
         f.instructions()
@@ -1875,10 +1590,9 @@ fn emit_list_of_arm(
 
     // list_elem_variant_base = variant_slot_base + j * variants_per_elem
     if let Some(slot_base) = ll.variant_slot_base {
-        let dest = lcl.list_elem_variant_base.expect(
-            "list_elem_variant_base unset — fn_has_list_elem_variant gate \
-             disagrees with ListEmitLocals.variant_slot_base",
-        );
+        let dest = lcl
+            .list_elem_variant_base
+            .expect("fn_has_list_elem_variant disagrees with variant_slot_base");
         f.instructions().local_get(slot_base);
         f.instructions().local_get(ll.j);
         if ll.variants_per_elem != 1 {
@@ -1889,10 +1603,9 @@ fn emit_list_of_arm(
         f.instructions().local_set(dest);
     }
 
-    // Per element-plan cell: stage its absolute address (and any
-    // per-iteration scratch), then dispatch to emit_cell_op.
-    // `char_idx` counts char-cells in element-plan walk order so
-    // multi-char elements get distinct slots in the per-call buffer.
+    // Per element-plan cell: stage addr (and any per-iter scratch),
+    // then dispatch. `char_idx` walks char-cells so multi-char
+    // elements get distinct slots in the per-call buffer.
     let mut char_idx: u32 = 0;
     for (cell_pos, elem_cell) in element_plan.cells.iter().enumerate() {
         emit_set_elem_cell_addr(f, lcl, ll, cell_pos as u32, cell_layout.size);
@@ -1902,9 +1615,6 @@ fn emit_list_of_arm(
                 char_idx += 1;
             }
             Cell::TupleOf { children } => {
-                // Resolve the element_plan-relative child indices to
-                // runtime cell-array indices and stash them in the
-                // per-iteration tuple-idx buffer slot.
                 let CellSideData::Tuple {
                     source: TupleIdxSource::PerIteration { offset_in_elem },
                 } = ll.elem_cell_side[cell_pos]
@@ -1940,10 +1650,7 @@ fn emit_list_of_arm(
         ll.chars_per_elem,
     );
 
-    // indices_ptr[j*4] = elem_cell_base + root — the cell-array
-    // index of this element's root cell, written through the
-    // already-staged `ll.elem_cell_base` rather than recomputing
-    // `start_i + j*elem_count`.
+    // indices_ptr[j*4] = elem_cell_base + root.
     f.instructions().local_get(ll.indices_ptr);
     f.instructions().local_get(ll.j);
     f.instructions().i32_const(4);
@@ -1970,10 +1677,8 @@ fn emit_list_of_arm(
 }
 
 /// Stage the absolute cell-array address of element-plan position
-/// `cell_pos` for the current iteration into `lcl.addr`:
-/// `cells_base + (elem_cell_base + cell_pos) * cell_size`. Reads
-/// `ll.elem_cell_base` (staged once at iteration start) instead of
-/// recomputing `start_i + j*elem_count`.
+/// `cell_pos` into `lcl.addr`:
+/// `cells_base + (elem_cell_base + cell_pos) * cell_size`.
 fn emit_set_elem_cell_addr(
     f: &mut Function,
     lcl: &WrapperLocals,
@@ -1993,12 +1698,9 @@ fn emit_set_elem_cell_addr(
     f.instructions().local_set(lcl.addr);
 }
 
-/// Resolve a cell-payload child cell-array index to a [`PayloadSource`].
-/// Static (top-level) cells get a build-time `ConstI32`. List-element
-/// cells stage `elem_cell_base + relative_idx` into
-/// `lcl.list_elem_child_idx` and return `Local` — except when
-/// `relative_idx == 0`, in which case `base` already holds the
-/// answer and the staging copy is skipped.
+/// Resolve a cell-payload child cell-array index. Static → ConstI32;
+/// list-element → stage `elem_cell_base + relative_idx` into
+/// `lcl.list_elem_child_idx`. `relative_idx == 0` reuses `base` directly.
 fn stage_child_idx_source(
     f: &mut Function,
     lcl: &WrapperLocals,
@@ -2011,10 +1713,9 @@ fn stage_child_idx_source(
     if relative_idx == 0 {
         return PayloadSource::Local(base);
     }
-    let dest = lcl.list_elem_child_idx.expect(
-        "list_elem_child_idx unset — fn_has_list_elem_child_idx must agree \
-         with the cells reaching emit_single_slot_cell",
-    );
+    let dest = lcl
+        .list_elem_child_idx
+        .expect("fn_has_list_elem_child_idx disagrees with cells reaching here");
     f.instructions().local_get(base);
     f.instructions().i32_const(relative_idx as i32);
     f.instructions().i32_add();
@@ -2022,12 +1723,8 @@ fn stage_child_idx_source(
     PayloadSource::Local(dest)
 }
 
-/// Emit one `Cell::TupleOf` cell. Dispatches on the side-data
-/// `TupleIdxSource`: static cells point at the build-time blob;
-/// list-element cells consume `lcl.tuple_slot_ptr`, which the caller
-/// (emit_list_of_arm) has already staged for this iteration plus
-/// written each child's runtime cell-array index into
-/// `mem[slot_ptr + i*4]`.
+/// Emit one `Cell::TupleOf`. Static cells point at the build-time
+/// blob; list-element cells consume `lcl.tuple_slot_ptr`.
 fn emit_tuple_of_cell(
     f: &mut Function,
     cell_layout: &CellLayout,
@@ -2104,25 +1801,21 @@ fn emit_stage_tuple_slot(
     }
 }
 
-/// Stage the per-iteration utf-8 scratch address for the
-/// `char_idx`-th `Cell::Char` of element_plan into
-/// `lcl.char_scratch_addr`:
-/// `base + (j * chars_per_elem + char_idx) * MAX_UTF8_LEN`. Pairs
-/// with `CharScratch::Prestaged` in [`emit_single_slot_cell`].
+/// Stage utf-8 scratch addr for the `char_idx`-th `Cell::Char` of
+/// element_plan: `base + (j * chars_per_elem + char_idx) * MAX_UTF8_LEN`.
+/// Pairs with `CharScratch::Prestaged`.
 fn emit_stage_char_scratch_addr(
     f: &mut Function,
     lcl: &WrapperLocals,
     ll: &ListEmitLocals,
     char_idx: u32,
 ) {
-    let scratch_base = ll.char_scratch_base.expect(
-        "Cell::Char element requires char_scratch_base — \
-         build_one_list_emit_locals must have allocated it",
-    );
-    let scratch_addr_local = lcl.char_scratch_addr.expect(
-        "char_scratch_addr unset for a list with Cell::Char elements — \
-         fn_contains_char must include element-plan chars",
-    );
+    let scratch_base = ll
+        .char_scratch_base
+        .expect("Cell::Char element requires char_scratch_base");
+    let scratch_addr_local = lcl
+        .char_scratch_addr
+        .expect("fn_contains_char must include element-plan chars");
     debug_assert!(char_idx < ll.chars_per_elem);
     // base + (j * chars_per_elem + char_idx) * MAX_UTF8_LEN
     f.instructions().local_get(scratch_base);
@@ -2143,11 +1836,9 @@ fn emit_stage_char_scratch_addr(
     f.instructions().local_set(scratch_addr_local);
 }
 
-/// Fill one `Cell::Handle`'s slot in the per-call handle-info buffer:
-/// build-time-const `type-name` + runtime zero-extended `id`. Static
-/// slots fold the offset into a memarg; per-iteration slots stage
-/// `slot_addr = base + (iter_base + offset_in_elem) * sizeof` once
-/// and reuse for the three stores.
+/// Fill one `Cell::Handle`'s slot: const `type-name` + runtime
+/// zero-extended `id`. Static folds the offset into memargs;
+/// PerIteration stages slot_addr once and reuses it.
 fn emit_handle_runtime_fill(
     f: &mut Function,
     handle_local: u32,
@@ -2156,16 +1847,11 @@ fn emit_handle_runtime_fill(
     info: HandleInfoOffsets,
 ) {
     use super::sidetable::handle_info::HandleSlotSource;
-    let base_local = lcl.handle_info_base.expect(
-        "handle_info_base local unset on a wrapper containing Cell::Handle — \
-         fn_has_handle_cells gate must agree with the cells reaching \
-         emit_handle_runtime_fill",
-    );
+    let base_local = lcl
+        .handle_info_base
+        .expect("fn_has_handle_cells disagrees with cells reaching here");
     let (slot_local, type_name_off, id_off) = match fill.slot_source {
         HandleSlotSource::Static(idx) => {
-            // Build-time-const byte offset: fold the multiply at build
-            // time and stage everything via `local_get base + offset`
-            // memargs (no runtime multiply, no scratch local needed).
             let entry_off = idx * info.entry_size;
             (
                 base_local,
@@ -2174,16 +1860,13 @@ fn emit_handle_runtime_fill(
             )
         }
         HandleSlotSource::PerIteration { offset_in_elem } => {
-            // slot_addr = handle_info_base
-            //           + (list_elem_handle_base + offset_in_elem) * entry_size
-            let iter_base = lcl.list_elem_handle_base.expect(
-                "list_elem_handle_base unset — fn_has_list_elem_handle gate \
-                 disagrees with walk_element_plan",
-            );
-            let scratch = lcl.handle_slot_addr.expect(
-                "handle_slot_addr unset — fn_has_list_elem_handle gate \
-                 disagrees with the cells reaching emit_handle_runtime_fill",
-            );
+            // slot_addr = base + (iter_base + offset_in_elem) * entry_size
+            let iter_base = lcl
+                .list_elem_handle_base
+                .expect("fn_has_list_elem_handle disagrees with walk_element_plan");
+            let scratch = lcl
+                .handle_slot_addr
+                .expect("fn_has_list_elem_handle disagrees with cells reaching here");
             f.instructions().local_get(iter_base);
             if offset_in_elem != 0 {
                 f.instructions().i32_const(offset_in_elem as i32);
@@ -2228,14 +1911,10 @@ fn emit_handle_runtime_fill(
     });
 }
 
-/// Fill one `Cell::RecordOf`'s slot in the per-call record-info
-/// buffer: write `type-name` + `fields` slice (`(ptr, len)`). Static
-/// cells fold offsets into memargs and use the pre-resolved absolute
-/// `fields_ptr` from the fill. List-element cells stage the entry
-/// address + per-iter `fields_ptr` from the iter base locals, then
-/// write each field's `(name, child-cell-idx)` tuple into the
-/// per-iter tuples sub-slice (with `cell_idx = elem_cell_base +
-/// child_pos_in_elem` resolved at runtime).
+/// Fill one `Cell::RecordOf`'s slot: write `type-name` + `fields`
+/// slice. Static folds offsets into memargs; PerIteration stages
+/// entry + tuples addrs from the iter bases and writes each field's
+/// `(name, child-cell-idx)` tuple with idx = elem_cell_base + child_pos.
 fn emit_record_runtime_fill(
     f: &mut Function,
     fill: &RecordRuntimeFill,
@@ -2245,17 +1924,14 @@ fn emit_record_runtime_fill(
     info: RecordInfoOffsets,
 ) {
     use super::sidetable::record_info::RecordSlotSource;
-    // PerIteration ↔ Some couple — see emit_variant_runtime_fill.
     debug_assert_eq!(
         matches!(fill.slot_source, RecordSlotSource::PerIteration { .. }),
         elem_cell_base.is_some(),
         "slot_source / elem_cell_base must agree (PerIteration ↔ Some)",
     );
-    let base_local = lcl.record_info_base.expect(
-        "record_info_base local unset on a wrapper containing Cell::RecordOf — \
-         fn_has_record_cells gate must agree with the cells reaching \
-         emit_record_runtime_fill",
-    );
+    let base_local = lcl
+        .record_info_base
+        .expect("fn_has_record_cells disagrees with cells reaching here");
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
@@ -2294,17 +1970,16 @@ fn emit_record_runtime_fill(
         } => {
             let iter_entry_base = lcl
                 .list_elem_record_base
-                .expect("list_elem_record_base unset — fn_has_list_elem_record gate disagrees");
-            let iter_tuples_base = lcl.list_elem_record_tuples_base.expect(
-                "list_elem_record_tuples_base unset — fn_has_list_elem_record gate disagrees",
-            );
-            let entry_dest = lcl.record_slot_addr.expect(
-                "record_slot_addr unset — fn_has_list_elem_record gate disagrees \
-                 with the cells reaching emit_record_runtime_fill",
-            );
+                .expect("fn_has_list_elem_record disagrees");
+            let iter_tuples_base = lcl
+                .list_elem_record_tuples_base
+                .expect("fn_has_list_elem_record disagrees");
+            let entry_dest = lcl
+                .record_slot_addr
+                .expect("fn_has_list_elem_record disagrees");
             let tuples_dest = lcl
                 .record_tuples_slice_addr
-                .expect("record_tuples_slice_addr unset — fn_has_list_elem_record gate disagrees");
+                .expect("fn_has_list_elem_record disagrees");
             // entry_addr = base + (iter_entry_base + entry_offset_in_elem) * entry_size
             f.instructions().local_get(iter_entry_base);
             if entry_offset_in_elem != 0 {
@@ -2324,9 +1999,7 @@ fn emit_record_runtime_fill(
             }
             f.instructions().local_set(tuples_dest);
 
-            // Write type-name (build-time-const) + fields.len
-            // (build-time-const) into the entry, with fields.ptr =
-            // tuples_slice_addr (runtime).
+            // type-name + fields.len const; fields.ptr = tuples_slice_addr.
             let store_const = |f: &mut Function, off: u32, value: i32| {
                 f.instructions().local_get(entry_dest);
                 f.instructions().i32_const(value);
@@ -2352,12 +2025,10 @@ fn emit_record_runtime_fill(
                 fill.fields_len as i32,
             );
 
-            // Per field: write the tuple at
-            //   tuples_slice_addr + i * tuple_size
-            // with name = const, idx = elem_cell_base + child_pos.
+            // tuple at tuples_slice_addr + i*tuple_size:
+            // name = const, idx = elem_cell_base + child_pos.
             let elem_base = elem_cell_base.expect(
-                "PerIteration record fill outside a list element body — \
-                 emit_cell_op must thread elem_cell_base for list-element records",
+                "PerIteration record fill needs elem_cell_base — emit_cell_op must thread it",
             );
             debug_assert_eq!(
                 fields.len() as u32,
@@ -2367,7 +2038,6 @@ fn emit_record_runtime_fill(
             for (i, (name, child_pos_in_elem)) in fields.iter().enumerate() {
                 let i = i as u32;
                 let tuple_off = i * info.tuple_size;
-                // tuple.name = const
                 let store_name = |f: &mut Function, off: u32, value: i32| {
                     f.instructions().local_get(tuples_dest);
                     f.instructions().i32_const(value);
@@ -2383,7 +2053,6 @@ fn emit_record_runtime_fill(
                     tuple_off + info.tuple_name_off + SLICE_LEN_OFFSET,
                     name.len as i32,
                 );
-                // tuple.idx = elem_cell_base + child_pos_in_elem
                 f.instructions().local_get(tuples_dest);
                 f.instructions().local_get(elem_base);
                 if *child_pos_in_elem != 0 {
@@ -2398,7 +2067,6 @@ fn emit_record_runtime_fill(
 }
 
 /// Resolve a `Cell::RecordOf`'s `cell::record-of(idx)` payload.
-/// Same shape as [`stage_flags_cell_payload`].
 fn stage_record_cell_payload(
     f: &mut Function,
     lcl: &WrapperLocals,
@@ -2413,13 +2081,13 @@ fn stage_record_cell_payload(
         } => {
             let iter_base = lcl
                 .list_elem_record_base
-                .expect("list_elem_record_base unset — fn_has_list_elem_record gate disagrees");
+                .expect("fn_has_list_elem_record disagrees");
             if entry_offset_in_elem == 0 {
                 return PayloadSource::Local(iter_base);
             }
             let dest = lcl
                 .record_payload_idx
-                .expect("record_payload_idx unset — fn_has_list_elem_record gate disagrees");
+                .expect("fn_has_list_elem_record disagrees");
             f.instructions().local_get(iter_base);
             f.instructions().i32_const(entry_offset_in_elem as i32);
             f.instructions().i32_add();
@@ -2430,7 +2098,6 @@ fn stage_record_cell_payload(
 }
 
 /// Resolve a `Cell::Flags`'s `cell::flags-set(idx)` payload.
-/// Same shape as [`stage_handle_cell_payload`].
 fn stage_flags_cell_payload(
     f: &mut Function,
     lcl: &WrapperLocals,
@@ -2445,13 +2112,13 @@ fn stage_flags_cell_payload(
         } => {
             let iter_base = lcl
                 .list_elem_flags_base
-                .expect("list_elem_flags_base unset — fn_has_list_elem_flags gate disagrees");
+                .expect("fn_has_list_elem_flags disagrees");
             if entry_offset_in_elem == 0 {
                 return PayloadSource::Local(iter_base);
             }
             let dest = lcl
                 .flags_payload_idx
-                .expect("flags_payload_idx unset — fn_has_list_elem_flags gate disagrees");
+                .expect("fn_has_list_elem_flags disagrees");
             f.instructions().local_get(iter_base);
             f.instructions().i32_const(entry_offset_in_elem as i32);
             f.instructions().i32_add();
@@ -2462,9 +2129,6 @@ fn stage_flags_cell_payload(
 }
 
 /// Resolve a `Cell::Handle`'s `cell::*-handle(idx)` payload.
-/// Static → `ConstI32(idx)`; list-element → `iter_base +
-/// offset_in_elem` into `lcl.handle_payload_idx` (or `iter_base`
-/// itself when offset is zero). Mirrors [`stage_child_idx_source`].
 fn stage_handle_cell_payload(
     f: &mut Function,
     lcl: &WrapperLocals,
@@ -2494,13 +2158,9 @@ fn stage_handle_cell_payload(
     }
 }
 
-/// Fill one `Cell::Flags`'s slot in the per-call flags-info buffer +
-/// scratch slab: write `type-name` + `set-flags.ptr` (build-time-const)
-/// into the entry, bit-walk the bitmask to write `(name_ptr, name_len)`
-/// pairs into scratch + count, then write `set-flags.len`. Bit-walk
-/// is unrolled — at ≤ 8 bits per typical flag type the overhead of a
-/// counter + `br_if` outweighs the static instructions. Single-threaded;
-/// the per-cell scratch slab is unsafe under concurrent calls.
+/// Fill one `Cell::Flags`'s slot + scratch: type-name + set-flags.ptr
+/// const, bit-walk writes `(name_ptr, name_len)` pairs + count.
+/// Unrolled bit-walk — at ≤ 8 bits a loop's overhead dominates.
 fn emit_flags_runtime_fill(
     f: &mut Function,
     bitmask_local: u32,
@@ -2515,24 +2175,15 @@ fn emit_flags_runtime_fill(
         memory_index: 0,
     };
 
-    let base_local = lcl.flags_info_base.expect(
-        "flags_info_base local unset on a wrapper containing Cell::Flags — \
-         fn_has_flags_cells gate must agree with the cells reaching \
-         emit_flags_runtime_fill",
-    );
-    // Stage `entry_addr` (where type-name + set-flags slot live) and
-    // initialize `flags_addr` to the start of this cell's scratch slab
-    // (the bit-walker consumes flags_addr as a moving cursor). Static
-    // cells fold offsets into memargs; list-element cells compute
-    // both at runtime off the per-iter base locals.
+    let base_local = lcl
+        .flags_info_base
+        .expect("fn_has_flags_cells disagrees with cells reaching here");
+    // Stage entry_addr + flags_addr cursor for the bit-walker.
     let (entry_addr_local, entry_off) = match fill.slot_source {
         FlagsSlotSource::Static {
             entry_idx,
             scratch_addr,
         } => {
-            // Scratch is build-time-const. Stage flags_addr once;
-            // both the set-flags.ptr write and the bit-walker cursor
-            // consume it directly.
             f.instructions().i32_const(scratch_addr);
             f.instructions().local_set(lcl.flags_addr);
             (base_local, entry_idx * info.entry_size)
@@ -2541,16 +2192,15 @@ fn emit_flags_runtime_fill(
             entry_offset_in_elem,
             scratch_offset_in_elem,
         } => {
-            let entry_dest = lcl.flags_slot_addr.expect(
-                "flags_slot_addr unset — fn_has_list_elem_flags gate disagrees \
-                 with the cells reaching emit_flags_runtime_fill",
-            );
+            let entry_dest = lcl
+                .flags_slot_addr
+                .expect("fn_has_list_elem_flags disagrees");
             let iter_entry_base = lcl
                 .list_elem_flags_base
-                .expect("list_elem_flags_base unset — fn_has_list_elem_flags gate disagrees");
-            let iter_scratch_base = lcl.list_elem_flags_scratch_base.expect(
-                "list_elem_flags_scratch_base unset — fn_has_list_elem_flags gate disagrees",
-            );
+                .expect("fn_has_list_elem_flags disagrees");
+            let iter_scratch_base = lcl
+                .list_elem_flags_scratch_base
+                .expect("fn_has_list_elem_flags disagrees");
             // entry_addr = base + (iter_entry_base + entry_offset) * entry_size
             f.instructions().local_get(iter_entry_base);
             if entry_offset_in_elem != 0 {
@@ -2562,9 +2212,7 @@ fn emit_flags_runtime_fill(
             f.instructions().local_get(base_local);
             f.instructions().i32_add();
             f.instructions().local_set(entry_dest);
-            // flags_addr = iter_scratch_base + scratch_offset_in_elem.
-            // Stage once; both the set-flags.ptr write and the bit-
-            // walker cursor consume it directly.
+            // flags_addr = iter_scratch_base + scratch_offset_in_elem
             f.instructions().local_get(iter_scratch_base);
             if scratch_offset_in_elem != 0 {
                 f.instructions().i32_const(scratch_offset_in_elem as i32);
@@ -2578,7 +2226,6 @@ fn emit_flags_runtime_fill(
     let type_name_off = entry_off + info.type_name_off;
     let set_flags_off = entry_off + info.set_flags_off;
 
-    // Write type-name (build-time-const).
     let store_const = |f: &mut Function, off: u32, value: i32| {
         f.instructions().local_get(entry_addr_local);
         f.instructions().i32_const(value);
@@ -2594,15 +2241,12 @@ fn emit_flags_runtime_fill(
         type_name_off + SLICE_LEN_OFFSET,
         fill.type_name.len as i32,
     );
-    // Write set-flags.ptr from flags_addr (the bit-walker's starting
-    // cursor — see staging above). Subsequent advances to flags_addr
-    // by the bit-walker don't affect this already-stored ptr.
+    // set-flags.ptr captures flags_addr before the bit-walk advances it.
     f.instructions().local_get(entry_addr_local);
     f.instructions().local_get(lcl.flags_addr);
     f.instructions()
         .i32_store(store_i32(set_flags_off + SLICE_PTR_OFFSET));
 
-    // Bit-walk count starts at 0; flags_addr already initialized.
     f.instructions().i32_const(0);
     f.instructions().local_set(lcl.flags_count);
 
@@ -2640,18 +2284,9 @@ fn emit_flags_runtime_fill(
         .i32_store(store_i32(set_flags_off + SLICE_LEN_OFFSET));
 }
 
-/// Fill one `Cell::Variant`'s slot in the per-call variant-info
-/// buffer: write `type-name` (build-time-const) and the
-/// disc-dispatched `case-name` + `payload` (option<u32>) at runtime.
-/// Static cells fold offsets into memargs; per-iteration cells stage
-/// `slot_addr = base + (iter_base + offset_in_elem) * entry_size`
-/// once and reuse for every store. List-element payload child idxs
-/// resolve to `elem_cell_base + child_pos_in_elem` at runtime.
-///
-/// N-way disc dispatch is encoded as nested if/else. For typical
-/// variants (≤ 8 cases) the nested depth is manageable; `br_table`
-/// is a future optimization. Single-threaded — the per-cell scratch
-/// is unsafe under concurrent calls.
+/// Fill one `Cell::Variant`'s slot: const `type-name` + disc-dispatched
+/// `case-name` + `payload` (option<u32>). N-way disc dispatch is nested
+/// if/else; `br_table` is a future optimization.
 fn emit_variant_runtime_fill(
     f: &mut Function,
     disc_local: u32,
@@ -2662,20 +2297,16 @@ fn emit_variant_runtime_fill(
 ) {
     use super::sidetable::variant_info::VariantSlotSource;
     // PerIteration ↔ Some couple: walk_element_plan only assigns
-    // PerIteration to list-element cells, and emit_cell_op only
-    // threads `Some(elem_cell_base)` inside list bodies. A drift
-    // would silently produce wrong wasm (Static + Some would write
-    // child_idx as a const ignoring `elem_cell_base`).
+    // PerIteration to list-element cells; drift would silently emit
+    // child_idx as a const ignoring `elem_cell_base`.
     debug_assert_eq!(
         matches!(fill.slot_source, VariantSlotSource::PerIteration { .. }),
         elem_cell_base.is_some(),
         "slot_source / elem_cell_base must agree (PerIteration ↔ Some)",
     );
-    let base_local = lcl.variant_info_base.expect(
-        "variant_info_base local unset on a wrapper containing Cell::Variant — \
-         fn_has_variant_cells gate must agree with the cells reaching \
-         emit_variant_runtime_fill",
-    );
+    let base_local = lcl
+        .variant_info_base
+        .expect("fn_has_variant_cells disagrees with cells reaching here");
     let store_i32 = |off: u32| MemArg {
         offset: off as u64,
         align: I32_STORE_LOG2_ALIGN,
@@ -2687,9 +2318,7 @@ fn emit_variant_runtime_fill(
         memory_index: 0,
     };
 
-    // Stage the entry-slot address: Static folds the offset into
-    // memargs (slot_local = base, all field offsets baked); list-
-    // element stages slot_addr once and uses zero memarg offsets.
+    // Static folds offsets into memargs; PerIteration stages slot_addr.
     let (slot_local, slot_off) = match fill.slot_source {
         VariantSlotSource::Static { entry_idx } => (base_local, entry_idx * info.entry_size),
         VariantSlotSource::PerIteration {
@@ -2697,11 +2326,10 @@ fn emit_variant_runtime_fill(
         } => {
             let iter_base = lcl
                 .list_elem_variant_base
-                .expect("list_elem_variant_base unset — fn_has_list_elem_variant gate disagrees");
-            let dest = lcl.variant_slot_addr.expect(
-                "variant_slot_addr unset — fn_has_list_elem_variant gate disagrees \
-                 with the cells reaching emit_variant_runtime_fill",
-            );
+                .expect("fn_has_list_elem_variant disagrees");
+            let dest = lcl
+                .variant_slot_addr
+                .expect("fn_has_list_elem_variant disagrees");
             // slot_addr = base + (iter_base + entry_offset_in_elem) * entry_size
             f.instructions().local_get(iter_base);
             if entry_offset_in_elem != 0 {
@@ -2717,7 +2345,6 @@ fn emit_variant_runtime_fill(
         }
     };
 
-    // Write type-name (build-time-const).
     let type_name_off = slot_off + info.type_name_off;
     let store_const = |f: &mut Function, off: u32, value: i32| {
         f.instructions().local_get(slot_local);
@@ -2741,9 +2368,8 @@ fn emit_variant_runtime_fill(
 
     debug_assert_eq!(fill.case_names.len(), fill.per_case_payload.len());
 
-    // Nested if/else: for each case `i`, `if disc == i { write case
-    // i's data }` else recurse. The last arm has no else (canonical-
-    // ABI disc out of range is unreachable).
+    // Nested if/else per disc; last arm has no else (canonical-ABI
+    // disc out of range is unreachable).
     for (i, name) in fill.case_names.iter().enumerate() {
         let is_last = i + 1 == fill.case_names.len();
         if !is_last {
@@ -2752,12 +2378,10 @@ fn emit_variant_runtime_fill(
             f.instructions().i32_eq();
             f.instructions().if_(BlockType::Empty);
         }
-        // case-name = case_names[i]
         store_const(f, case_name_off + SLICE_PTR_OFFSET, name.off as i32);
         store_const(f, case_name_off + SLICE_LEN_OFFSET, name.len as i32);
-        // payload = some(child_idx) or none. `child_idx` is plan-
-        // relative; static cells write it as a const, list-element
-        // cells resolve it to `elem_cell_base + child_pos` at runtime.
+        // child_idx is plan-relative; list-element resolves to
+        // elem_cell_base + child_pos at runtime.
         match fill.per_case_payload[i] {
             Some(child_idx) => {
                 f.instructions().local_get(slot_local);
@@ -2779,24 +2403,22 @@ fn emit_variant_runtime_fill(
                 f.instructions().i32_store(store_i32(payload_value_off));
             }
             None => {
+                // value slot untouched (irrelevant when disc=0)
                 f.instructions().local_get(slot_local);
                 f.instructions().i32_const(OPTION_NONE as i32);
                 f.instructions().i32_store8(store_i8(payload_off));
-                // value slot left untouched (irrelevant when disc=0)
             }
         }
         if !is_last {
             f.instructions().else_();
         }
     }
-    // Close all the nested `if`s — N-1 ends.
     for _ in 0..fill.case_names.len().saturating_sub(1) {
         f.instructions().end();
     }
 }
 
 /// Resolve a `Cell::Variant`'s `cell::variant-case(idx)` payload.
-/// Same shape as [`stage_record_cell_payload`].
 fn stage_variant_cell_payload(
     f: &mut Function,
     lcl: &WrapperLocals,
@@ -2810,13 +2432,13 @@ fn stage_variant_cell_payload(
         } => {
             let iter_base = lcl
                 .list_elem_variant_base
-                .expect("list_elem_variant_base unset — fn_has_list_elem_variant gate disagrees");
+                .expect("fn_has_list_elem_variant disagrees");
             if entry_offset_in_elem == 0 {
                 return PayloadSource::Local(iter_base);
             }
             let dest = lcl
                 .variant_payload_idx
-                .expect("variant_payload_idx unset — fn_has_list_elem_variant gate disagrees");
+                .expect("fn_has_list_elem_variant disagrees");
             f.instructions().local_get(iter_base);
             f.instructions().i32_const(entry_offset_in_elem as i32);
             f.instructions().i32_add();
@@ -2826,15 +2448,8 @@ fn stage_variant_cell_payload(
     }
 }
 
-/// Emit the wasm to lift a single-cell result value into the cell at
-/// `lcl.addr`. Direct primitive returns read from `lcl.result`;
-/// Text/Bytes returns load `(ptr, len)` from retptr scratch into
-/// `ptr_scratch` / `len_scratch` and lift those.
-///
-/// Compound results don't go through here — their cells aren't a
-/// single one-shot write, so the wrapper-body emitter walks them via
-/// [`emit_lift_plan`] after capturing the retptr-loaded flat slots
-/// into synthetic locals.
+/// Emit lift for a single-cell Direct result at `lcl.addr`. Compound
+/// results go through `emit_lift_compound_prefix` + `emit_lift_plan`.
 pub(crate) fn emit_lift_result(
     f: &mut Function,
     ctx: &LiftEmitCtx<'_>,
@@ -2848,7 +2463,7 @@ pub(crate) fn emit_lift_result(
             side_data,
         } => {
             // classify_result_lift routes Compound-only kinds away
-            // from Direct, so a Direct cell here is always single-source.
+            // from Direct.
             debug_assert!(
                 !matches!(
                     cell,
@@ -2865,17 +2480,9 @@ pub(crate) fn emit_lift_result(
     }
 }
 
-/// Emit the wasm prefix for a compound result: load the result's
-/// canonical-ABI bytes from `retptr_offset` via the pre-built
-/// `lift_from_memory` instruction sequence, then capture each flat
-/// value into a synthetic local in REVERSE order (the wasm stack is
-/// LIFO — the last-pushed value is the highest-indexed flat slot).
-///
-/// After this returns, the synthetic locals at `synth_locals[0]..
-/// synth_locals[N]` hold the result's flat values in canonical-ABI
-/// order, ready for [`emit_lift_plan`] (called with `local_base =
-/// synth_locals[0]`) to walk the cell plan and recover the absolute
-/// synth-local indices.
+/// Emit compound-result prefix: load bytes from `retptr_offset` via
+/// `loads`, then capture each flat value into `synth_locals` in
+/// REVERSE order (wasm stack is LIFO).
 pub(crate) fn emit_lift_compound_prefix(
     f: &mut Function,
     plan_flat_slot_count: u32,
@@ -2889,16 +2496,12 @@ pub(crate) fn emit_lift_compound_prefix(
         plan_flat_slot_count as usize,
         "synthetic-local count (emit) must match classify-time plan flat slot count"
     );
-    // Stage retptr_offset into the addr local that the pre-built
-    // bindgen loads read from.
     f.instructions().i32_const(retptr_offset);
     f.instructions().local_set(addr_local);
-    // Push canonical-ABI flat values onto the wasm value stack.
     for inst in loads {
         f.instruction(inst);
     }
-    // local.set in reverse order: top-of-stack is the LAST pushed (=
-    // highest flat-slot index). Working back to slot 0.
+    // Reverse order: stack top is the last pushed (highest slot).
     for &local in synth_locals.iter().rev() {
         f.instructions().local_set(local);
     }

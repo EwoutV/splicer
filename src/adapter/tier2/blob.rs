@@ -1,18 +1,7 @@
-//! Data-segment packing helpers for tier-2.
-//!
-//! Mirrors what `cells::CellLayout` does on the wasm-emit side: read
-//! field offsets from a [`RecordLayout`] (already schema-derived) and
-//! expose name-keyed writes, so no caller has to do
-//! `base + layout.offset_of("foo") + SLICE_PTR_OFFSET as usize` math
-//! inline. Also collapses the dozens of `(u32, u32)` "pointer/length"
-//! tuples into a typed [`BlobSlice`].
-//!
-//! Cross-segment pointers go through the [`Segment`] / [`SymRef`] /
-//! [`Reloc`] relocation model: a builder writes a placeholder + a
-//! [`Reloc`] (or hands back a [`SymRef`]), and the layout phase
-//! resolves both in one pass after every segment has a base address.
-//! This makes segment placement order commutative — no
-//! "patch-then-translate" sequence to get wrong.
+//! Data-segment packing helpers for tier-2. Name-keyed record writes
+//! over a schema-derived [`RecordLayout`], typed [`BlobSlice`]
+//! pointer/length pairs, and a [`Segment`] / [`SymRef`] / [`Reloc`]
+//! relocation model so segment placement order is commutative.
 
 use std::collections::HashMap;
 
@@ -20,17 +9,9 @@ use super::super::abi::emit::{
     BlobSlice, RecordLayout, OPTION_NONE, OPTION_SOME, SLICE_LEN_OFFSET, SLICE_PTR_OFFSET,
 };
 
-/// Append-only string interner whose handle type is [`BlobSlice`].
-/// Wraps the `Vec<u8>` that backs the tier-2 name-blob data segment;
-/// the order in which `intern` is called determines the byte offsets
-/// reported back as [`BlobSlice::off`] — that ordering used to be a
-/// comment ("appending order determines offset") and is now a type
-/// contract: callers can only produce a [`BlobSlice`] by going through
-/// `intern`, and the only way to surface the bytes is `into_bytes`.
-///
-/// Repeat calls with the same string return the same [`BlobSlice`]
-/// (offset + length) so `point` mentioned in two different functions
-/// only contributes one copy of `"point"` / `"x"` / `"y"` to the blob.
+/// Append-only string interner; the only way to obtain a `BlobSlice`
+/// is `intern`, the only way to surface bytes is `into_bytes`. Repeat
+/// `intern` of the same string returns the same slice (dedups).
 pub(crate) struct NameInterner {
     bytes: Vec<u8>,
     seen: HashMap<String, BlobSlice>,
@@ -64,14 +45,11 @@ impl NameInterner {
     }
 }
 
-/// Identifier handed out by [`SymbolBases::alloc`]; names a future
-/// data-segment base address that is not yet known at build time.
+/// Names a future data-segment base address.
 pub(crate) type SymbolId = u32;
 
-/// One pending pointer write into a [`Segment`]'s bytes. After every
-/// segment has a base in the [`SymbolBases`], the layout pass writes
-/// `bases[target] + addend` as a little-endian i32 at
-/// `segment_base + site`.
+/// One pending pointer write. After segments have bases, layout writes
+/// `bases[target] + addend` as LE i32 at `segment_base + site`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Reloc {
     pub(crate) site: u32,
@@ -79,9 +57,7 @@ pub(crate) struct Reloc {
     pub(crate) addend: i32,
 }
 
-/// One bytes-and-relocs unit handed off to the layout phase. The
-/// builder fills `bytes` and records cross-segment pointer slots in
-/// `relocs`; the layout resolves and emits the bytes.
+/// One bytes-and-relocs unit handed to the layout phase.
 pub(crate) struct Segment {
     pub(crate) id: SymbolId,
     pub(crate) align: u32,
@@ -89,12 +65,9 @@ pub(crate) struct Segment {
     pub(crate) relocs: Vec<Reloc>,
 }
 
-/// A `(ptr, len)` pair that points into segment `target` at relative
-/// `off`. Held in builder outputs until [`resolve`] looks up
-/// `target`'s placed base; calling resolve consumes the symbolic form
-/// so a "translate twice" mistake becomes a type error. Absence is
-/// modeled by the surrounding [`Option`] — `None` resolves to
-/// [`BlobSlice::EMPTY`].
+/// A `(ptr, len)` pair into segment `target` at relative `off`.
+/// `resolve` consumes the symbolic form (typed "translate twice" check).
+/// `None` resolves to `BlobSlice::EMPTY`.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct SymRef {
     pub(super) target: SymbolId,
@@ -115,12 +88,8 @@ pub(super) fn resolve(sym: Option<SymRef>, symbols: &SymbolBases) -> BlobSlice {
     }
 }
 
-/// One assigned base address per [`SymbolId`] — a thin
-/// `Vec<Option<u32>>` keyed by id. Not a compiler-style symbol table
-/// (no names, types, or scopes); only the linker-side question
-/// "where did symbol N land?". The layout phase calls `set` once per
-/// segment after assigning its base; reads happen during reloc
-/// application + [`SymRef::resolve`].
+/// One assigned base address per [`SymbolId`]. Linker-side "where did
+/// symbol N land?" only — no names, types, or scopes.
 pub(super) struct SymbolBases {
     bases: Vec<Option<u32>>,
 }
@@ -146,21 +115,15 @@ impl SymbolBases {
     }
 }
 
-/// Defers reloc resolution until every target symbol has a base.
-/// `record_segment` is called as each segment lands in the layout's
-/// data area (with that segment's assigned absolute base);
-/// [`Self::resolve`] then applies every queued write in one pass.
-///
-/// Decoupling segment placement from reloc application is the whole
-/// point of this layer — it's why placing two segments in either
-/// order produces the same final bytes.
+/// Defers reloc resolution until every target symbol has a base. The
+/// whole point of this layer — placing segments in any order produces
+/// the same final bytes.
 pub(super) struct RelocPlan {
     pending: Vec<PendingReloc>,
 }
 
 struct PendingReloc {
-    /// Index into `data_segments` of the entry holding the slot.
-    /// Captured at queue time so resolve skips the segment scan.
+    /// Index into `data_segments`; captured so resolve skips the scan.
     seg_idx: usize,
     /// Absolute byte offset of the 4-byte slot to overwrite.
     site: u32,
@@ -175,9 +138,8 @@ impl RelocPlan {
         }
     }
 
-    /// Record that `seg` landed inside `data_segments[seg_idx]` at
-    /// absolute `seg_base`. Caller must have already registered the
-    /// segment's symbol via [`SymbolBases::set`].
+    /// Caller must have already registered the segment's symbol via
+    /// `SymbolBases::set`.
     pub(super) fn record_segment(&mut self, seg_idx: usize, seg_base: u32, relocs: Vec<Reloc>) {
         for r in relocs {
             self.pending.push(PendingReloc {
@@ -189,8 +151,6 @@ impl RelocPlan {
         }
     }
 
-    /// Write `bases[target] + addend` as little-endian i32 at every
-    /// queued site. O(n) in relocs — each carries its `seg_idx`.
     pub(super) fn resolve(self, symbols: &SymbolBases, data_segments: &mut [(u32, Vec<u8>)]) {
         for r in self.pending {
             let value = (symbols.base_of(r.target) as i32).wrapping_add(r.addend);
@@ -206,18 +166,14 @@ pub(super) fn write_le_i32(buf: &mut [u8], offset: usize, value: i32) {
     buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
-/// Field-keyed writer over one record instance inside a `Vec<u8>`
-/// data segment. Holds the [`RecordLayout`] + base offset, exposes
-/// `write_*("field-name", ...)` against it. Drops the borrow on the
-/// blob between calls so a caller can interleave nested-record
-/// writers without lifetime gymnastics.
+/// Field-keyed writer over one record instance. Drops the blob borrow
+/// between calls so nested-record writers interleave freely.
 pub(super) struct RecordWriter<'a> {
     pub layout: &'a RecordLayout,
     pub base: usize,
 }
 impl<'a> RecordWriter<'a> {
-    /// Anchor at an existing record start; record bytes must already
-    /// be present (zeroed) in the blob.
+    /// Anchor at an existing record; record bytes must already be in the blob.
     pub(super) fn at(layout: &'a RecordLayout, base: usize) -> Self {
         Self { layout, base }
     }
@@ -234,7 +190,6 @@ impl<'a> RecordWriter<'a> {
         self.base + self.layout.offset_of(field) as usize
     }
 
-    /// Anchor a nested-record writer over `field`'s sub-layout.
     pub(super) fn nested<'b>(
         &self,
         field: &str,
@@ -251,23 +206,21 @@ impl<'a> RecordWriter<'a> {
         blob[self.field_offset(field)] = value;
     }
 
-    /// Write a `list<T>` / `string` field as a `(ptr, len)` slice pair.
+    /// Write a `(ptr, len)` slice pair for a `list<T>` / `string` field.
     pub(super) fn write_slice(&self, blob: &mut [u8], field: &str, slice: BlobSlice) {
         let off = self.field_offset(field);
         write_le_i32(blob, off + SLICE_PTR_OFFSET as usize, slice.off as i32);
         write_le_i32(blob, off + SLICE_LEN_OFFSET as usize, slice.len as i32);
     }
 
-    /// Set the `option<T>` discriminant byte at `field` to `none`.
-    /// Zero the payload by leaving the rest of the record at its
-    /// initial zeroes (caller should have used `extend_zero`).
+    /// Set the option disc byte to `none`. Caller must `extend_zero`
+    /// to zero the payload.
     pub(super) fn write_option_none(&self, blob: &mut [u8], field: &str) {
         self.write_u8(blob, field, OPTION_NONE);
     }
 
-    /// Set the option discriminant to `some` at `field`. The payload
-    /// itself lives at `field_offset(field) + payload_off`; the caller
-    /// fills it in via a separate writer anchored there.
+    /// Set the option disc to `some`. Caller fills the payload via a
+    /// separate writer at `field_offset(field) + payload_off`.
     pub(super) fn write_option_some(&self, blob: &mut [u8], field: &str) {
         self.write_u8(blob, field, OPTION_SOME);
     }

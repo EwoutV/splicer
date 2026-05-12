@@ -1,12 +1,6 @@
-//! Tuple-indices side-table builder.
-//!
-//! Each `Cell::TupleOf` cell carries a `[u32; N]` of child plan-cell
-//! positions in its `(ptr, len)` payload. Indices are adapter-build-
-//! time constants, so the arrays go in one shared static segment.
-//!
-//! No internal relocs — the cell payload is materialized at emit
-//! time from a resolved [`super::super::super::super::abi::emit::BlobSlice`],
-//! not patched in the segment bytes.
+//! Tuple-indices side-table builder. Each `Cell::TupleOf` carries a
+//! `[u32; N]` of child plan-cell positions. Indices are build-time
+//! constants, so all arrays share one static segment.
 
 use super::super::super::blob::{Segment, SymRef, SymbolId};
 use super::super::super::FuncClassified;
@@ -15,11 +9,7 @@ use super::PerCellIndices;
 
 const U32_SIZE: u32 = 4;
 
-/// Output of [`build_tuple_indices_blob`]: the packed `[u32]`
-/// segment plus a [`PerCellIndices<SymRef>`] keyed by (fn, param |
-/// result) × plan-cell. The layout phase calls
-/// [`PerCellIndices::resolve_param`] / [`PerCellIndices::resolve_result`]
-/// to materialize absolute [`super::super::super::super::abi::emit::BlobSlice`]s.
+/// Packed `[u32]` segment + per-cell SymRefs.
 pub(crate) struct TupleIndicesBlob {
     pub segment: Segment,
     pub per_cell_idx: PerCellIndices<SymRef>,

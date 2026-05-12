@@ -1,9 +1,5 @@
-//! Enum-info side-table builder. Reads pre-interned `(type_name,
-//! case_names)` BlobSlices off [`Cell::EnumCase`] (interned at
-//! plan-build time, mirroring [`Cell::Flags`] and [`Cell::Handle`])
-//! and writes one entry per case into the `enum-info` segment. The
-//! cell at runtime points at the contiguous per-(param|result) range
-//! via `(blob_off, len)`.
+//! Enum-info side-table builder. One entry per case in the
+//! `enum-info` segment; the cell points at the contiguous range.
 
 use super::super::super::super::abi::emit::RecordLayout;
 use super::super::super::blob::{RecordWriter, Segment, SymRef, SymbolId};
@@ -14,19 +10,12 @@ use super::{SideTableBlob, INFO_TYPE_NAME};
 
 const ENUM_INFO_CASE_NAME: &str = "case-name";
 
-/// Build the enum-info side-table blob. The selected `Cell::EnumCase`
-/// contributes `len(case_names)` entries; the cell's runtime
-/// `(off, len)` slice points at the per-(fn, param | result) range.
+/// Build the enum-info segment. Cell at runtime points at the
+/// per-(param|result) range via `(blob_off, len)`.
 ///
-/// **Plans must have ≤1 `EnumCase` per param/result.** Multi-enum
-/// plans (e.g. a record with two distinct enum fields) need a
-/// per-cell side-table-idx scheme like flags/variant — the cell
-/// payload `cell::enum-case(disc)` is the case index, not a
-/// per-enum offset, so two enum cells would step on each other in
-/// the same per-param range. The plan-builder doesn't enforce this
-/// today; the [`debug_assert`] below catches a violation at build
-/// time so a future plan-builder change fails loudly instead of
-/// silently dropping entries.
+/// **≤1 `EnumCase` per param/result** — cell payload is the case disc
+/// (not an offset), so two enums per range would collide. The
+/// debug_assert below catches violations.
 pub(crate) fn build_enum_info_blob(
     per_func: &[FuncClassified],
     entry_layout: &RecordLayout,
@@ -46,8 +35,8 @@ pub(crate) fn build_enum_info_blob(
             ));
         }
         per_param.push(params);
-        // Compound results: walk the plan (catches enums in list
-        // element plans). Direct results: the cell IS the result.
+        // Compound: walk plan (catches enums in list element plans).
+        // Direct: the cell IS the result.
         let result_cell = fd.result_lift.as_ref().and_then(|r| match r.compound() {
             Some(c) => sole_enum_case(&c.plan),
             None => match &r.source {
@@ -74,21 +63,14 @@ pub(crate) fn build_enum_info_blob(
     }
 }
 
-/// The plan's sole `Cell::EnumCase` (or `None` if the plan has no
-/// enums). Walks into list-element sub-plans — `Cell::ListOf` is the
-/// only cell kind that carries a sub-`LiftPlan` today; record/tuple/
-/// option/result/variant reference children by cell index inside
-/// the same plan, so a non-recursive `cells.iter()` would miss
-/// `list<enum>`. `debug_assert`s the ≤1 invariant the side-table
-/// shape requires.
+/// The plan's sole `Cell::EnumCase` (walks into list element plans
+/// since they're the only sub-`LiftPlan` carrier). debug_asserts ≤1.
 fn sole_enum_case(plan: &LiftPlan) -> Option<&Cell> {
     let mut found: Option<&Cell> = None;
     visit_enum_cases(plan, &mut |cell| {
         debug_assert!(
             found.is_none(),
-            "plan has multiple Cell::EnumCase entries — enum side-table \
-             keyed by per-cell disc only supports ≤1 enum per (fn, param | \
-             result); see build_enum_info_blob doc",
+            "≤1 EnumCase per range; see build_enum_info_blob doc"
         );
         found = Some(cell);
     });

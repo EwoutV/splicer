@@ -1,42 +1,8 @@
-//! Tier-2 adapter generator: lifts canonical-ABI values from the
-//! target function's parameters/result into the structural cell-array
-//! representation defined in `splicer:common/types`, then dispatches
-//! the lifted values to the middleware's tier-2 hooks.
-//!
-//! Wired: primitives, `string`, `list<u8>`, `char`, `enum`, `flags`,
-//! `record`, `tuple<...>`, `option<T>`, `result<T, E>`, `variant`,
-//! `own<R>` / `borrow<R>` resource handles, `stream<T>` / `future<T>`,
-//! `error-context` (all share `Cell::Handle` — same canonical-ABI
-//! shape, different cell-disc). Un-wired: `list<T>` (non-u8).
-//! Roadmap: `docs/tiers/lift-codegen.md`.
-//!
-//! Pipeline (driven by [`build_dispatch_module`]):
-//! 1. Classify — [`build_per_func_classified`] walks each target
-//!    function's params/result and produces a [`FuncClassified`]
-//!    list. No static-memory offsets yet.
-//! 2. Layout — [`layout::lay_out_static_memory`] reserves data +
-//!    scratch slabs, populates side-table blobs, and assembles the
-//!    immutable [`FuncDispatch`] list (classify data + offsets).
-//! 3. Emit — [`section_emit`] writes the wasm sections;
-//!    [`wrapper_body::emit_wrapper_function`] generates each
-//!    wrapper's body.
-//!
-//! Submodules:
-//! - [`blob`] — typed data-segment packing helpers (`BlobSlice`,
-//!   `RecordWriter`); the data-side analogue of [`cells::CellLayout`].
-//! - [`cells`] — emit helpers for constructing individual `cell`
-//!   variant cases in the canonical-ABI memory layout (one helper
-//!   per primitive case so far).
-//! - [`lift`] — lift classification (`Cell`), per-(param|result)
-//!   lift descriptors, side-table population, and the wasm-encoder
-//!   codegen that writes one cell per lifted value.
-//! - [`schema`] — `splicer:common/types` typedef layouts + tier-2
-//!   hook-import resolution.
-//! - [`layout`] — static-memory layout phase (`lay_out_static_memory`
-//!   + blob builders).
-//! - [`section_emit`] — wasm section emitters (types, imports,
-//!   exports, code, data).
-//! - [`wrapper_body`] — per-wrapper body generation.
+//! Tier-2 adapter generator: lift canonical-ABI values from the
+//! target function's params/result into the cell-array representation
+//! in `splicer:common/types`, then dispatch to the middleware's
+//! tier-2 hooks. Pipeline: classify → layout → emit. See
+//! `docs/tiers/lift-codegen.md`.
 
 pub(super) mod blob;
 pub(super) mod cells;
@@ -147,9 +113,7 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
         bail!("interface has no functions");
     }
     require_no_inline_resources(resolve, target_iface)?;
-    // Async funcs whose flat params overflow MAX_FLAT_ASYNC_PARAMS go
-    // through `build_lower_params_to_memory` — currently scoped to
-    // scalar primitives. Mirrors tier-1.
+    // Async indirect-params path is scoped to scalar primitives (mirrors tier-1).
     for (name, func) in &iface.functions {
         if func.kind.is_async() {
             let import_sig = resolve.wasm_signature(AbiVariant::GuestImportAsync, func);
@@ -161,7 +125,6 @@ fn require_supported_case(resolve: &Resolve, target_iface: InterfaceId) -> Resul
     Ok(())
 }
 
-/// Synthesize the tier-2 adapter world.
 /// Active tier-2 hook interfaces as fully-qualified versioned names.
 fn tier2_hook_imports(has_before: bool, has_after: bool) -> Vec<String> {
     use crate::contract::{versioned_interface, TIER2_AFTER, TIER2_BEFORE, TIER2_VERSION};
@@ -175,8 +138,7 @@ fn tier2_hook_imports(has_before: bool, has_after: bool) -> Vec<String> {
     out
 }
 
-/// Drive the section emitters in the right order to produce the
-/// dispatch core module bytes.
+/// Produce the dispatch core module bytes.
 fn build_dispatch_module(
     resolve: &Resolve,
     schema: &schema::SchemaLayouts,
@@ -210,12 +172,8 @@ fn build_dispatch_module(
         func_idx.init_idx,
         func_idx.cabi_realloc_idx,
     );
-    // Zip the per-build hook pieces (schema layout, import idx,
-    // params-buffer offset) into one `Option<BeforeHook>` /
-    // `Option<AfterHook>`. The unreachable arms encode the
-    // "wired together or not at all" contract that today is only
-    // implicit in the construction order of `emit_imports_and_funcs`
-    // and `lay_out_static_memory`.
+    // Zip hook pieces into one `Option<BeforeHook>` / `Option<AfterHook>`;
+    // the unreachable arms encode the "wired together or not at all" contract.
     let before_hook = match (
         schema.before_hook.as_ref(),
         func_idx.before_hook_idx,
@@ -259,36 +217,24 @@ fn build_dispatch_module(
 }
 
 // ─── Phase data shared across submodules ──────────────────────────
+//
+// Structs scoped to `pub(in crate::adapter::tier2)` so their `pub`
+// fields can carry types only visible to that scope.
 
-// Phase-data types (`FuncShape`, `FuncClassified`, `FuncDispatch`,
-// etc.) carry tier2-internal types from `lift` (`ParamLift`,
-// `ResultLayout`, …) which are `pub(super)` from inside `lift`,
-// i.e. visible in `crate::adapter::tier2`. To make the field
-// visibility match what they expose (and silence the
-// "type X is more private than item Y" lint), the struct itself is
-// scoped to `pub(in crate::adapter::tier2)`; individual fields can
-// stay plain `pub` because the struct visibility narrows them.
-
-/// `task.return` import for one async target function. The wrapper
-/// body calls this at the end of an async dispatch to publish the
-/// result.
+/// `task.return` import for one async target function.
 pub(in crate::adapter::tier2) struct TaskReturnImport {
     pub module: String,
     pub name: String,
     pub sig: WasmSignature,
 }
 
-/// Sync/async shape of one target function. Holds the
-/// `task.return` import directly in the async variant — there's no
-/// "async without task.return" or "sync with task.return" state.
+/// Sync/async shape of one target function.
 pub(in crate::adapter::tier2) enum FuncShape {
     Sync,
     Async(TaskReturnImport),
 }
 
 impl FuncShape {
-    /// Classify a function as sync or async, eagerly resolving the
-    /// `task.return` import for the async case.
     fn classify(resolve: &Resolve, target_world_key: &WorldKey, func: &WitFunction) -> Self {
         if func.kind.is_async() {
             let (module, name, sig) =
@@ -344,117 +290,79 @@ impl FuncShape {
     }
 }
 
-/// Per-function on-return hook offsets, populated only when the
-/// middleware exports `splicer:tier2/after`. Pairs with the per-build
-/// [`wrapper_body::AfterHook`] (import idx + on-return params layout)
-/// at emit time. Result cells are `cabi_realloc`'d per call by the
-/// wrapper body — presence of a result is read from `result_lift`.
+/// Per-function on-return hook offsets, populated when the middleware
+/// exports `splicer:tier2/after`. Result cells are `cabi_realloc`'d
+/// per call by the wrapper body.
 pub(in crate::adapter::tier2) struct AfterSetup {
     /// Byte offset of the pre-built on-return indirect-params buffer.
     pub params_offset: i32,
 }
 
-/// Classify-phase per-function output. Holds everything the layout
-/// phase needs to compute static-memory offsets, but no offsets
-/// itself. The layout phase consumes a `Vec<FuncClassified>` by
-/// value and returns a `Vec<FuncDispatch>` whose offsets are filled
-/// in once and immutable thereafter. This split is what makes
-/// "back-fill across phase boundaries" structurally impossible:
-/// there's nowhere on `FuncClassified` to write a layout offset to.
+/// Classify-phase per-function output. No static-memory offsets — the
+/// layout phase consumes a `Vec<FuncClassified>` and returns a parallel
+/// `Vec<FuncDispatch>` with offsets filled in, so back-fill across
+/// phase boundaries is structurally impossible.
 pub(in crate::adapter::tier2) struct FuncClassified {
     pub shape: FuncShape,
-    /// WIT result type, kept around so async wrappers can drive
-    /// `lift_from_memory` to flat-load the result for `task.return`.
+    /// WIT result type — async wrappers drive `lift_from_memory` to
+    /// flat-load the result for `task.return`.
     pub result_ty: Option<Type>,
     pub import_module: String,
     pub import_field: String,
     pub export_name: String,
-    /// Wrapper export sig (`AbiVariant::GuestExport`).
     pub export_sig: WasmSignature,
-    /// Handler import sig (`AbiVariant::GuestImport`).
     pub import_sig: WasmSignature,
     pub needs_cabi_post: bool,
-    /// Byte offset of the function name within the data segment.
     pub fn_name_offset: i32,
     pub fn_name_len: i32,
-    /// Per-param classify-time lift recipe (no offsets).
     pub params: Vec<ParamLift>,
-    /// Classify-time return-value lift recipe (no offsets).
     pub result_lift: Option<ResultLift>,
-    /// Top-level `borrow<R>` params as `(flat_idx, resource_id)`.
-    /// The wrapper must `[resource-drop]<R>` each one before
-    /// returning — the canon-ABI runtime checks every borrow lifted
-    /// on entry is dropped on exit.
+    /// Top-level `borrow<R>` params as `(flat_idx, resource_id)`. The
+    /// wrapper must `[resource-drop]<R>` each one before returning —
+    /// the canon-ABI runtime checks every borrow lifted on entry is
+    /// dropped on exit.
     pub borrow_drops: Vec<(u32, TypeId)>,
 }
 
-/// Layout-phase per-function output: the classify data plus every
-/// static-memory offset the emit phase needs. Constructed once at
-/// the end of `lay_out_static_memory`; read-only thereafter.
+/// Layout-phase per-function output: classify data + every static-
+/// memory offset the emit phase needs. Read-only after construction.
 pub(in crate::adapter::tier2) struct FuncDispatch {
     pub shape: FuncShape,
-    /// WIT result type, kept around so async wrappers can drive
-    /// `lift_from_memory` to flat-load the result for `task.return`.
     pub result_ty: Option<Type>,
     pub import_module: String,
     pub import_field: String,
     pub export_name: String,
-    /// Wrapper export sig (`AbiVariant::GuestExport`) — the shape
-    /// `wit-component`'s validator expects for our exported wrapper.
     pub export_sig: WasmSignature,
-    /// Handler import sig (`AbiVariant::GuestImport`) — the shape
-    /// `wit-component`'s validator expects for our import declaration.
-    /// May differ from `export_sig` for compound-result functions
-    /// (caller-allocates retptr on the import side vs. callee-returns
-    /// pointer on the export side).
+    /// Handler import sig. May differ from `export_sig` for compound-
+    /// result functions (caller-allocates retptr on the import side
+    /// vs. callee-returns pointer on the export side).
     pub import_sig: WasmSignature,
     pub needs_cabi_post: bool,
-    /// Byte offset of the function name within the data segment.
     pub fn_name_offset: i32,
     pub fn_name_len: i32,
-    /// Per-param post-layout lift recipe (classify data + side-table
-    /// bookkeeping). Empty for zero-arg functions. Each param's cells
-    /// slab is `cabi_realloc`'d per call — no static slab base.
+    /// Per-param post-layout lift recipe. Each param's cells slab is
+    /// `cabi_realloc`'d per call — no static slab base.
     pub params: Vec<lift::ParamLayout>,
-    /// Byte offset of this function's pre-built `field` records in
-    /// the data segment. Holds `params.len()` consecutive `field`
-    /// records, each [`schema::SchemaLayouts::field_layout`]`.size`
-    /// bytes. Pointed at by the `args.list.ptr` field passed to
-    /// `on-call`.
+    /// Byte offset of this function's pre-built `field` records in the
+    /// data segment; pointed at by `args.list.ptr` passed to `on-call`.
     pub fields_buf_offset: u32,
-    /// Byte offset of the retptr scratch buffer; `Some` iff the
-    /// import sig wants a caller-allocates retptr but the export sig
-    /// returns the pointer directly. The wrapper passes this as the
-    /// extra trailing arg when calling the import, then loads from it
-    /// to produce its own return value.
+    /// Retptr scratch; `Some` iff the import sig wants a
+    /// caller-allocates retptr but the export sig returns the pointer
+    /// directly.
     pub retptr_offset: Option<i32>,
-    /// Byte offset of the indirect-params record buffer; `Some` iff
-    /// async + `import_sig.indirect_params` (canon-lower-async
-    /// overflowed `Resolve::MAX_FLAT_ASYNC_PARAMS = 4` and switched to
-    /// pass-by-record). The wrapper lowers its flat function params
-    /// into this slot and passes the slot's pointer to the handler.
-    /// Inherits `retptr_offset` / bump's single-active-call assumption:
-    /// two concurrent invocations of the same wrapper would clobber it.
+    /// Indirect-params record buffer; `Some` iff async +
+    /// `import_sig.indirect_params` (canon-lower-async overflowed
+    /// `MAX_FLAT_ASYNC_PARAMS = 4`). Inherits bump's single-active-call
+    /// assumption — concurrent invocations would clobber it.
     pub params_record_offset: Option<i32>,
-    /// How to lift the function's return value into a `cell` for the
-    /// on-return hook. `None` for void or compound returns we don't
-    /// yet lift.
+    /// `None` for void or compound returns we don't yet lift.
     pub result_lift: Option<lift::ResultLayout>,
-    /// On-return-hook scaffolding; `Some` iff after-hook is wired.
     pub after: Option<AfterSetup>,
-    /// Top-level `borrow<R>` params as `(flat_idx, resource_id)`.
-    /// See [`FuncClassified::borrow_drops`].
     pub borrow_drops: Vec<(u32, TypeId)>,
 }
 
-/// Build the per-target-function classify records: classify each
-/// param, populate the WIT-derived sigs and mangled names, classify
-/// the result for on-return lift. Output has no static-memory
-/// offsets — those are computed by [`layout::lay_out_static_memory`],
-/// which consumes the `Vec<FuncClassified>` and returns a parallel
-/// `Vec<FuncDispatch>` with the offsets filled in. Interns fn names,
-/// param names, and any record/field names referenced by lift plans
-/// into `names` as it goes.
+/// Build per-target-function classify records. Interns fn names,
+/// param names, and any record/field names referenced by lift plans.
 fn build_per_func_classified(
     resolve: &Resolve,
     target_iface: InterfaceId,
@@ -1416,10 +1324,9 @@ mod tests {
     }
 
     /// End-to-end test for `Cell::Variant` as a Compound result.
-    /// Drives `is_compound_result(Variant) → Compound → lift_from_memory`
-    /// + the N-way disc dispatch on the result side. `shape { circle,
-    /// sq(u32), tri(u32) }` joined-flat = [i32 disc, i32 (joined u32/u32)]
-    ///   → 2 slots → retptr.
+    /// Drives `is_compound_result(Variant) → Compound → lift_from_memory` + the
+    /// N-way disc dispatch on the result side. `shape { circle,
+    /// sq(u32), tri(u32) }` joined-flat = [i32 disc, i32 (joined u32/u32)] → 2 slots → retptr.
     #[test]
     fn dispatch_module_with_variant_result_roundtrips() {
         let wat = r#"(component
@@ -1475,10 +1382,9 @@ mod tests {
             .expect("emitted tier-2 adapter component should validate");
     }
 
-    /// Drives `is_compound_result(List) → Compound → lift_from_memory`
-    /// + `Cell::ListOf` element-loop emit on the result side.
-    ///   `list<u32>` flattens to (ptr, len) → 2 slots → retptr. Pre-
-    ///   allocated u32 array at 0x2000 + (ptr, len) header at 0x1000.
+    /// Drives `is_compound_result(List) → Compound → lift_from_memory` + `Cell::ListOf`
+    /// element-loop emit on the result side. `list<u32>` flattens to (ptr, len) → 2 slots → retptr.
+    /// Pre-allocated u32 array at 0x2000 + (ptr, len) header at 0x1000.
     #[test]
     fn dispatch_module_with_list_result_roundtrips() {
         let wat = r#"(component
@@ -1535,10 +1441,9 @@ mod tests {
     }
 
     /// `list<option<u32>>` param — multi-cell element. Exercises the
-    /// per-iteration `elem_cell_base = start_i + j*elem_count` stage
-    /// + runtime-computed Option child index in
-    ///   `cell::option-some(idx)` payload. Canned-sweep covers runtime
-    ///   value-correctness; this is a build-and-validate fast check.
+    /// per-iteration `elem_cell_base = start_i + j*elem_count` stage + runtime-computed
+    /// Option child index in `cell::option-some(idx)` payload.
+    /// Canned-sweep covers runtime value-correctness; this is a build-and-validate fast check.
     #[test]
     fn dispatch_module_with_option_list_param_roundtrips() {
         let wat = r#"(component
