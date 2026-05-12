@@ -9,22 +9,22 @@
 ///
 /// Any non-empty subset is valid: you can export just `before`, just
 /// `after`, just `blocking`, or any combination.
-package splicer:tier1@0.2.0;
+package splicer:tier1@0.3.0;
 
 interface before {
-    use splicer:common/types@0.1.0.{call-id};
+    use splicer:common/types@0.2.0.{call-id};
     /// Called before every invocation of a target-interface function.
     on-call: async func(call: call-id);
 }
 
 interface after {
-    use splicer:common/types@0.1.0.{call-id};
+    use splicer:common/types@0.2.0.{call-id};
     /// Called after every invocation of a target-interface function.
     on-return: async func(call: call-id);
 }
 
 interface blocking {
-    use splicer:common/types@0.1.0.{call-id};
+    use splicer:common/types@0.2.0.{call-id};
     /// Called before the invocation; if it returns `true`, the
     /// downstream call is skipped entirely. Only supported for
     /// void-returning functions today.
