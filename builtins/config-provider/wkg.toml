@@ -1,0 +1,5 @@
+# Resolve splicer:* WIT packages from this repo's canonical wit/ dirs
+# instead of pulling from ghcr.io. Keeps the builtin's source build
+# offline and tracking the in-repo WIT exactly.
+[overrides]
+"splicer:builtin-config" = { path = "../../wit/builtin-config" }

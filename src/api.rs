@@ -340,6 +340,14 @@ fn materialize_builtins(rules: &mut [SpliceRule], splits_dir: &std::path::Path) 
                 })?
                 .to_string();
             inj.path = Some(path_str);
+
+            // If the builtin imports `splicer:builtin-config`, also
+            // materialize a patched provider component sealed with
+            // the user's `config:` block (empty when absent). The
+            // helper short-circuits cleanly for builtins that don't
+            // import the substrate — every existing tier-1 builtin
+            // is unaffected.
+            crate::config_provider::ensure_provider_for(inj, splits_dir)?;
         }
     }
     Ok(())
@@ -561,6 +569,8 @@ rules:
                 name: "ghost".into(),
                 path: None,
                 builtin: Some("does-not-exist".into()),
+                builtin_config: Default::default(),
+                config_provider_path: None,
                 adapter_info: None,
             }],
         }];

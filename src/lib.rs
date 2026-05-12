@@ -72,6 +72,7 @@ mod adapter;
 mod api;
 mod builtins;
 mod compose;
+mod config_provider;
 mod contract;
 mod parse;
 mod split;

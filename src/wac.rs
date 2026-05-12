@@ -957,6 +957,8 @@ fn add_to_inject_plan(
                     // Keep the original middleware path; adapter_path goes in adapter_info.
                     path: injection.path.clone(),
                     builtin: injection.builtin.clone(),
+                    builtin_config: injection.builtin_config.clone(),
+                    config_provider_path: injection.config_provider_path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,
@@ -989,6 +991,8 @@ fn add_to_inject_plan(
                     name: injection.name.clone(),
                     path: injection.path.clone(),
                     builtin: injection.builtin.clone(),
+                    builtin_config: injection.builtin_config.clone(),
+                    config_provider_path: injection.config_provider_path.clone(),
                     adapter_info: Some(AdapterInjectionInfo {
                         adapter_path,
                         matched_hook_interfaces: matched_interfaces,
@@ -1148,13 +1152,32 @@ fn create_tier1_mdl(
     // and only the last-generated adapter wasm reaches wac compose.
     let adapter_var = format!("{}-adapter-{}", mdl.name, sanitize_wac_id(&interface.name));
 
-    // Real middleware — only has host imports, so no explicit wiring needed.
-    // Emit the `let` once per mdl.name; adapters on later rules reuse
-    // the same var.
+    let config_provider_var = mdl
+        .config_provider_path
+        .as_ref()
+        .map(|_| format!("{real_var}-config"));
+
+    // Real middleware. The unpatched assumption is that builtins only
+    // have host imports (so `{ ... }` covers everything); a builtin
+    // that imports `splicer:builtin-config` needs the patched
+    // provider wired explicitly because the host doesn't satisfy
+    // that interface. Emit both `let`s once per mdl.name; adapters
+    // on later rules reuse the vars.
     if emitted_mdl_vars.insert(real_var.clone()) {
-        wac_lines.push(format!(
-            "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
-        ));
+        if let Some(cfg_var) = config_provider_var.as_ref() {
+            wac_lines.push(format!(
+                "let {cfg_var} = new {INST_PREFIX}:{cfg_var} {{ ... }};"
+            ));
+            wac_lines.push(format!(
+                "let {real_var} = new {INST_PREFIX}:{real_var} {{\n    \
+                 \"{cfg_key}\": {cfg_var}[\"{cfg_key}\"],\n    ...\n}};",
+                cfg_key = crate::config_provider::BUILTIN_CONFIG_GET_VERSIONED,
+            ));
+        } else {
+            wac_lines.push(format!(
+                "let {real_var} = new {INST_PREFIX}:{real_var} {{ ... }};"
+            ));
+        }
     }
 
     // Proxy — wires the downstream target interface and the hook interfaces
@@ -1202,7 +1225,7 @@ fn create_tier1_mdl(
     adapter_line.push_str("\n    ...\n};");
     wac_lines.push(adapter_line);
 
-    let used = vec![
+    let mut used = vec![
         (
             real_var,
             mdl.path
@@ -1212,6 +1235,11 @@ fn create_tier1_mdl(
         ),
         (adapter_var.clone(), adapter_info.adapter_path.clone()),
     ];
+    if let (Some(cfg_var), Some(cfg_path)) =
+        (config_provider_var, mdl.config_provider_path.as_ref())
+    {
+        used.push((cfg_var, cfg_path.clone()));
+    }
     Ok((adapter_var, used))
 }
 
@@ -1498,6 +1526,119 @@ mod tests {
         assert!(
             msg.contains("different component"),
             "error should explain the multi-provider problem; got: {msg}"
+        );
+    }
+
+    // ── splicer:builtin-config provider wiring ───────────────────────
+
+    /// `create_tier1_mdl` with `config_provider_path` set must emit
+    /// the patched provider instance and wire its `get` export into
+    /// the real middleware's import.
+    #[test]
+    fn config_provider_wired_when_path_set() {
+        use crate::parse::config::{AdapterInjectionInfo, Injection};
+        let mdl = Injection {
+            name: "metrics".to_string(),
+            path: Some("/tmp/metrics.wasm".to_string()),
+            builtin: Some("otel-bare-metrics".to_string()),
+            builtin_config: Default::default(),
+            config_provider_path: Some("/tmp/metrics-config.wasm".to_string()),
+            adapter_info: None,
+        };
+        let adapter_info = AdapterInjectionInfo {
+            adapter_path: "/tmp/metrics-adapter.wasm".to_string(),
+            matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
+        };
+        let contract = Contract {
+            name: "wasi:http/handler@0.3.0".to_string(),
+            ty_fingerprint: None,
+        };
+        let graph = synth_graph(1, &[]);
+        let mut lines: Vec<String> = Vec::new();
+        let mut emitted: std::collections::HashSet<String> = Default::default();
+        let (_adapter_var, used) = create_tier1_mdl(
+            "downstream",
+            &mdl,
+            &contract,
+            &adapter_info,
+            &graph,
+            &HashMap::new(),
+            &mut lines,
+            &mut emitted,
+        )
+        .expect("emit");
+
+        let wac = lines.join("\n");
+        assert!(
+            wac.contains("let metrics-config = new my:metrics-config { ... };"),
+            "config provider instance must be emitted; got:\n{wac}"
+        );
+        assert!(
+            wac.contains(
+                "let metrics = new my:metrics {\n    \
+                 \"splicer:builtin-config/get@0.1.0\": metrics-config[\"splicer:builtin-config/get@0.1.0\"]"
+            ),
+            "real middleware must wire the provider's get export; got:\n{wac}"
+        );
+
+        // The `used` vec drives wac_deps; the config provider's path
+        // must be present so wac compose can find the patched bytes.
+        assert!(
+            used.iter()
+                .any(|(name, path)| name == "metrics-config" && path == "/tmp/metrics-config.wasm"),
+            "config provider must be registered in wac_deps; got: {used:?}"
+        );
+    }
+
+    /// Without `config_provider_path`, the real-mdl line is the
+    /// unchanged `{ ... }` form — every existing tier-1 builtin
+    /// (hello-tier1, otel-bare-spans) must keep working.
+    #[test]
+    fn config_provider_not_wired_when_path_unset() {
+        use crate::parse::config::{AdapterInjectionInfo, Injection};
+        let mdl = Injection {
+            name: "hello".to_string(),
+            path: Some("/tmp/hello.wasm".to_string()),
+            builtin: Some("hello-tier1".to_string()),
+            builtin_config: Default::default(),
+            config_provider_path: None,
+            adapter_info: None,
+        };
+        let adapter_info = AdapterInjectionInfo {
+            adapter_path: "/tmp/hello-adapter.wasm".to_string(),
+            matched_hook_interfaces: vec!["splicer:tier1/before".to_string()],
+        };
+        let contract = Contract {
+            name: "wasi:http/handler@0.3.0".to_string(),
+            ty_fingerprint: None,
+        };
+        let graph = synth_graph(1, &[]);
+        let mut lines: Vec<String> = Vec::new();
+        let mut emitted: std::collections::HashSet<String> = Default::default();
+        let (_adapter_var, used) = create_tier1_mdl(
+            "downstream",
+            &mdl,
+            &contract,
+            &adapter_info,
+            &graph,
+            &HashMap::new(),
+            &mut lines,
+            &mut emitted,
+        )
+        .expect("emit");
+
+        let wac = lines.join("\n");
+        assert!(
+            wac.contains("let hello = new my:hello { ... };"),
+            "real middleware should keep the unchanged `{{ ... }}` form; got:\n{wac}"
+        );
+        assert!(
+            !wac.contains("hello-config"),
+            "no config provider instance should be emitted; got:\n{wac}"
+        );
+        assert!(
+            used.iter().all(|(name, _)| name != "hello-config"),
+            "no config provider should appear in wac_deps; got: {used:?}"
         );
     }
 }

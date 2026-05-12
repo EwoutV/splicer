@@ -319,6 +319,8 @@ mod tests {
             name: name.to_string(),
             adapter_info: None,
             builtin: None,
+            builtin_config: Default::default(),
+            config_provider_path: None,
             path: None,
         }
     }
@@ -638,6 +640,8 @@ mod tests {
             name: "mw".to_string(),
             adapter_info: None,
             builtin: None,
+            builtin_config: Default::default(),
+            config_provider_path: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);
@@ -681,6 +685,8 @@ mod tests {
             name: "mw".to_string(),
             adapter_info: None,
             builtin: None,
+            builtin_config: Default::default(),
+            config_provider_path: None,
             path: None,
         };
         let results = validate_contract(&[inj], "wasi:http/handler@0.3.0", &chain_fp, &mut cache);

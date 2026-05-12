@@ -1,0 +1,5 @@
+package splicer:config-provider@0.1.0;
+
+world config-provider-mdl {
+    export splicer:builtin-config/get@0.1.0;
+}
