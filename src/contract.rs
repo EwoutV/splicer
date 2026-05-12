@@ -482,7 +482,10 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(
             "mw".to_string(),
-            exports_for(&["splicer:tier1/before@0.2.0", "splicer:tier2/after@0.1.0"]),
+            exports_for(&[
+                &versioned_interface("splicer:tier1/before", TIER1_VERSION),
+                &versioned_interface("splicer:tier2/after", TIER2_VERSION),
+            ]),
         );
         let results = validate_contract(
             &[injection("mw")],
