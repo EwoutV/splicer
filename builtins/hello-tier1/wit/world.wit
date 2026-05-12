@@ -3,4 +3,10 @@ package splicer:hello-tier1@0.1.0;
 world hello-tier1-mdl {
     export splicer:tier1/before@0.3.0;
     export splicer:tier1/after@0.3.0;
+    /// Optional: read a `greeting` string at first call and use it as
+    /// the print prefix. Splicer wires a patched provider when this
+    /// builtin is injected; if no `config:` is set in the YAML, the
+    /// provider's `get` returns `none` and the builtin falls back to
+    /// its hardcoded default.
+    import splicer:builtin-config/get@0.1.0;
 }

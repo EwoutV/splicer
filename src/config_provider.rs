@@ -357,6 +357,50 @@ mod tests {
             .expect("template must resolve and have exactly one MAGIC_BYTES match");
     }
 
+    /// Smoke test: confirm `hello-tier1` (a real shipped builtin)
+    /// actually trips `imports_substrate` and that `ensure_provider_for`
+    /// produces a patched provider for it. Catches regressions where a
+    /// builtin's WIT world stops importing `splicer:builtin-config` or
+    /// the byte-scan stops detecting it.
+    ///
+    /// Same `#[ignore]` rationale as `built_provider_has_unique_magic`:
+    /// needs the assets dir or a populated cache.
+    #[test]
+    #[ignore = "needs built/cached/registry-resolvable hello-tier1 + config-provider"]
+    fn hello_tier1_smoke() {
+        let hello_bytes =
+            crate::builtins::load_resolved_bytes("hello-tier1").expect("hello-tier1 must resolve");
+        assert!(
+            imports_substrate(&hello_bytes),
+            "hello-tier1 must import splicer:builtin-config",
+        );
+
+        // Drive the same end-to-end path the splice pipeline takes:
+        // ensure_provider_for reads inj.path off disk and writes the
+        // patched provider next to it.
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let hello_path = builtin_dir.join("hello-tier1.wasm");
+        std::fs::write(&hello_path, &hello_bytes).unwrap();
+
+        let mut inj = Injection::from_path("hello-tier1", hello_path.to_str().unwrap());
+        inj.builtin_config
+            .insert("greeting".to_string(), "wired-up-end-to-end".to_string());
+
+        ensure_provider_for(&mut inj, splits.path()).expect("ensure_provider_for");
+        let provider = inj
+            .config_provider_path
+            .as_deref()
+            .expect("provider path stamped");
+        let patched = std::fs::read(provider).expect("provider file written");
+        let parsed = parse_back(&patched);
+        assert_eq!(
+            parsed.get("greeting").map(String::as_str),
+            Some("wired-up-end-to-end")
+        );
+    }
+
     // ── imports_substrate / ensure_provider_for ─────────────────────
 
     /// Tiny WAT fixture: a component importing `splicer:builtin-config/get`.
