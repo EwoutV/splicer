@@ -1,5 +1,27 @@
 # Builtin config substrate — `splicer:builtin-config`
 
+> **Status:** landed. The substrate ships as designed below, with one
+> deviation: the body talks about builtins (including the provider
+> template) being **embedded in the splicer binary**, but builtins now
+> ship as OCI artifacts under
+> `ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>` and are
+> resolved at splice time via local override → on-disk cache → OCI
+> pull (see [`src/builtins.rs`](../../src/builtins.rs) for the
+> resolver). The patching mechanism is the same; only the bytes'
+> origin changed.
+>
+> User-facing YAML reference lives in
+> [`docs/splice-config.md`](../splice-config.md); the worked example
+> is `--hello-builtin-config` in
+> `tests/component-interposition/run.sh`. The first non-trivial
+> consumer (the `otel-bare-metrics` aggregation rework noted at the
+> bottom of this doc) is still pending; until that lands,
+> `otel-bare-metrics` runs in always-flush mode with hardcoded
+> defaults. The rest of this file is preserved as the design rationale
+> — particularly the "Why string-based (not typed records)" and "Path
+> 1 vs path 2 vs path 3" tradeoffs — so future contributors can reason
+> about boundary cases without re-litigating them.
+
 ## Motivation
 
 Most planned tier-1 builtins beyond `hello-tier1` and `otel-bare-spans`
@@ -190,42 +212,79 @@ original scalar type for error messages).
 
 ## Implementation pieces
 
-1. **WIT**: `wit/builtin-config/world.wit` defining
-   `splicer:builtin-config@0.1.0`. Add to all consuming builtins'
-   `wkg.toml` overrides like `splicer:tier1` / `splicer:common`.
+1. ✅ **WIT** — `wit/builtin-config/world.wit` defines
+   `splicer:builtin-config@0.1.0` (single `get` interface). Consuming
+   builtins point at it from their `wkg.toml`; see
+   [`builtins/hello-tier1/wkg.toml`](../../builtins/hello-tier1/wkg.toml)
+   for the override pattern.
 
-2. **Provider template**: `builtins/config-provider/` Rust crate. Exports
-   `splicer:builtin-config/get`, reads its KV table from a known custom
-   data section. Built via `make build-builtins`.
+2. ✅ **Provider template** — [`builtins/config-provider/`](../../builtins/config-provider/)
+   Rust crate. Exports `splicer:builtin-config/get`. Reads its KV
+   table from a fixed-capacity `static` buffer (`SPLICER_CONFIG_BLOB`)
+   in linear memory rather than a custom section; the buffer is
+   prefixed with a magic sentinel so the splicer-side patcher can
+   locate it by byte-scan after `wasm-tools component new`. Built
+   via `make build-builtins`.
 
-3. **Splice-time patcher**: `src/config_provider.rs` with
-   `build_provider(values) -> Vec<u8>`.
+3. ✅ **Splice-time patcher** — [`src/config_provider.rs`](../../src/config_provider.rs)
+   exposes `build_provider(values) -> Vec<u8>` (loads the template
+   via the same OCI/cache/override resolver as user-facing builtins,
+   then in-place rewrites the magic-anchored window). Shared
+   wire-format constants + codec live in
+   [`builtins/config-provider/src/wire_format.rs`](../../builtins/config-provider/src/wire_format.rs),
+   `mod wire_format`-included from both crates so the patcher and
+   the runtime parser can't drift.
 
-4. **YAML schema**: extend `parse::config::Injection` with optional
-   `config:` map; plumb into the splice pipeline.
+4. ✅ **YAML schema** — `parse::config::Injection` carries
+   `builtin_config: BTreeMap<String, String>`; the YAML's
+   `builtin.config:` map gets stringified at parse time (scalars
+   only; lists, maps, nulls, and tags are rejected with a clear
+   error).
 
-5. **Composition wiring**: detect `splicer:builtin-config` in the
-   builtin's imports, generate + write + wac-wire the provider.
+5. ✅ **Composition wiring** — `ensure_provider_for` in
+   `src/config_provider.rs` decodes each materialized builtin's WIT
+   imports; if `splicer:builtin-config` is among them, it patches +
+   writes the provider to `<splits>/builtins/<inject-id>-config.wasm`
+   and stamps the path on the injection. `create_tier1_mdl` in
+   `src/wac.rs` emits the provider's WAC instance and wires its
+   `get` export into the consuming builtin's import. As a misconfig
+   guard, setting `config:` on a non-consumer builtin errors at
+   splice time rather than silently dropping the values.
 
-6. **Tests**:
-    - Unit test for the patcher (right key returns right value, missing
-      key returns `none`, malformed table fails cleanly)
-    - Integration test for an end-to-end splice with a config-consuming
-      builtin
+6. ✅ **Tests** — the patcher's wire-format invariants
+   (`round_trip_empty`, `round_trip_multi_key`, `overflow_rejects`,
+   missing/duplicate magic, etc.) and the substrate-wiring path
+   (`ensure_provider_for_*`) live in
+   [`src/config_provider.rs`](../../src/config_provider.rs)'s test
+   module. Two `#[ignore]`d regression tests run against the actual
+   built provider when invoked with
+   `SPLICER_BUILTINS_DIR=assets/builtins`:
+   `built_provider_has_unique_magic` (catches the rustc/lld
+   duplicate-MAGIC emission bug from earlier iterations) and
+   `hello_tier1_smoke` (confirms a real shipped builtin trips
+   `imports_substrate` and produces a patched provider end-to-end).
+   The component-interposition submodule's
+   `--hello-builtin-config` mode stacks two `hello-tier1` instances
+   (one defaulted, one configured) and diffs stdout against
+   `expected-output/hello-builtin-config.txt`, which is the
+   load-bearing end-to-end check.
 
-7. **First consumer**: `otel-bare-metrics` aggregation rework — see the
-   `TODO(aggregation)` block in `builtins/otel-bare-metrics/src/lib.rs`.
+7. ⏳ **First consumer**: `otel-bare-metrics` aggregation rework — see the
+   `TODO(aggregation)` block in `builtins/otel-bare-metrics/src/lib.rs`
+   and [`builtins/otel-bare-metrics/README.md`](../../builtins/otel-bare-metrics/README.md).
+   Substrate is ready; this is the natural next PR.
 
 ## Sequencing
 
-Tier 2 has landed, so the substrate can proceed as a fresh branch
-off main without the merge-conflict risk the original plan was
-sequenced around.
+Substrate landed off main with the tier-2 work already in place, so
+there were no merge-conflict surprises versus the original sequencing
+plan.
 
-Until the substrate lands, `otel-bare-metrics` runs in always-flush
-(`buffer = 1`) mode with hardcoded defaults. The `TODO(aggregation)`
-block in its `lib.rs` lists the config keys and semantics so the
-rework is mechanical once the substrate is in place.
+`otel-bare-metrics` still runs in always-flush (`buffer = 1`) mode
+with hardcoded defaults pending the consumer rework. The
+`TODO(aggregation)` block in its `lib.rs` lists the config keys and
+semantics so the rework is mechanical now that the substrate is in
+place.
 
 ## Defaults / missing-key semantics
 
@@ -277,3 +336,41 @@ WIT-level rename, not a redesign.
   key in v0.2, splicer has no way to migrate the user's YAML
   automatically. Builtins should treat keys as part of their public
   API and add new keys before removing old ones.
+
+## Future enhancements
+
+### Discoverable config schemas
+
+What landed: each builtin documents its supported keys + defaults in
+`builtins/<name>/README.md` (e.g.
+[`builtins/hello-tier1/README.md`](../../builtins/hello-tier1/README.md)).
+Splice-config docs point users at the per-builtin README. Splicer
+itself doesn't type-check YAML values against the schema; an unknown
+key passes parse time and is ignored at runtime.
+
+The gap: discovery is human-only ("read the README") and validation is
+runtime-only ("the builtin's init parse will reject malformed values").
+A user with a typo in a key name (or value type) doesn't find out
+until they actually run the spliced wasm.
+
+Two plausible follow-ups in increasing scope:
+
+1. **CLI introspection.** A `splicer help builtin <name>` (or
+   `splicer describe-builtin <name>`) subcommand that prints the
+   README — same source of truth, lower friction. Pure additive,
+   no schema format needed.
+
+2. **Structured manifest + splice-time validation.** Each builtin
+   ships a `config.toml` (or sibling WIT custom section)
+   declaring `{ key, type, default, doc }` per config entry.
+   Splicer reads it at YAML parse time and:
+   - Rejects unknown keys with a clear error (catches typos).
+   - Type-checks scalars against the declared type
+     (`buffer: "ten"` errors before runtime).
+   - Backs `splicer describe-builtin <name>`.
+
+   The "Defaults / missing-key semantics" section above deliberately
+   punted on this for v0.1; revisit once a few real-world consumers
+   exist and we know whether the typo-protection is worth the schema
+   maintenance cost. The substrate's design doesn't change either
+   way — only the YAML pre-validation does.

@@ -59,8 +59,14 @@ const MAX_PAYLOAD: usize = CAPACITY - MAGIC_LEN - LEN_PREFIX_BYTES;
 ///
 /// Idempotent: if `injection.config_provider_path` is already set,
 /// returns without re-doing the work. Returns without writing when
-/// the injection isn't a builtin, has no materialized path yet, or
-/// doesn't import the substrate.
+/// the injection isn't a builtin or has no materialized path yet.
+///
+/// Errors when the builtin doesn't import `splicer:builtin-config`
+/// but the YAML still set a non-empty `config:` block. Silently
+/// dropping the config in that case would let a typo (or a builtin
+/// that simply doesn't support the keys the user picked) disappear
+/// without diagnosis. An empty `config:` against a non-consumer is
+/// fine — no information was lost.
 pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Result<()> {
     if injection.config_provider_path.is_some() {
         return Ok(());
@@ -71,6 +77,19 @@ pub fn ensure_provider_for(injection: &mut Injection, splits_dir: &Path) -> Resu
     let bytes = std::fs::read(builtin_path)
         .with_context(|| format!("Failed to read materialized builtin '{}'", builtin_path))?;
     if !imports_substrate(&bytes) {
+        if !injection.builtin_config.is_empty() {
+            let mut keys: Vec<&str> =
+                injection.builtin_config.keys().map(String::as_str).collect();
+            keys.sort();
+            anyhow::bail!(
+                "injection '{name}' set `config:` keys [{keys}], but the underlying \
+                 component doesn't import `splicer:builtin-config/get` — splicer has \
+                 nothing to seal the values into. Either drop the `config:` block, or \
+                 inject a builtin that consumes the substrate.",
+                name = injection.name,
+                keys = keys.join(", "),
+            );
+        }
         return Ok(());
     }
     let provider_bytes = build_provider(&injection.builtin_config).with_context(|| {
@@ -570,6 +589,35 @@ mod tests {
 
         ensure_provider_for(&mut inj, splits.path()).expect("ensure");
         assert!(inj.config_provider_path.is_none());
+    }
+
+    /// Misconfig guard: a non-consumer builtin with a non-empty
+    /// `config:` block must error out. Otherwise the user's config
+    /// would silently disappear — a typo in the builtin name, or a
+    /// builtin that simply doesn't support the keys, becomes
+    /// undebuggable.
+    #[test]
+    fn ensure_provider_for_rejects_config_on_non_consumer() {
+        let bytes = wat::parse_str(NON_CONSUMER_WAT).expect("wat");
+        let splits = tempfile::tempdir().unwrap();
+        let builtin_dir = splits.path().join("builtins");
+        std::fs::create_dir_all(&builtin_dir).unwrap();
+        let builtin_path = builtin_dir.join("hello.wasm");
+        std::fs::write(&builtin_path, &bytes).unwrap();
+
+        let mut inj = Injection::from_path("hello", builtin_path.to_str().unwrap());
+        inj.builtin_config
+            .insert("buffer".to_string(), "100".to_string());
+        inj.builtin_config
+            .insert("flush_after_seconds".to_string(), "10.0".to_string());
+        let _guard = EnvGuard::clear("SPLICER_BUILTINS_DIR");
+
+        let err = ensure_provider_for(&mut inj, splits.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("'hello'"), "{msg}");
+        // Keys are listed sorted for a deterministic error message.
+        assert!(msg.contains("buffer, flush_after_seconds"), "{msg}");
+        assert!(msg.contains("doesn't import"), "{msg}");
     }
 
     /// Restore (or remove) an env var on drop so a test doesn't leak

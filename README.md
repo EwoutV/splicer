@@ -73,10 +73,13 @@ For the full guide — including how to write a tier-1 middleware, how adapter
 detection works, and what the generated adapter does internally — see
 [docs/adapter-components.md](docs/adapter-components.md).
 
-### Builtin Middleware
+---
 
-Splicer ships pre-built middleware components embedded in the binary.
-Reference one from a splice config without supplying a path:
+# Builtins
+
+Splicer ships pre-built middleware components, fetched on demand from
+`ghcr.io/ejrgilbert/splicer/builtins/*`. Reference one from a splice
+config without supplying a path:
 
 ```yaml
 inject:
@@ -89,18 +92,18 @@ siblings — `otel-spans`, `otel-metrics`, `otel-logs` (unprefixed) —
 are **planned but not yet implemented**; they'll arrive once tier-2
 codegen lands.
 
-| Name                | Tier | Description                                                                |
-|---------------------|------|----------------------------------------------------------------------------|
-| `hello-tier1`       | 1    | `println!`s every wrapped call. Verifies splice rules fire.                |
-| `otel-bare-spans`   | 1    | Emits a `wasi:otel` span per call (timing + call-id attrs, no payload).    |
-| `otel-bare-metrics` | 1    | Emits `wasi:otel` count + duration metrics per call (no payload).          |
-| `otel-bare-logs`    | 1    | Emits a structured `wasi:otel` log per call (severity `INFO`, no payload). |
+| Name                                               | Tier | Description                                                                |
+|----------------------------------------------------|------|----------------------------------------------------------------------------|
+| [`hello-tier1`](builtins/hello-tier1/)             | 1    | `println!`s every wrapped call. Verifies splice rules fire.                |
+| [`otel-bare-spans`](builtins/otel-bare-spans/)     | 1    | Emits a `wasi:otel` span per call (timing + call-id attrs, no payload).    |
+| [`otel-bare-metrics`](builtins/otel-bare-metrics/) | 1    | Emits `wasi:otel` count + duration metrics per call (no payload).          |
+| [`otel-bare-logs`](builtins/otel-bare-logs/)       | 1    | Emits a structured `wasi:otel` log per call (severity `INFO`, no payload). |
 
 Source crates live under [`builtins/`](builtins/); rebuild artifacts
-with `make build-builtins`.
-
-See [docs/splice-config.md](docs/splice-config.md#inject-entry-shapes)
-for the full `builtin:` schema (short + long forms).
+with `make build-builtins`. See
+[docs/splice-config.md](docs/splice-config.md#inject-entry-shapes) for
+the full `builtin:` schema (short + long forms, the `config:` block,
+and the local-override → cache → OCI resolution order).
 
 ---
 
