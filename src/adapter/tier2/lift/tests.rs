@@ -2321,7 +2321,7 @@ fn flags_scratch_sizes_count_both_param_and_result_cells() {
 // ─── Side-table N=1 invariant ─────────────────────────────────
 
 #[test]
-#[should_panic(expected = "plan has multiple Cell::EnumCase entries")]
+#[should_panic(expected = "≤1 EnumCase per range")]
 fn build_enum_info_blob_panics_on_multi_enum_plan() {
     // Pin the structural N=1 invariant in `build_enum_info_blob`:
     // a record with two distinct enum fields (`two-enums { c: color,
