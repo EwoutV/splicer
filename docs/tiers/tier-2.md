@@ -11,6 +11,54 @@ For the shared framework that applies to every tier (one-tier-
 per-middleware rule, async convention, hook-trap propagation,
 chain composition), see [`adapter-components.md`](../adapter-components.md).
 
+## Payload integrity
+
+The complement to tier-1's
+[payload isolation](./tier-1.md#payload-isolation): tier-2
+middleware **can see the payload but can't modify it**. What
+flows from caller to handler is bit-for-bit identical to what the
+caller sent — the lifted `field-tree` the middleware reads is a
+separate observation artifact, not the value being forwarded.
+
+Three reinforcing reasons:
+
+1. **The WIT contract.** The tier-2 hooks
+   (`on-call(call, args)`, `on-return(call, result)`) return
+   nothing. There's no shape by which the middleware can
+   communicate a modified value back to the adapter; after a hook
+   returns, the adapter forwards the originals.
+2. **Shared-nothing memory.** The middleware receives the
+   field-tree as data copied into *its own* linear memory by the
+   canonical-ABI trampoline. Modifying that local copy has no
+   effect on the adapter's original canonical-ABI flat values,
+   which are what get forwarded downstream. (See
+   [`adapter-internals.md`](../adapter-internals.md#shared-nothing-components-and-the-canon-abi-trampoline)
+   for the cross-component memory model.)
+3. **Handles are opaque correlation IDs, not usable handles.**
+   When a resource (`own<R>` / `borrow<R>`) or `stream<T>` /
+   `future<T>` / `error-context` crosses the boundary, the
+   middleware sees a `handle-info { type-name, id }` correlation
+   record, not the actual handle. The `u64` is not invokable —
+   the middleware cannot call methods on the resource, read its
+   contents, drop it, or escape it past the call. Without this,
+   "observation only" would have a back door: a middleware that
+   received a real `borrow<request>` could call
+   `request.headers().append(...)` and silently mutate the
+   payload. The adapter retains canonical-ABI handle ownership;
+   the middleware just gets an identity tag useful for
+   correlating the same handle's appearances across calls.
+
+So tier-2 lets you build observation middleware — tracing,
+metrics, content-aware logging, schema-aware routing — with the
+guarantee that adding a middleware **cannot change call
+semantics**. A handler downstream sees exactly the same bytes
+whether it was called directly or through a tier-2 interposition.
+
+Tier-3 relaxes this property by design: middleware sees the
+payload and can modify it (the hook signatures grow a return
+value). Tier-4 replaces the downstream entirely. Picking tier-2
+is opting into observation without modification authority.
+
 ## Tier-2 hook interfaces
 
 The tier-2 WIT package mirrors tier-1's split-by-hook structure:

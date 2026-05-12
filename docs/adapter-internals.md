@@ -71,6 +71,54 @@ the WIT world that declares its imports/exports — nothing else.
 [`wit-parser`]: https://docs.rs/wit-parser
 [`wit-bindgen-core::abi`]: https://docs.rs/wit-bindgen-core
 
+## Shared-nothing components and the canon-ABI trampoline
+
+The component model is a **shared-nothing** model: each component
+has its own isolated linear memory, and no component can
+dereference a pointer that belongs to a different component. That
+constraint is what motivates the canonical ABI in the first
+place — components need a defined protocol for shipping typed
+values across boundaries when they can't share memory addresses.
+
+For each value crossing a component boundary, the canonical ABI
+splits the work three ways:
+
+- **Lower** writes a typed value into the *sender's* linear
+  memory and produces a flat representation (a sequence of
+  primitive wasm values; pointers reference the sender's memory).
+- The **boundary trampoline** — provided by the host runtime
+  (e.g., wasmtime), not by any component — reads the flat
+  representation, copies any pointer-referenced bytes from the
+  sender's memory into the *receiver's* memory via the receiver's
+  `cabi_realloc`, and rewrites the pointers in the flat
+  representation to reference the receiver's memory.
+- **Lift** reads the typed value from the *receiver's* linear
+  memory using the rewritten flat representation.
+
+Lower and lift each operate within a single component's memory;
+the cross-component copy is the trampoline's job. **Splicer never
+authors a cross-component memory write** — the adapter's wasm
+only ever touches its own linear memory. For a wrapper sitting
+between caller and handler:
+
+- When the caller invokes the wrapper export, the trampoline has
+  already copied pointer-referenced args into the wrapper's
+  memory; the wrapper sees flat args whose pointers reference its
+  own memory.
+- When the wrapper calls the handler import, the trampoline at
+  *that* boundary copies pointer-referenced data from the
+  wrapper's memory into the handler's memory; the handler
+  receives flat args whose pointers reference its own memory.
+- Symmetric copying happens for results.
+
+That's why tier-1 can be a true "passthrough" wrapper at the wasm
+level (the body just `local.get`s and `call`s) even though every
+call involves real byte-copying between components — the copying
+happens *outside* the wrapper's own wasm, in the trampoline.
+Tier-2 additionally walks its own copy of the args via
+`lift_from_memory` to populate the field-tree, but still never
+touches any other component's memory.
+
 ## Layering
 
 Two layers, with a clean responsibility split:
@@ -97,19 +145,31 @@ sits at the root of `src/adapter/`.
 
 Both tiers follow the same outer shape:
 
-1. **Resolve** — decode the split's embedded component-type custom
-   section into a `wit_parser::Resolve` carrying the target
-   interface's types.
-2. **Synthesize world** — push the `splicer:common` / `splicer:tier*`
-   WITs and a generated adapter-world WIT into the `Resolve`, then
-   select the world the dispatch module exports.
-3. **Build dispatch module** — the tier-specific part (see below).
-4. **Encode Component** — `wit_component::embed_component_metadata`
-   + `ComponentEncoder::default().module(...).encode()`.
+1. **Discover the target's WIT.** Decode the input split's
+   `component-type` custom section into a `wit_parser::Resolve`.
+   This is how splicer learns the target interface — its function
+   list, type definitions, resource shapes, async-ness — without
+   any out-of-band schema. Everything downstream (which functions
+   to wrap, which types to lift, what to re-export, what canonical
+   names to use for imports/exports) is driven by this WIT.
+2. **Synthesize the adapter world.** Push the `splicer:common` /
+   `splicer:tier*` WIT packages plus a generated adapter-world
+   WIT into the `Resolve`, then select that world. The world
+   declares the imports (target interface re-imported from a
+   handler component, plus the middleware's hook interfaces) and
+   the exports (the target interface, re-exposed to the caller)
+   the dispatch core module must satisfy.
+3. **Build dispatch module.** Emit the wasm core module that
+   implements that world — the tier-specific part (see below).
+4. **Encode Component.** Hand the core module to
+   `wit_component::ComponentEncoder` via
+   `embed_component_metadata` + `.module(...).encode()`; the
+   library synthesizes the surrounding Component shape from
+   metadata embedded in the module.
 
 The synthesized adapter-world WIT is what makes the generator
-**specification-driven**: every import/export name in the dispatch
-core module comes from `Resolve::wasm_import_name` /
+**specification-driven**: every import/export name in the
+dispatch core module comes from `Resolve::wasm_import_name` /
 `wasm_export_name` queries against this world, not from string
 concatenation. A WIT-level mangling change in upstream silently
 propagates to the emitted module.
@@ -148,21 +208,16 @@ values.
 is lifted into the `field-tree` representation defined in
 [`wit/common/world.wit`](../wit/common/world.wit). Hooks see
 `on-call(call-id, args: list<field>)` and
-`on-return(call-id, result: option<field-tree>)`. The wrapper still
-forwards the canonical-ABI flat values through to the handler
-unchanged; the field-tree is observation, not value transformation.
-
-The data flow for tier-2 (cell shapes, side-table policy, plan
-invariants, when entries live in static segments vs per-call
-`cabi_realloc`'d buffers, the dynamic-count regime for list-element
-widening) is documented in
-[`docs/tiers/lift-codegen.md`](./tiers/lift-codegen.md) and stays
-there because it moves as new kinds open. This doc covers only the
-parts that are stable: the wrapper body is four-phase (`on-call` →
-handler call → `on-return` → tail), the `on-call` and handler
-phases produce identical flat-value traffic to tier-1, and the
-result-lift `lift_from_memory` call is the third Bindgen call-site
-(see [Where the Bindgen fires](#where-the-bindgen-fires)).
+`on-return(call-id, result: option<field-tree>)`; the wrapper
+still forwards canonical-ABI flat values through to the handler
+unchanged (observation, not transformation). The data flow — cell
+shapes, side-table storage policy, plan invariants, list-element
+widening — is documented in [`docs/tiers/lift-codegen.md`](./tiers/lift-codegen.md).
+The cross-cutting fact relevant to this doc is that tier-2's
+compound-result lift goes through our `Bindgen` impl (see
+[Where the Bindgen fires](#where-the-bindgen-fires)); the
+`on-call` and handler phases produce flat-value traffic identical
+to tier-1's.
 
 ## Where the Bindgen fires
 
@@ -218,7 +273,7 @@ constrain how the impl is allowed to evolve:
   as the dispatch module's own locals. The caller calls
   `locals.freeze()` once when constructing the `Function`.
 
-## Heterogeneous variants and joined flat
+## Heterogeneous variants and the joined flat representation
 
 Variant / option / result arms can have different flat shapes:
 
