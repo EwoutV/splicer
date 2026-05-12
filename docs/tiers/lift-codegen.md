@@ -143,10 +143,14 @@ the way it is.
    same vector that codegen iterates over at emit time is the
    one side-table entries reference — they can't disagree
    because they read the same vector.
-3. **Flat-slot consumption is `plan.flat_slot_count`.** No
-   per-kind `slot_count()` table to keep in sync with the
-   plan-builder; the builder's cursor at `into_plan` time *is*
-   the count.
+3. **Flat-slot count is the builder's final cursor value.** As
+   `LiftPlanBuilder` pushes cells, it bumps a counter for each
+   flat slot a cell consumes; when the plan is finalized that
+   counter becomes `plan.flat_slot_count`. There's no separate
+   "how many slots does each `Cell` variant take?" table that has
+   to stay in sync with the builder's actual allocations — the
+   count and the allocations come from the same counter, so they
+   can't disagree.
 
 ### Children-first allocation
 
@@ -195,10 +199,16 @@ Where `local_base` comes from per destination:
   flat-slot counts. Param 0's `local_base` is 0; param 1's is
   `params[0].flat_slot_count`; param 2's is
   `params[0].flat_slot_count + params[1].flat_slot_count`; etc.
-- **Compound-result emit**: the first of `flat_slot_count` synth
-  locals the wrapper allocates to receive `lift_from_memory`'s
-  output. The "synth locals are contiguous" invariant lives at the
-  alloc site, so cell N's absolute local is `synth_locals[0] + N`.
+- **Compound-result emit** — when the result is itself a compound
+  type (record, tuple, variant) whose lift plan has multiple cells
+  spanning multiple flat slots, the handler returns it via retptr
+  and the wrapper allocates `flat_slot_count` *contiguous* synth
+  locals to receive `lift_from_memory`'s flat output. `local_base`
+  is the wasm-local index of the **first** of those synth locals;
+  because the slice is contiguous, a cell with flat-slot offset K
+  lands at absolute local `local_base + K`. The contiguity is
+  enforced at the alloc site, so this calculation is the only
+  thing the per-cell emit code needs.
 - **Side-table builders**: no `local_base` — they only read
   structural fields like case names and child indices.
 
@@ -290,8 +300,7 @@ entire target interface**. Two outcomes:
   making that function's K-count len-dependent. A data segment
   can't be sized for it, so splicer moves **all** of the
   interface's functions to the per-call buffer policy for K —
-  every
-  function calls `cabi_realloc` per call to allocate the buffer,
+  every function calls `cabi_realloc` per call to allocate the buffer,
   then writes every field of every entry (static fields from
   `i32.const`s emitted into the wrapper body, dynamic fields from
   wasm locals).
@@ -301,8 +310,7 @@ splicer would rather pay the per-call cost uniformly across the
 interface than maintain two code paths for the same kind within
 one adapter. A function that doesn't itself have a list-with-K
 can still end up under the per-call buffer policy because some
-sibling
-function in the same interface forced it.
+sibling function in the same interface forced it.
 
 ### Decision 2: per interface function, only under the per-call buffer policy
 
