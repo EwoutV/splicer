@@ -205,6 +205,25 @@ Concrete diagnostics worth adding:
 No code changes needed for the chain mechanism itself; this is
 purely a UX / diagnostics question.
 
+## Tier-2 future hook: `on-trap`
+
+A trap-observability hook (`on-trap(call, reason)`) was scoped but
+intentionally not shipped with tier-2. The motivating use case is
+real: instrumenting a target interface and seeing when a
+downstream call fails. The blocker is at the runtime layer rather
+than splicer's codegen — canon-async on current wasmtime releases
+propagates child-task traps as wasm traps that unwind the parent's
+stack, so the parent guest never gets a chance to observe the
+trap before unwinding alongside it. There's no `Status::Failed` or
+`Event::TaskFailed` for the parent's wait-loop to dispatch on,
+neither for guest-implemented nor host-implemented targets.
+
+Wiring `on-trap` would require either (1) canon-async growing a
+guest-visible terminal-error event the parent can poll for, or (2)
+the adapter wrapping every async call in an exception-catching
+shell. Both depend on upstream evolution that may or may not
+happen; revisit when upstream lands the event semantics.
+
 ## Per-tier performance characterization
 
 Every tier above 1 lifts canonical-ABI values into `field-value`

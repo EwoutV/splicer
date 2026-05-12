@@ -11,6 +11,51 @@ For the shared framework that applies to every tier (one-tier-
 per-middleware rule, async convention, hook-trap propagation,
 chain composition), see [`adapter-components.md`](../adapter-components.md).
 
+## Tier-2 hook interfaces
+
+The tier-2 WIT package mirrors tier-1's split-by-hook structure:
+two interfaces, `before` and `after`. `before::on-call(call,
+args)` carries the function's params as a `list<field>`;
+`after::on-return(call, result)` carries the return as
+`option<field-tree>` (`none` for void). Both hooks are `async`.
+
+**Receiver convention.** For resource methods (`request.body()`, etc.),
+the receiver `borrow<request>` / `own<request>` surfaces as the first
+entry in `args` with `name: "self"`. The remaining declared parameters
+follow in WIT-declaration order.
+
+**Function naming.** `call-id.function-name` uses the **canonical-ABI**
+function name verbatim — `"[constructor]request"`,
+`"[method]request.body"`, `"[static]request.from-uri"`, `"handle"` for
+plain functions. No special-casing or pretty-printing; the middleware
+sees what the canonical ABI sees.
+
+A middleware can export any non-empty subset:
+
+- `before` only — pre-call observation (e.g. throttler that counts inbound shapes)
+- `after` only — post-call observation (e.g. response logger)
+- `before` + `after` — full lifecycle (e.g. tracer, recorder, metrics)
+
+The adapter only fires hooks the middleware actually exports, so a
+`before`-only middleware never pays the lift cost on the result.
+
+**Result representation.** WIT functions have at most one result and
+results are unnamed, so `on-return` carries `option<field-tree>`
+directly (`none` for void functions, `some(tree)` otherwise) rather
+than wrapping in a `field` with a synthetic name.
+
+**WIT definition:** [`wit/tier2/world.wit`](../../wit/tier2/world.wit)
+
+**Good for:** request/response logging with payload inspection, metrics
+extraction from request fields, content-based routing decisions,
+throttling by request shape, authentication/authorization, security
+policy enforcement, parameter validation. When applied at multiple WIT
+boundaries simultaneously (e.g. `wasi:http/handler` plus
+`wasi:http/types`), tier-2 also enables **span-based recording**: the
+middleware can correlate the resource handles that surface across
+nested calls within a single top-level invocation, then log the entire
+causal trace as one record.
+
 ## Value representation: flattened cells with side tables
 
 The adapter lifts canonical-ABI values into a **flat array of cells**.
@@ -27,17 +72,14 @@ small set of side lists plus a root index.
 
 Two design constraints shape this layout:
 
-1. **WIT does not yet support recursive types**
-   ([component-model
-   issue #56](https://github.com/WebAssembly/component-model/issues/56)),
-   so the tree's recursion is "compiled out" into an index-keyed array.
-2. **Canonical-ABI lays out a `list<variant>` as fixed-stride memory**,
-   where the stride equals the variant's max payload size padded to
-   alignment. Keeping nominal metadata inline in cell variant cases
-   would force every cell — including a `cell::bool(true)` — to pay
-   24+ bytes of padding. Pulling the metadata into side tables caps
-   every cell payload at 8 bytes (`s64`), so the cell stride lands at
-   16 bytes regardless of which case is present.
+1. **WIT lacks recursive types**
+   ([component-model #56](https://github.com/WebAssembly/component-model/issues/56))
+   — so the tree's recursion is encoded as `u32` indices into the
+   cells array, not inline nesting.
+2. **Cells need a small, uniform size** — canonical-ABI's
+   fixed-stride variant layout would force every cell to pay
+   padding for the widest case, so nominal metadata goes in side
+   tables to keep cells tight.
 
 The `cell` variant is a tagged union over three families of cases:
 
@@ -90,18 +132,30 @@ The cost is one extra `tree.<kind>_infos[idx]` lookup in middleware
 code per nominal cell. Helper libraries hide this; without one, the
 indirection is mechanical.
 
-Type names inside cells use **simple** names (`"color"`, not
-`"my:pkg/types@1.0.0.color"`). The fully-qualified interface identity
-surfaces at the **call** level; tier-2's per-call hook receives the
-fully-qualified interface plus the function name, so simple names
-inside values are always unambiguous.
+### Middleware contract
 
-The adapter handles all canonical-ABI lifting; the middleware works
-entirely with the cell representation. Tools that want a flat string
-can format the tree themselves; tools that want structured access
-(jsonpath-style metric extraction, schema-aware routing) can walk the
-tree directly. Splicer emits one format and lets the tool decide what
-to do with it.
+Type names inside cells use **simple** names (`"color"`, not
+`"my:pkg/types@1.0.0.color"`). The fully-qualified interface
+identity surfaces at the **call** level; tier-2's per-call hook
+receives the fully-qualified interface plus the function name, so
+simple names inside values are always unambiguous.
+
+The adapter handles all canonical-ABI lifting; the middleware
+works entirely with the cell representation. Tools that want a
+flat string can format the tree themselves; tools that want
+structured access (jsonpath-style metric extraction, schema-aware
+routing) can walk the tree directly. Splicer emits one format and
+lets the tool decide what to do with it.
+
+**Walking the cells by hand is awkward**, so splicer plans to ship
+a Rust helper crate that wraps the `field-tree` in a typed walker
+(cell-by-cell traversal, automatic side-table lookups, conversion
+to native Rust types where it makes sense). Middleware authors in
+other languages will eventually get a polyglot-friendly path via
+the planned [resource-shape adapter-adapter](#planned-resource-shape-adapter-adapter)
+described below. Neither is shipped yet; today, middleware authors
+either use Rust and consume the cells directly, or hand-roll a
+walker in their language of choice.
 
 ## Resource, stream, future, and error-context handles
 
@@ -119,51 +173,6 @@ it. The adapter still owns canonical-ABI ownership semantics
 ID is purely for reasoning about identity (e.g. "this `request` was
 seen on `handle` and again as the parent of the `body` resource three
 calls later").
-
-### `error-context` is id-only — host limitation
-
-The canonical ABI defines `error-context.debug-message`, which would
-let the wrapper read the debug string in its own component (no
-cross-component hop needed for the string itself). We deliberately
-do **not** call it today: wasmtime currently ships an incomplete
-`error-context` implementation ("very incomplete" per its own
-`wasm_component_model_error_context` config docstring). The
-`error_context_transfer` libcall fired by the FACT trampoline
-crashes with `unknown handle index` when an `error-context`
-crosses any component boundary — including a wrapper interposed
-via splicer or even a wac-shim in a fan-in topology. The wrapper's
-wasm code never runs, so option-2 (read the debug message) cannot
-be validated end-to-end on current hosts.
-
-When wasmtime's error-context support matures, this will be upgraded
-to surface the debug string. The on-the-wire shape will change (likely
-a sibling cell variant, e.g. `error-context-message(string)`, or
-extending `handle-info.type-name` to carry the message); middleware
-that pattern-matches on `error-context-handle` today should be ready
-to switch.
-
-### Oversized lists trap
-
-The lift codegen reserves slabs sized `count * elem_bytes` (cells
-slab) and `len * 4` (per-list child-index buffer). Both go through
-`cabi_realloc`, whose size param is canonical-ABI i32 (signed). When a
-dynamic `len` would make the multiplication overflow signed i32 — at
-roughly 134M cells (16-byte cell stride) or 536M list-of indices — the
-wrapper traps via `unreachable` rather than wrapping silently and
-under-allocating.
-
-In practice this fires only on pathological / adversarial inputs. The
-trade-off is **trap (loud, clean abort) vs. clip (truncate the lifted
-view, keep the call running)**: clipping would let observability
-survive larger inputs, but creates a divergence between what the
-handler sees (full list) and what the audit log records (truncated) —
-exactly the property auditors don't want. The wire format is not yet
-designed for a "this list was truncated" marker, so today's behavior
-is trap.
-
-If your deployment surfaces traps from large lists, file a bug with
-the call shape; the policy is revisitable but warrants real call-size
-data before changing.
 
 ### What this means for resource-bearing target interfaces
 
@@ -208,69 +217,49 @@ deliberately does **not** support that. It's planned as a separate
 opt-in interface (`splicer:tier2/stream-observer`) once a concrete use
 case justifies the implementation cost.
 
-## Tier-2 hook interfaces
+### `error-context` is id-only — host limitation
 
-The tier-2 WIT package mirrors tier-1's split-by-hook structure:
-two interfaces, `before` and `after`. `before::on-call(call,
-args)` carries the function's params as a `list<field>`;
-`after::on-return(call, result)` carries the return as
-`option<field-tree>` (`none` for void). Both hooks are `async`.
+The canonical ABI defines `error-context.debug-message`, which would
+let the wrapper read the debug string in its own component (no
+cross-component hop needed for the string itself). We deliberately
+do **not** call it today: wasmtime currently ships an incomplete
+`error-context` implementation ("very incomplete" per its own
+`wasm_component_model_error_context` config docstring). The
+`error_context_transfer` libcall fired by the FACT trampoline
+crashes with `unknown handle index` when an `error-context`
+crosses any component boundary — including a wrapper interposed
+via splicer or even a wac-shim in a fan-in topology. The wrapper's
+wasm code never runs, so option-2 (read the debug message) cannot
+be validated end-to-end on current hosts.
 
-**Receiver convention.** For resource methods (`request.body()`, etc.),
-the receiver `borrow<request>` / `own<request>` surfaces as the first
-entry in `args` with `name: "self"`. The remaining declared parameters
-follow in WIT-declaration order.
+When wasmtime's error-context support matures, this will be upgraded
+to surface the debug string. The on-the-wire shape will change (likely
+a sibling cell variant, e.g. `error-context-message(string)`, or
+extending `handle-info.type-name` to carry the message); middleware
+that pattern-matches on `error-context-handle` today should be ready
+to switch.
 
-**Function naming.** `call-id.function-name` uses the **canonical-ABI**
-function name verbatim — `"[constructor]request"`,
-`"[method]request.body"`, `"[static]request.from-uri"`, `"handle"` for
-plain functions. No special-casing or pretty-printing; the middleware
-sees what the canonical ABI sees.
+## Oversized lists trap
 
-A middleware can export any non-empty subset:
+The lift codegen reserves slabs sized `count * elem_bytes` (cells
+slab) and `len * 4` (per-list child-index buffer). Both go through
+`cabi_realloc`, whose size param is canonical-ABI i32 (signed). When a
+dynamic `len` would make the multiplication overflow signed i32 — at
+roughly 134M cells (16-byte cell stride) or 536M list-of indices — the
+wrapper traps via `unreachable` rather than wrapping silently and
+under-allocating.
 
-- `before` only — pre-call observation (e.g. throttler that counts inbound shapes)
-- `after` only — post-call observation (e.g. response logger)
-- `before` + `after` — full lifecycle (e.g. tracer, recorder, metrics)
+In practice this fires only on pathological or adversarial inputs.
+The trade-off is **trap (loud, clean abort) vs. clip (truncate the
+lifted view, keep the call running)**. Clipping would let the call
+survive at the cost of a divergence between what the handler sees
+(full list) and what the lifted view records (truncated), and the
+wire format doesn't yet carry a "this list was truncated" marker —
+so the conservative choice today is trap.
 
-The adapter only fires hooks the middleware actually exports, so a
-`before`-only middleware never pays the lift cost on the result.
-
-**Result representation.** WIT functions have at most one result and
-results are unnamed, so `on-return` carries `option<field-tree>`
-directly (`none` for void functions, `some(tree)` otherwise) rather
-than wrapping in a `field` with a synthetic name.
-
-**WIT definition:** [`wit/tier2/world.wit`](../../wit/tier2/world.wit)
-
-### Future hook: `on-trap`
-
-A trap-observability hook (`on-trap(call, reason)`) was scoped but
-intentionally not shipped. The motivating use case is real:
-instrumenting a target interface and seeing when a downstream call
-fails. The blocker is at the runtime layer rather than our codegen:
-canon-async on current wasmtime releases propagates child-task
-traps as wasm traps that unwind the parent's stack — the parent
-guest never gets a chance to observe the trap before unwinding
-alongside it. There's no `Status::Failed` or `Event::TaskFailed`
-for the parent's wait-loop to dispatch on, neither for guest-
-implemented nor host-implemented targets.
-
-Wiring `on-trap` would require either (1) canon-async growing a
-guest-visible terminal-error event the parent can poll for, or (2)
-the adapter wrapping every async call in an exception-catching
-shell — neither is in scope today. We'll add the WIT + dispatch
-when upstream lands the event semantics.
-
-**Good for:** request/response logging with payload inspection, metrics
-extraction from request fields, content-based routing decisions,
-throttling by request shape, authentication/authorization, security
-policy enforcement, parameter validation. When applied at multiple WIT
-boundaries simultaneously (e.g. `wasi:http/handler` plus
-`wasi:http/types`), tier-2 also enables **span-based recording**: the
-middleware can correlate the resource handles that surface across
-nested calls within a single top-level invocation, then log the entire
-causal trace as one record.
+If a real workload hits these traps, please open an issue with the
+call shape. The policy is revisitable, but we'd rather see concrete
+call-size data than guess at the right cutoff up front.
 
 ## Planned: resource-shape adapter-adapter
 
