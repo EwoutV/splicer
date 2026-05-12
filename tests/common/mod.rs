@@ -20,8 +20,8 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.2.0";
-pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.2.0";
+pub const SPLICER_BEFORE: &str = "splicer:tier1/before@0.3.0";
+pub const SPLICER_AFTER: &str = "splicer:tier1/after@0.3.0";
 
 pub const TARGET_IFACE: &str = "wasi:http/handler@0.3.0";
 pub const TARGET_FN: &str = "handle";
@@ -45,6 +45,21 @@ pub fn call_id_val(iface: &str, func: &str) -> Val {
     Val::Record(vec![
         ("interface-name".into(), Val::String(iface.into())),
         ("function-name".into(), Val::String(func.into())),
+        ("id".into(), Val::U64(0)),
+    ])
+}
+
+/// Empty `span-context` — all-zero ids, no flags, no state. Returned
+/// by fake `outer-span-context` host fns so the builtin sees "no host
+/// parent" and either mints a fresh trace-id (tracing) or leaves
+/// trace-correlation fields unset on emitted records (logs).
+pub fn empty_span_context() -> Val {
+    Val::Record(vec![
+        ("trace-id".into(), Val::String(String::new())),
+        ("span-id".into(), Val::String(String::new())),
+        ("trace-flags".into(), Val::Flags(vec![])),
+        ("is-remote".into(), Val::Bool(false)),
+        ("trace-state".into(), Val::List(vec![])),
     ])
 }
 

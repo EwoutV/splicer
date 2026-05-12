@@ -21,12 +21,15 @@ valid.
 ## Call-id shape
 
 Every tier-1 hook takes a `call-id` record carrying the target
-interface (fully-qualified) plus the canonical-ABI function name:
+interface (fully-qualified), the canonical-ABI function name, and a
+monotonic per-instance id for correlating `on-call` / `on-return` of
+the same invocation:
 
 ```wit
 record call-id {
     interface-name: string,    // "wasi:http/handler@0.3.0"
     function-name: string,     // "handle", "[method]request.body", ...
+    id: u64,                   // monotonic per-instance call id
 }
 ```
 
@@ -34,6 +37,39 @@ record call-id {
 [`splicer:common`](../../wit/common/world.wit) package, so middleware
 authors who later move from tier 1 to tier 2 see the same call-identity
 shape — only the payload widens.
+
+## Payload isolation
+
+Tier-1's "name-only" framing isn't just an ergonomic simplification —
+it's a **structural security property**: the middleware never sees
+the call's payload bytes, and can't. Two reinforcing reasons:
+
+1. **The WIT contract.** The tier-1 hooks
+   (`on-call(call)`, `on-return(call)`, `should-block(call)`) take
+   *only* `call-id`. There's no parameter shape that could carry
+   the args or the result into the middleware.
+2. **Shared-nothing memory.** Even if a middleware tried to peek,
+   it can't. Components have isolated linear memories, and the
+   payload bytes live in the adapter's memory (during the wrapper
+   body) and the handler's memory (during the downstream call).
+   The middleware's wasm has no way to dereference into either.
+   (See [`adapter-internals.md`](../adapter-internals.md#shared-nothing-components-and-the-canon-abi-trampoline)
+   for the cross-component memory model.)
+
+So tier-1 lets you compose middleware into a call path with a
+strong guarantee: it can throttle, authenticate, route, or log by
+call identity, but **cannot see, log, exfiltrate, or be tricked
+into leaking the payload bytes**. Useful for sensitive-data
+contexts — auth interceptors in front of secrets, audit logging
+over PII, rate-limiting on financial APIs — where the call-shape
+metadata is enough to make the policy decision but you don't want
+the policy code inside the trust boundary of the payload.
+
+Higher tiers relax this property by design: tier-2 shows the
+middleware a lifted typed view of the payload (read-only
+observation), tier-3 lets the middleware modify the payload
+in flight, tier-4 replaces the downstream entirely. The strongest
+payload-isolation guarantee lives at tier-1.
 
 ## What "interface" means here (one middleware wraps N functions)
 

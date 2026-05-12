@@ -14,6 +14,6 @@ world otel-bare-metrics-mdl {
     import wasi:otel/metrics@0.2.0-rc.2;
     import wasi:clocks/wall-clock@0.2.0;
 
-    export splicer:tier1/before@0.2.0;
-    export splicer:tier1/after@0.2.0;
+    export splicer:tier1/before@0.3.0;
+    export splicer:tier1/after@0.3.0;
 }

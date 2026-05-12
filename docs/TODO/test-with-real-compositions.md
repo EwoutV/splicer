@@ -3,8 +3,9 @@
 Coverage map for the tier-1 adapter. Each bullet is a shape the
 adapter should handle, marked:
 
-- `[x]` — integration test exists (in `src/adapter/tests.rs`) or
-  runtime test exists (in `tests/component-interposition/`).
+- `[x]` — integration test exists (in `src/adapter/tier1/tests.rs`
+  or `src/adapter/tier2/lift/tests.rs`) or runtime test exists (in
+  `tests/component-interposition/`).
 - `[-]` — covered structurally (adapter generates + validates)
   but not exercised at runtime.
 - `[ ]` — not covered; candidate for new coverage.
@@ -31,7 +32,10 @@ is tracked under "Built-in middleware keyword" / fuzzing in
 - [x] `string` (async return)
 - [x] `list<primitive>` param + result (exercises `has_lists` needs_realloc)
 - [ ] `list<string>` (nested variable-length)
-- [ ] `list<list<T>>` (doubly-nested)
+- [ ] `list<list<T>>` (doubly-nested) — fixture present at
+  `src/adapter/tier2/lift/tests.rs:124`; gated at plan-build, pinned
+  by `nested_list_bails_at_plan_build`. Lift support is the only
+  remaining list-element gap.
 - [x] `list<T, N>` (fixed-size — structural coverage via
   `test_adapter_fixed_size_list_param_sync` + unit test in
   `abi/bindgen.rs`'s `lift_fixed_size_list_unrolls_n_loads`)

@@ -20,12 +20,13 @@ target-agnostic at tiers 2 and up (the adapter lifts canonical-ABI
 values into a uniform field representation). Splicer handles all the
 type plumbing at composition time either way.
 
-This document covers the cross-tier framework: tier taxonomy, the rules
-that apply to every tier, eligibility detection, and chain composition.
-For each tier's deep dive, see the per-tier docs:
+This document covers the shared framework that applies to every tier:
+tier taxonomy, the rules common to all tiers, eligibility detection,
+and chain composition. For each tier's deep dive, see the per-tier
+docs:
 
-- [Tier 1: Name-Only Hooks](./tiers/tier-1.md) — currently supported
-- [Tier 2: Observation](./tiers/tier-2.md) — planned
+- [Tier 1: Name-Only Hooks](./tiers/tier-1.md) — shipped
+- [Tier 2: Observation](./tiers/tier-2.md) — shipped
 - [Tier 3: Transform](./tiers/tier-3.md) — planned
 - [Tier 4: Virtualize](./tiers/tier-4.md) — planned
 
@@ -50,7 +51,7 @@ replace the downstream entirely.
 | Tier | See call name | See typed data | Modify data | Bypass downstream | Status        |
 |------|---------------|----------------|-------------|-------------------|---------------|
 | [1](./tiers/tier-1.md) | yes | no  | no  | partial (block) | **supported** |
-| [2](./tiers/tier-2.md) | yes | yes | no  | no              | planned       |
+| [2](./tiers/tier-2.md) | yes | yes | no  | no              | **supported** |
 | [3](./tiers/tier-3.md) | yes | yes | yes | no              | planned       |
 | [4](./tiers/tier-4.md) | yes | yes | yes | yes             | planned       |
 
@@ -96,30 +97,19 @@ separate sync code path.
 ### Adapter behavior when a middleware hook traps
 
 If a middleware's hook (any tier's `on-call`, `on-return`,
-`should-block`, `on-trap`, etc.) itself traps — e.g. the middleware
-panics, dereferences out-of-bounds memory, or otherwise hits an
-unrecoverable error — the adapter **propagates the trap** rather than
-swallowing it.
+`should-block`, etc.) itself traps — e.g. the middleware panics,
+dereferences out-of-bounds memory, or otherwise hits an unrecoverable
+error — the trap propagates as a wasm trap through the adapter and
+on up to the host. The adapter does nothing special; the runtime's
+backtrace points at the adapter's dispatch wrapper at the hook-call
+site, so an operator can tell from the backtrace alone that the trap
+originated in the middleware hook (not in the wrapped target
+function).
 
-Concretely: hooks run as async subtasks, so the adapter awaits the
-subtask and inspects its terminal state. If the subtask is in `errored`
-state, the adapter traps too. The runtime's backtrace points at the
-adapter's dispatch wrapper at the hook-call site, so an operator can
-tell from the backtrace alone that the trap originated in the
-middleware hook (not in the wrapped target function).
-
-The adapter does **not** attach a custom string reason to the
-re-propagated trap (core wasm has no parameterized-trap primitive), and
-it does **not** import a logging interface to write a more readable
-error before trapping. Both are deliberate: keep the adapter
-zero-imports beyond what its target requires, and rely on the runtime's
-backtrace to identify the fault site.
-
-The adapter does **not** silently swallow middleware traps and proceed
-with the downstream call. A middleware whose code is broken should fail
-loudly so the operator notices. A configurable
-`on-middleware-trap: propagate | log | swallow` policy is plausible
-future work if a concrete use case justifies it.
+A middleware whose code is broken fails loudly so the operator
+notices. A configurable `on-middleware-trap: propagate | log |
+swallow` policy is plausible future work if a concrete use case
+justifies it.
 
 ### One tier per middleware
 
@@ -205,7 +195,7 @@ When processing a splice rule, splicer checks each middleware component:
    rejects with an error:
    ```
    middleware `my-middleware.wasm` exports interfaces from multiple tiers
-   (tier 1: splicer:tier1/before; tier 2: splicer:tier2/observe).
+   (tier 1: splicer:tier1/before; tier 2: splicer:tier2/before).
 
    A middleware must implement exactly one tier. To combine behaviors,
    ship them as separate components and chain them in `inject: [...]`.

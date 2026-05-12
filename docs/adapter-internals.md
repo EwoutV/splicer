@@ -1,390 +1,382 @@
 # Adapter generation — architecture
 
-Low-level map of the code that produces a tier-1 adapter component.
-Companion doc: [`adapter-components.md`](./adapter-components.md) is the
-user-facing explainer; this file is for contributors working on the
-generator itself.
+Design and rationale for the code that produces splicer's adapter
+components. Companion doc:
+[`adapter-components.md`](./adapter-components.md) is the user-facing
+explainer; this file is for contributors working on the generators
+themselves. Tier-by-tier user docs live in
+[`docs/tiers/`](./tiers/), and tier-2 lift internals live in
+[`docs/tiers/lift-codegen.md`](./tiers/lift-codegen.md).
+
+The implementation lives under `src/adapter/`. Module names, file
+paths, and per-kind dispatch tables intentionally aren't enumerated
+here — they rot every refactor and are faster to read at the source.
 
 ## Mission
 
 Given
 
-- the target interface (cviz `InterfaceType::Instance`),
-- a split `.wasm` that imports or exports it,
-- the set of `splicer:tier1/*` interfaces the middleware exports,
+- a target interface (fully-qualified, e.g. `wasi:http/handler@0.3.0`),
+- a split `.wasm` whose embedded WIT defines that interface,
+- the set of `splicer:tier{1,2}/*` interfaces the middleware exports,
 
 emit a WebAssembly Component binary that:
 
 - Re-exports the target interface unchanged (drop-in replacement for
   the upstream caller).
 - Imports the target interface from a handler-providing component.
-- Imports the middleware's tier-1 hooks (`before`, `after`, `blocking`).
-- For each function in the target interface, wraps it with the hooks'
-  before/after/blocking phases, handling the canonical-ABI lift/lower
-  and async machinery transparently.
+- Imports the middleware's hooks (`before` / `after` / `blocking`
+  for tier-1; `before` / `after` for tier-2).
+- For each function in the target interface, wraps it with the
+  hooks' before/after/blocking phases, handling the canonical-ABI
+  lift/lower and async machinery transparently.
+
+There are two generators with the same outer shape but different
+dispatch-module bodies (see [Tier-1 vs Tier-2](#tier-1-vs-tier-2)).
 
 ## Design thesis
 
-**Splicer does not implement the Component Model's canonical ABI.** It
-consumes one. The adapter generator's job is to:
+**Splicer does not implement the Component Model's canonical ABI.
+It consumes one.** The generator's job is to:
 
-1. Know what *shape* the adapter should have (which hooks fire, which
-   handler gets called, how the phases sequence).
-2. Emit the wasm to *drive* a canonical-ABI implementation someone else
-   owns.
+1. Know what *shape* the adapter should have (which hooks fire,
+   which handler gets called, how the phases sequence).
+2. Emit the wasm to *drive* a canonical-ABI implementation someone
+   else owns.
 
 The canonical-ABI authority lives in two upstream crates:
 
 - [`wit-parser`] — type model, `SizeAlign` for canonical-ABI layout
   (size / align / field offsets / variant payload offsets),
-  `Resolve::push_flat` for flattening.
+  `Resolve::wasm_signature` / `Resolve::push_flat` for flattening,
+  `Resolve::wasm_import_name` / `wasm_export_name` for canonical
+  mangling.
 - [`wit-bindgen-core::abi`] — instruction-level codegen via the
-  `Bindgen` trait. Walks a type, emits an abstract instruction stream
-  (`I32Load { offset }`, `VariantLift { … }`, `RecordLift { … }`,
-  `FixedLengthListLiftFromMemory { … }`, etc.).
+  `Bindgen` trait. Walks a type, emits an abstract instruction
+  stream (`I32Load { offset }`, `VariantLift { … }`,
+  `RecordLift { … }`, etc.).
 
-Splicer implements `Bindgen` against `wasm-encoder::Instruction`. Every
-canonical-ABI decision — walk order, offsets, discriminant widths,
-joined flat shapes, widening rules — comes from upstream. Splicer's
-implementation is a transcriber: abstract `Instruction` → concrete wasm
-opcode.
+Splicer implements `Bindgen` against `wasm_encoder::Instruction`.
+Every canonical-ABI decision — walk order, offsets, discriminant
+widths, joined flat shapes, widening rules — comes from upstream.
+The implementation is a transcriber: abstract instruction → concrete
+wasm opcode.
 
-When upstream adds a new canonical-ABI feature, splicer picks it up
-via `cargo update` with at most one new `emit` match arm. When the
-upstream types grow a new variant splicer doesn't handle, Rust's
-exhaustive-match rule fails at compile time — **loud at build, silent
-never.**
+The outer Component is *also* not splicer's job: both generators
+hand a single core module to `wit_component::ComponentEncoder`,
+which synthesizes the surrounding component from the metadata
+embedded into the module. Splicer owns the inner core module and
+the WIT world that declares its imports/exports — nothing else.
 
 [`wit-parser`]: https://docs.rs/wit-parser
 [`wit-bindgen-core::abi`]: https://docs.rs/wit-bindgen-core
 
-## Module layout
+## Shared-nothing components and the canon-ABI trampoline
 
-```
-src/adapter/
-├── abi/                  — canonical-ABI abstraction
-│   ├── bindgen.rs        — WasmEncoderBindgen (Bindgen impl)
-│   ├── bridge.rs         — WitBridge (cviz → wit-parser translator)
-│   └── compat.rs         — verbatim cast / flat_types (pending [PR #1597])
-├── build/                — wasm binary emission
-│   ├── component.rs      — build_adapter_bytes (outer Component, 13 phases)
-│   ├── dispatch.rs       — inner dispatch core module
-│   ├── encoders.rs       — component-level type-section encoders
-│   ├── mem_layout.rs     — MemoryLayoutBuilder (scratch-memory allocator)
-│   └── ty.rs             — prim_cv, val_type_byte_size, align_to_val
-├── filter/               — closure-based split dep walker + raw-sections re-encoder
-├── func.rs               — AdapterFunc value object
-├── indices.rs            — ComponentIndices / DispatchIndices / FunctionIndices
-├── names.rs              — stable import/export name strings
-├── tests.rs              — integration tests
-└── mod.rs                — generate_tier1_adapter entry
-```
+The component model is a **shared-nothing** model: each component
+has its own isolated linear memory, and no component can
+dereference a pointer that belongs to a different component. That
+constraint is what motivates the canonical ABI in the first
+place — components need a defined protocol for shipping typed
+values across boundaries when they can't share memory addresses.
 
-Two layers (`abi/`, `build/`) plus three cross-cutting root files
-(`func.rs`, `indices.rs`, `names.rs`) and a `filter/` module that
-stands on its own.
+For each value crossing a component boundary, the canonical ABI
+splits the work three ways:
 
-### Layer responsibilities
+- **Lower** writes a typed value into the *sender's* linear
+  memory and produces a flat representation (a sequence of
+  primitive wasm values; pointers reference the sender's memory).
+- The **boundary trampoline** — provided by the host runtime
+  (e.g., wasmtime), not by any component — reads the flat
+  representation, copies any pointer-referenced bytes from the
+  sender's memory into the *receiver's* memory via the receiver's
+  `cabi_realloc`, and rewrites the pointers in the flat
+  representation to reference the receiver's memory.
+- **Lift** reads the typed value from the *receiver's* linear
+  memory using the rewritten flat representation.
 
-**`abi/` — spec-consuming.** Encodes knowledge *of* the canonical ABI
-by importing `wit-parser` and `wit-bindgen-core`. Never touches
-`wasm-encoder` section builders directly except for individual
-`Instruction` opcodes inside the `Bindgen` impl. Nothing in `abi/`
-knows about "the adapter's shape" — it's generic lift-from-memory
-machinery.
+Lower and lift each operate within a single component's memory;
+the cross-component copy is the trampoline's job. **Splicer never
+authors a cross-component memory write** — the adapter's wasm
+only ever touches its own linear memory. For a wrapper sitting
+between caller and handler:
 
-**`build/` — wasm-emitting.** Knows about the adapter's shape (13
-phases, hook sequencing, nested core modules, name conventions) and
-uses `wasm-encoder` sections to assemble the final binary. Consumes
-`abi/` for the lift-from-memory instruction bytes at the one spot
-that needs them (`task.return` load).
+- When the caller invokes the wrapper export, the trampoline has
+  already copied pointer-referenced args into the wrapper's
+  memory; the wrapper sees flat args whose pointers reference its
+  own memory.
+- When the wrapper calls the handler import, the trampoline at
+  *that* boundary copies pointer-referenced data from the
+  wrapper's memory into the handler's memory; the handler
+  receives flat args whose pointers reference its own memory.
+- Symmetric copying happens for results.
 
-**Cross-cutting (root).** `AdapterFunc` is a per-function value object
-produced by `func.rs::extract_adapter_funcs`. `indices.rs` holds three
-running-index allocators (one per namespace: outer component, dispatch
-core module, wasm function locals). `names.rs` centralizes string
-constants. Used by both layers.
+That's why tier-1 can be a true "passthrough" wrapper at the wasm
+level (the body just `local.get`s and `call`s) even though every
+call involves real byte-copying between components — the copying
+happens *outside* the wrapper's own wasm, in the trampoline.
+Tier-2 additionally walks its own copy of the args via
+`lift_from_memory` to populate the field-tree, but still never
+touches any other component's memory.
 
-## Type-flow: cviz arena → emitted wasm
+## Layering
 
-```
-cviz::TypeArena                        src/adapter/mod.rs entry
-      │
-      │ (splicer's internal type model, populated from the split)
-      ▼
-WitBridge::from_cviz(&arena)          abi/bridge.rs
-      │
-      │ Walks every ValueTypeId in the arena, allocates a wit_parser
-      │ TypeDef per compound type, records a HashMap<ValueTypeId, Type>.
-      │ Types insert children-first so Resolve::types stays topologically
-      │ ordered (SizeAlign::fill requires this).
-      ▼
-wit_parser::Resolve + SizeAlign       (owned by WitBridge)
-      │
-      │ Every canonical-ABI query now goes through this. WitBridge
-      │ exposes `size_bytes`, `flat_types`, `has_strings`, `has_lists`
-      │ wrappers so splicer consumers don't import wit-parser directly.
-      ▼
-AdapterFunc list                      func.rs::extract_adapter_funcs
-      │
-      │ Per-function resolution: param/result type ids, core-wasm flat
-      │ signature (via push_flat), result buffer size, has-strings /
-      │ has-lists predicates. Also allocates the initial bytes of the
-      │ dispatch module's scratch memory (function-name blob +
-      │ per-function result buffers).
-      ▼
-build_adapter_bytes                   build/component.rs
-      │
-      │ The 13 phases assemble the outer Component: type / import /
-      │ alias sections, handler instance type, canon lift/lower,
-      │ embed mem module + dispatch module, wire instances, export.
-      ▼
-build_dispatch_module                 build/dispatch.rs
-      │
-      │ Emits the inner core-wasm module: per-function wrapper bodies
-      │ with hook phases + async wait-loops + task.return. For async
-      │ funcs with a result, pre-runs WasmEncoderBindgen on the result
-      │ type to get the instruction sequence that task.return needs.
-      ▼
-Final .wasm bytes
-```
+Two layers, with a clean responsibility split:
 
-### Where the Bindgen actually fires
+- **`abi/` — spec-consuming.** Encodes knowledge *of* the canonical
+  ABI by importing `wit-parser` and `wit-bindgen-core`. Touches
+  `wasm-encoder` only for individual `Instruction` opcodes inside
+  the `Bindgen` impl, plus shared section / `cabi_realloc` /
+  hook-import / call-id helpers. Nothing in `abi/` knows about
+  "the adapter's shape" — it's generic infrastructure both tiers
+  consume.
 
-Just one spot: `build/dispatch.rs::build_task_return_loads`. For each
-async function whose result is non-void, we:
+- **Per-tier modules — wasm-emitting.** Each owns the shape of its
+  dispatch core module: which hooks fire, how the phases sequence,
+  what gets written to scratch memory, how results are returned.
+  They share `abi/` for the standard-export / hook-import /
+  `cabi_realloc` plumbing every dispatch module needs.
 
-1. Allocate an i32 local via `FunctionIndices::alloc_local` to hold
-   the result buffer's base address.
-2. Emit `I32Const(result_ptr); LocalSet(addr_local)` to stash it.
-3. Construct a `WasmEncoderBindgen` over the `&bridge.sizes` and
-   `&mut indices` (so any locals the bindgen needs for variant
-   dispatch / fixed-size-list iteration are allocated into the same
-   function-local space).
-4. Call `wit_bindgen_core::abi::lift_from_memory(&bridge.resolve,
-   &mut bindgen, (), &result_type)`.
-5. `bindgen.into_instructions()` — a `Vec<wasm_encoder::Instruction>`
-   that, when flushed into the function body, leaves the joined flat
-   representation of the result on the wasm value stack, ready for
-   the `task.return` call that follows.
+Cross-cutting infrastructure (split decoding, target-interface
+lookup, `DispatchIndices`, `LocalsBuilder`, `MemoryLayoutBuilder`)
+sits at the root of `src/adapter/`.
 
-All of the canonical-ABI heavy lifting — walking the type, picking
-load widths, computing offsets, dispatching variant arms, widening
-arm flats to the joined flat, unrolling fixed-size-list iteration —
+## Pipeline: split bytes → emitted Component
+
+Both tiers follow the same outer shape:
+
+1. **Discover the target's WIT.** Decode the input split's
+   `component-type` custom section into a `wit_parser::Resolve`.
+   This is how splicer learns the target interface — its function
+   list, type definitions, resource shapes, async-ness — without
+   any out-of-band schema. Everything downstream (which functions
+   to wrap, which types to lift, what to re-export, what canonical
+   names to use for imports/exports) is driven by this WIT.
+2. **Synthesize the adapter world.** Push the `splicer:common` /
+   `splicer:tier*` WIT packages plus a generated adapter-world
+   WIT into the `Resolve`, then select that world. The world
+   declares the imports (target interface re-imported from a
+   handler component, plus the middleware's hook interfaces) and
+   the exports (the target interface, re-exposed to the caller)
+   the dispatch core module must satisfy.
+3. **Build dispatch module.** Emit the wasm core module that
+   implements that world — the tier-specific part (see below).
+4. **Encode Component.** Hand the core module to
+   `wit_component::ComponentEncoder` via
+   `embed_component_metadata` + `.module(...).encode()`; the
+   library synthesizes the surrounding Component shape from
+   metadata embedded in the module.
+
+The synthesized adapter-world WIT is what makes the generator
+**specification-driven**: every import/export name in the
+dispatch core module comes from `Resolve::wasm_import_name` /
+`wasm_export_name` queries against this world, not from string
+concatenation. A WIT-level mangling change in upstream silently
+propagates to the emitted module.
+
+The two tiers diverge at the dispatch-module build:
+
+- **Tier-1** is a single-pass emitter: per-function loop produces
+  sigs + name offsets + retptr offsets, then sections are emitted
+  in fixed order.
+- **Tier-2** runs three explicit phases: **classify**
+  (`FuncClassified` per function with lift recipes, no offsets
+  yet), **layout** (reserve data + scratch + per-call buffers,
+  pre-build the blobs that embed cross-blob pointers), **emit**
+  (write the wasm sections and each wrapper body). The
+  classify→layout type-state hinge guarantees no offset is
+  back-filled into a placeholder.
+
+## Tier-1 vs tier-2
+
+The user-facing distinction is in [`docs/tiers/`](./tiers/). Inside
+the generators it shows up as **what gets written to the dispatch
+module's scratch memory**.
+
+**Tier-1 dispatch shape — passthrough wrapper.** The wrapper export
+and the handler import share the same flat sig (same
+`Resolve::wasm_signature` call against the same function). The body
+`local.get`s every param and `call`s the handler — no lift, no
+lower, no copy through memory for the payload. Static memory holds
+only call-identity bookkeeping (interface + function names, call-id
+buffer), retptr scratch per function whose result needs one, and
+hook plumbing (canon-async event slot, should-block retptr). Hooks
+observe call-id metadata only — they never see param or result
+values.
+
+**Tier-2 dispatch shape — lifting wrapper.** Each param and result
+is lifted into the `field-tree` representation defined in
+[`wit/common/world.wit`](../wit/common/world.wit). Hooks see
+`on-call(call-id, args: list<field>)` and
+`on-return(call-id, result: option<field-tree>)`; the wrapper
+still forwards canonical-ABI flat values through to the handler
+unchanged (observation, not transformation). The data flow — cell
+shapes, side-table storage policy, plan invariants, list-element
+widening — is documented in [`docs/tiers/lift-codegen.md`](./tiers/lift-codegen.md).
+The cross-cutting fact relevant to this doc is that tier-2's
+compound-result lift goes through our `Bindgen` impl (see
+[Where the Bindgen fires](#where-the-bindgen-fires)); the
+`on-call` and handler phases produce flat-value traffic identical
+to tier-1's.
+
+## Where the Bindgen fires
+
+`WasmEncoderBindgen` is splicer's `wit_bindgen_core::abi::Bindgen`
+implementation. It's invoked everywhere we need to **lift a
+canonical-ABI value out of linear memory onto the wasm value stack
+in joined-flat form**:
+
+- Tier-1 async wrappers whose flat-fitting result was returned via
+  retptr — we lift from the retptr scratch to satisfy `task.return`'s
+  flat-value contract.
+- Tier-2 compound result lifts — load multi-slot retptr buffers into
+  per-slot synth locals so the result-cells can read each slot
+  independently.
+- Tier-2 async `task.return` tail — the same flat-load as tier-1's
+  async path, but happens after the on-return hook has observed the
+  lifted result.
+
+In every case the caller stashes the source pointer into an
+`addr_local`, constructs a `WasmEncoderBindgen` with `&mut locals`
+(so any scratch the bindgen needs lands in the wrapper's local index
+space), calls `lift_from_memory(resolve, &mut bindgen, (), &ty)`,
+and flushes the resulting `Vec<Instruction>` into the function body.
+All canonical-ABI heavy lifting — walking the type, picking load
+widths, computing offsets, dispatching variant arms, widening arm
+flats to the joined flat, unrolling fixed-size-list iteration —
 happens inside upstream's `read_from_memory` via our `Bindgen::emit`.
 
-## `WasmEncoderBindgen` — design notes
+## `WasmEncoderBindgen` — invariants
 
-Key invariants:
+The detailed treatment is in the module header. The invariants that
+constrain how the impl is allowed to evolve:
 
-- **`Operand = ()`**. The wasm value stack is the source of truth.
-  The generator's internal operand stack tracks *counts*, not
-  identities. Splicer's emit arms pop/push placeholders to match each
+- **`Operand = ()`.** The wasm value stack is the source of truth.
+  The generator's internal operand stack tracks counts, not
+  identities. Emit arms pop / push placeholders to match each
   `Instruction` variant's declared arity.
-
-- **Address handling by local.** The base address lives in
+- **Address handling by local.** The base address lives in an
   `addr_local` (or a per-iteration `iter_addr_local` for fixed-size
-  lists); every load emit funnels through `emit_load`, which emits
+  lists); every load funnels through `emit_load`, which emits
   `local.get $addr; <load> offset=N`. The generator's abstract
   address operand can be cloned freely because we never pop a wasm
   value for it — each load re-reads from the local.
-
-- **Block-capture IR.** `push_block` / `finish_block` redirect emits
-  into an `ActiveBlock` buffer; `finish_block` stashes the buffer in
-  `completed_blocks` for the variant / fixed-size-list lift to
-  consume. Variant emits splice captured arm bodies inside a
-  `block ... br_table ... end` structure; fixed-size-list emits
-  replay the single element-read body N times with the address local
-  advanced by `elem_size` each iteration.
-
+- **Block-capture IR.** Block-pushing emits redirect into a buffer;
+  block-finishing stashes the buffer for the variant /
+  fixed-size-list lift to consume. Variant emits splice captured
+  arm bodies inside a `block ... br_table ... end` structure;
+  fixed-size-list emits replay the single element-read body N times
+  with the address local advanced by `elem_size` each iteration.
 - **Local allocation is shared with the outer function.** The
-  `Bindgen` borrows `&mut FunctionIndices` from the caller, so every
-  local it allocates (disc locals for variants, payload locals for
-  widening stash, iter address locals for fixed-size lists) lands in
-  the *same* contiguous local-index space as the dispatch module's
-  own locals (subtask / waitable-set). The caller calls
-  `indices.into_locals()` once when constructing the `Function`.
+  `Bindgen` borrows `&mut LocalsBuilder` from the caller, so every
+  local it allocates lands in the same contiguous local-index space
+  as the dispatch module's own locals. The caller calls
+  `locals.freeze()` once when constructing the `Function`.
 
-See the module docstring in `src/adapter/abi/bindgen.rs` for the full
-treatment, including the block-capture rationale and the fixed-size
-vs dynamic list table.
+## Heterogeneous variants and the joined flat representation
 
-## Heterogeneous variants and joined flat
-
-Variant / option / result arms can have different flat shapes. E.g.:
+Variant / option / result arms can have different flat shapes:
 
 - `result<u8, u64>` — ok arm flats to `[i32]`, err arm flats to
-  `[i64]`. Joined payload: `[i64]`. Ok arm's load must be widened via
-  `i64.extend_i32_u`.
-
+  `[i64]`. Joined payload: `[i64]`. Ok arm's load must be widened
+  via `i64.extend_i32_u`.
 - `result<string, u64>` — ok flats to `[Pointer, Length]`, err flats
-  to `[I64]`. Joined payload: `[PointerOrI64, Length]`. Ok arm's
-  Pointer at position 0 is i32 at the wasm level; PointerOrI64 is
-  i64. Widening: `i64.extend_i32_u`.
+  to `[I64]`. Joined: `[PointerOrI64, Length]`. Ok arm's Pointer at
+  position 0 is i32 at the wasm level; PointerOrI64 is i64.
+  Widening: `i64.extend_i32_u`.
 
-The widening table lives in `abi/compat.rs::cast` (verbatim copy of
-`wit-bindgen-core`'s private `fn cast`). The `Bindgen`'s
-`emit_bitcast` maps each `Bitcast` variant to its wasm opcode. **Key
-subtlety on wasm32**: `Pointer` and `Length` collapse to `i32` but
-`PointerOrI64` collapses to `i64`, so the four cross-boundary casts
-(`PToP64`, `LToI64`, `P64ToP`, `I64ToL`) need `i64.extend_i32_u` /
-`i32.wrap_i64` — not no-ops. Tested by
-`lift_result_string_u64_widens_pointer_to_pointer_or_i64` and
-`lift_result_list_u64_widens_pointer_to_pointer_or_i64` in
-`abi/bindgen.rs`.
+The widening table lives in the `abi/` borrow from upstream (see
+below). **Key subtlety on wasm32**: `Pointer` and `Length` collapse
+to `i32` but `PointerOrI64` collapses to `i64`, so the four
+cross-boundary casts (`PToP64`, `LToI64`, `P64ToP`, `I64ToL`) need
+`i64.extend_i32_u` / `i32.wrap_i64` — not no-ops. Unit-tested
+alongside the bindgen impl.
 
-## Dispatch module — what splicer still owns
+## `abi/compat.rs` — a temporary upstream borrow
 
-The `abi/` layer is generic lift-from-memory. The *shape* of the
-adapter — which is splicer's unique value-add — lives in
-`build/dispatch.rs`:
+`wit-bindgen-core`'s `cast` / `flat_types` helpers and the
+`MAX_FLAT_PARAMS` constant aren't part of its public API. Splicer's
+variant widening needs them, so they're copied verbatim into a
+small `abi/compat.rs`. Visibility-flip PR tracked at
+<https://github.com/bytecodealliance/wit-bindgen/pull/1597>; when it
+merges, delete the file and import from upstream directly. Mark on
+the calendar: every wit-bindgen-core upgrade should re-check that
+the copies still match.
 
-- Per-function wrapper body, sequencing five phases: before,
-  blocking, handler call, after, return.
-- Async wait-loop emission (`waitable-set.wait` blocks) for hook
-  subtasks and async handler calls.
-- `task.return` wiring: custom wasm function types when the result
-  flattens to multiple values, shared `void → ()` / `(i32) → ()`
-  types for common cases, per-func import aliases.
-- Name-blob data segment + function-name hook invocations.
-- Nested core module 0 (memory provider, optionally with a bump
-  realloc) whose exports `mem` / `realloc` are aliased out and used
-  as canon-lift/lower options.
+## Index spaces
 
-None of this is canonical-ABI logic — it's adapter policy and
-component-model plumbing. Splicer owns it because it's the *shape*
-nobody else generates.
+Two running-index allocators thread through every emit:
 
-## `abi/compat.rs` — a temporary borrow
+- **`DispatchIndices`** — per dispatch module's type + function
+  indices.
+- **`LocalsBuilder`** — per emitted wasm function's locals.
 
-`wit-bindgen-core`'s private helpers `cast(WasmType, WasmType) ->
-Bitcast` and `flat_types(&Resolve, &Type, Option<usize>) ->
-Option<Vec<WasmType>>` aren't part of its public API. Splicer's
-variant widening needs both. `abi/compat.rs` contains verbatim copies
-of those two functions (plus the `MAX_FLAT_PARAMS` constant).
+`LocalsBuilder` is the cross-cutting one: both the wrapper-body
+emitter and the `Bindgen` allocate into the *same* instance, so
+their locals share an index space. The caller constructs it,
+pre-allocates anything it knows about, threads `&mut LocalsBuilder`
+into `Bindgen::new`, and after the bindgen finishes calls
+`locals.freeze()` to feed `Function::new_with_locals_types`.
 
-Visibility-flip PR filed upstream:
-<https://github.com/bytecodealliance/wit-bindgen/pull/1597>. When it
-merges, delete `abi/compat.rs` and change `abi/bindgen.rs` to import
-`wit_bindgen_core::abi::{cast, flat_types}` directly. The two
-functions reference only already-public types (`WasmType`, `Bitcast`,
-`Resolve`, `Type`), so the flip is semantically trivial.
-
-## Supported WIT types for async results
-
-Everything except Map. Specifically:
-
-- All primitives (bool, s8..s64, u8..u64, f32, f64, char, string,
-  error-context)
-- Records, tuples at any nesting
-- Enums, flags (any case/flag count)
-- Resources (Own / Borrow)
-- Futures, Streams (as i32 handles)
-- Dynamic lists, strings
-- Variants, options, results — including heterogeneous arms with
-  `Pointer`/`Length` ↔ `PointerOrI64` widening
-- Fixed-size lists — unrolled N-element reads with per-iteration
-  address advancement
-- Any nesting of the above
-
-**`Map<K, V>`**: `wit-bindgen-core`'s `read_from_memory` currently
-has `TypeDefKind::Map(..) => todo!()`. An async result type
-containing a Map would panic at lift time. Workaround: WIT authors
-can use `list<tuple<K, V>>` instead. Fixing this requires a
-`wit-bindgen-core` patch.
-
-The sync function path and function parameter handling flow through
-component-model `canon lift` / `canon lower` opcodes, which are the
-runtime's responsibility. Splicer never emits instruction-level
-lift/lower for those — it just declares the lift/lower operations
-via `CanonicalFunctionSection`, and the runtime does the rest. So
-those paths have always handled whatever types the component model
-supports.
+The outer Component's index spaces (component types / instances /
+canon lifts / canon lowers) are owned by `wit-component`, not
+splicer — a consequence of the "one core module → ComponentEncoder"
+shape.
 
 ## How canonical-ABI evolution affects the code
 
 Three failure modes, in order of frequency:
 
-1. **New `TypeDefKind` upstream.** `WitBridge::translate` has an
-   exhaustive match over cviz's `ValueType`, so cviz evolution forces
-   a compile error. The wit-parser side uses upstream-provided
-   `push_flat` / `SizeAlign` behavior, which absorbs most new type
-   kinds without our code changing. If upstream adds a
-   `TypeDefKind` splicer genuinely can't express (because cviz
-   doesn't have a matching `ValueType`), the bridge needs a new
-   translation arm.
+1. **New `TypeDefKind` upstream.** Most type-walking goes through
+   `wit-parser` / `wit-bindgen-core` directly, so new kinds are
+   absorbed transparently. The risk surface is tier-2's classify
+   pass and the cell-emit dispatch — both have non-exhaustive
+   matches over `TypeDefKind` and bail with a clear error on
+   unsupported kinds. Adding support = one new arm + a `Cell`
+   variant if the shape demands one.
+2. **New `Instruction` variant in `wit-bindgen-core::abi`.** The
+   `Bindgen` emit's match over `AbiInst` is **not** exhaustive —
+   the fallback is `unimplemented!()`. Won't catch at compile
+   time; the first run that exercises it panics with a clear
+   message. Add a new arm.
+3. **Bitcast table expansion.** The copy in `abi/compat.rs` has a
+   non-exhaustive `cast` match ending in `unreachable!()` for
+   bitcast pairs the canonical ABI doesn't allow. If upstream adds
+   a new `WasmType` or changes the allowed join pairs, the copy
+   must update. One reason to prefer upstream's version once
+   public.
 
-2. **New `Instruction` variant in `wit-bindgen-core::abi`.**
-   `WasmEncoderBindgen::emit`'s match over `AbiInst` is NOT
-   exhaustive — the fallback is `unimplemented!()`. When upstream
-   adds a new instruction (say, a new async bookkeeping op), we
-   won't notice at compile time, but the first run that exercises it
-   panics with a clear message. Add a new emit arm.
-
-3. **Bitcast table expansion.** `abi/compat.rs::cast` has a
-   non-exhaustive match (it ends with `unreachable!()` for
-   bitcast pairs the canonical ABI doesn't allow). If upstream adds a
-   new `WasmType` variant or changes the allowed join pairs, we'd
-   need to update the copied table. This is one of the reasons to
-   prefer upstream's version once `cast` is made public.
-
-None of these are silent.
-
-## Index spaces
-
-Three separate counter allocators, one per namespace:
-
-| Struct | Namespace | Scope |
-|---|---|---|
-| `ComponentIndices` | outer Component types / instances / funcs / core instances / core funcs | one per adapter component |
-| `DispatchIndices` | dispatch core module types / funcs | one per dispatch module |
-| `FunctionIndices` | wasm function locals | one per emitted wasm function |
-
-Keeping them separate makes the "different index spaces" explicit —
-the dispatch core module's type table has no relationship to the
-outer component's, and a function's locals are disjoint from both.
-
-`FunctionIndices` is the cross-cutting one: both the dispatch module
-(for subtask / waitable-set locals) and the Bindgen (for iter
-address, disc, and payload stash locals) allocate into the same
-instance. The caller constructs it, pre-allocates anything it knows
-about, then threads a `&mut FunctionIndices` into `Bindgen::new`.
-When the bindgen is dropped, the caller calls `into_locals()` and
-feeds the result into `Function::new_with_locals_types`.
+None of these are silent failures; all three trip on first
+execution rather than emitting subtly-wrong wasm.
 
 ## Testing
 
-Three layers of test coverage:
+Three layers, all expected to pass for any non-trivial change:
 
-- **Unit tests in `abi/bindgen.rs`** (~11 tests): emit-level
-  assertions — "loading a u32 emits one `i32.load`", "heterogeneous
-  variant emits one `i64.extend_i32_u`", "option's None arm pads
-  with `i32.const 0`". These catch bitcast / widening regressions at
-  `cargo test` time.
+- **Unit tests** alongside the code they exercise. Emit-level
+  assertions ("loading a u32 emits one `i32.load`", "heterogeneous
+  variant emits one `i64.extend_i32_u`", "this `Cell` variant emits
+  this exact byte sequence"). Catch bitcast / widening /
+  cell-encoding regressions at `cargo test` time.
+- **Adapter-shape integration tests** — run the full generator for
+  various interface shapes, then validate the emitted binary with
+  `wasmparser`. Catches structural bugs but not execution-time behavior.
+- **End-to-end composition** in `tests/component-interposition/`.
+  Run `./run.sh __testme` to build every configuration (single
+  middleware / chain / fan-in / nested / …), compose with real
+  handler components, and execute through a wasmtime runner. The
+  gold standard for "does the adapter actually work?" —
+  execution-time bugs (unaligned retptrs, missing borrow-drops,
+  cell-layout drift) surface here even when the unit +
+  binary-validation layers pass.
 
-- **In-process adapter validation in `src/adapter/tests.rs`** (~60
-  tests): run the full adapter generator for various interface
-  shapes, then validate the emitted binary with wasmparser. Catches
-  structural bugs but not runtime behavior.
-
-- **End-to-end composition in `tests/component-interposition/`**: run
-  `./run.sh __testme` to build every configuration (single middleware
-  / chain / fan-in / nested / …), compose with real handler
-  components, and execute the result through a wasmtime runner. This
-  is the gold standard for "does the adapter actually work."
-
-Any non-trivial change should clear all three. The bitcast widening
-bug we fixed in Stage 2 was invisible to the first two — it only
-surfaced when `__testme` tried to compose the real `wasi:http`
-error-code variant.
+For tier-2 specifically, there's also a canned wasmtime sweep
+(`cargo test --test fuzz_and_run test_tier2_canned -- --ignored`)
+exercising one representative shape per `Cell` kind.
 
 ## References
 
-- [`CanonicalABI.md`](https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md)
-  — the spec.
-- [`definitions.py`](https://github.com/WebAssembly/component-model/blob/main/design/mvp/canonical-abi/definitions.py)
-  — precise reference semantics.
-- `docs/TODO/investigate-canon-abi.md` — the decision / migration
-  doc that drove the Bindgen adoption.
-- `docs/TODO/adapter-comp-planning.md` — broader planning notes on the
-  tier-1 adapter.
+- [`CanonicalABI.md`](https://github.com/WebAssembly/component-model/blob/main/design/mvp/CanonicalABI.md) — the spec.
+- [`definitions.py`](https://github.com/WebAssembly/component-model/blob/main/design/mvp/canonical-abi/definitions.py) — precise reference semantics.
+- [`docs/tiers/lift-codegen.md`](./tiers/lift-codegen.md) — tier-2 lift design (data flow, plan invariants, side-table storage policy).
+- [`docs/tiers/tier-1.md`](./tiers/tier-1.md), [`tier-2.md`](./tiers/tier-2.md), [`tier-3.md`](./tiers/tier-3.md), [`tier-4.md`](./tiers/tier-4.md) — per-tier user-facing semantics.
