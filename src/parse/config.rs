@@ -1,6 +1,6 @@
 use anyhow::bail;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Parse a YAML splice configuration string into a list of validated
 /// [`SpliceRule`]s ready to pass to [`crate::lowlevel::generate_wac`].
@@ -41,20 +41,26 @@ pub struct YamlInjection {
 }
 
 /// `inject: [{ builtin: ... }]` payload. Two shapes — short scalar
-/// (just the builtin's name) or a long-form map with optional extras.
-/// The long form will house `config: {...}` once builtins grow that.
+/// (just the builtin's name) or a long-form map with optional extras
+/// including a `config:` block sealed into the builtin's
+/// `splicer:builtin-config` provider at splice time.
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum BuiltinSpec {
     /// `builtin: hello-tier1`
     Name(String),
-    /// `builtin: { name: hello-tier1, alias: greeter }`
+    /// `builtin: { name: hello-tier1, alias: greeter, config: { ... } }`
     Detailed {
         /// Name of the builtin in the splicer registry.
         name: String,
         /// Optional override for the WAC variable name. Defaults to
         /// `name` when omitted.
         alias: Option<String>,
+        /// Sealed into the `splicer:builtin-config` provider at
+        /// splice time. Scalars only — lists/maps are rejected;
+        /// encode structure inside a single string value.
+        #[serde(default)]
+        config: BTreeMap<String, serde_yaml::Value>,
     },
 }
 
@@ -69,6 +75,12 @@ impl BuiltinSpec {
         match self {
             BuiltinSpec::Name(_) => None,
             BuiltinSpec::Detailed { alias, .. } => alias.as_deref(),
+        }
+    }
+    fn config(&self) -> Option<&BTreeMap<String, serde_yaml::Value>> {
+        match self {
+            BuiltinSpec::Name(_) => None,
+            BuiltinSpec::Detailed { config, .. } => Some(config),
         }
     }
 }
@@ -136,6 +148,18 @@ pub struct Injection {
     /// need to know about builtins.
     #[serde(skip)]
     pub builtin: Option<String>,
+    /// YAML `builtin.config:` values, stringified at parse time so
+    /// the splice pipeline can hand them verbatim to the provider
+    /// patcher. `BTreeMap` for deterministic patched-provider bytes.
+    #[serde(skip)]
+    pub builtin_config: BTreeMap<String, String>,
+    /// Stamped by `ensure_provider_for` when the builtin imports
+    /// `splicer:builtin-config/get` — points at the patched provider
+    /// alongside the materialized builtin. Not user-settable; callers
+    /// who want their own provider use a user-form (`name` + `path`)
+    /// injection instead.
+    #[serde(skip)]
+    pub(crate) config_provider_path: Option<String>,
     /// Populated at runtime by `add_to_inject_plan` when this injection
     /// is resolved as a tier-1 adapter. Not part of the YAML config and
     /// not user-settable — use the `generated_adapters` field on
@@ -153,6 +177,8 @@ impl Injection {
             name: name.into(),
             path: Some(path.into()),
             builtin: None,
+            builtin_config: BTreeMap::new(),
+            config_provider_path: None,
             adapter_info: None,
         }
     }
@@ -165,6 +191,8 @@ impl Injection {
             name: name.into(),
             path: None,
             builtin: None,
+            builtin_config: BTreeMap::new(),
+            config_provider_path: None,
             adapter_info: None,
         }
     }
@@ -178,6 +206,8 @@ impl Injection {
             name: name.clone(),
             path: None,
             builtin: Some(name),
+            builtin_config: BTreeMap::new(),
+            config_provider_path: None,
             adapter_info: None,
         }
     }
@@ -378,6 +408,12 @@ impl ConfigFile {
                              empty if specified (omit the key to leave it unset)"
                         );
                     }
+                    if let Some(cfg) = spec.config() {
+                        // Surface bad config shapes at parse time, not
+                        // splice time. The into_injection path expects
+                        // this to have run.
+                        stringify_config(rule_num, inj_num, cfg)?;
+                    }
                 }
 
                 // Effective WAC-var name for uniqueness: builtin form
@@ -462,20 +498,63 @@ fn into_injection(yaml: YamlInjection) -> Injection {
         path,
         builtin,
     } = yaml;
-    let (wac_name, builtin_name) = match builtin {
+    let (wac_name, builtin_name, builtin_config) = match builtin {
         Some(spec) => {
             let bname = spec.builtin_name().to_string();
             let alias = spec.alias().map(str::to_string);
-            (alias.unwrap_or_else(|| bname.clone()), Some(bname))
+            // `validate()` ran first, so stringification can't fail
+            // here — expect on the result rather than threading
+            // Result through the rule-construction path.
+            let cfg = match spec.config() {
+                Some(c) => stringify_config(0, 0, c).expect("validated"),
+                None => BTreeMap::new(),
+            };
+            (alias.unwrap_or_else(|| bname.clone()), Some(bname), cfg)
         }
-        None => (name.expect("validated"), None),
+        None => (name.expect("validated"), None, BTreeMap::new()),
     };
     Injection {
         name: wac_name,
         path,
         builtin: builtin_name,
+        builtin_config,
+        config_provider_path: None,
         adapter_info: None,
     }
+}
+
+/// Convert a YAML config map to the string-keyed/string-valued
+/// shape the provider patcher consumes. Scalars stringify
+/// naturally; null/sequence/mapping/tagged values are rejected so
+/// silently dropping structured config can't happen.
+fn stringify_config(
+    rule_num: usize,
+    inj_num: usize,
+    values: &BTreeMap<String, serde_yaml::Value>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (key, val) in values {
+        let s = match val {
+            serde_yaml::Value::String(s) => s.clone(),
+            serde_yaml::Value::Bool(b) => b.to_string(),
+            serde_yaml::Value::Number(n) => n.to_string(),
+            serde_yaml::Value::Null => bail!(
+                "rule {rule_num}, injection {inj_num}: config key '{key}' is null; \
+                 omit the key or use an empty string scalar instead"
+            ),
+            serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) => bail!(
+                "rule {rule_num}, injection {inj_num}: config key '{key}' must be a scalar \
+                 (string, number, or bool); lists and maps must be encoded inside a single \
+                 string value (JSON, newline-separated, etc.) and parsed by the builtin"
+            ),
+            serde_yaml::Value::Tagged(_) => bail!(
+                "rule {rule_num}, injection {inj_num}: config key '{key}' carries a YAML tag, \
+                 which the substrate doesn't support"
+            ),
+        };
+        out.insert(key.clone(), s);
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -996,6 +1075,141 @@ rules:
           alias: ""
 "#,
             "builtin 'alias' must not be empty if specified",
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Builtin config block
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_builtin_config_block_stringifies_scalars() {
+        // YAML scalars (numbers, bools, strings) all flatten to strings
+        // by the time the injection lands in the splice pipeline.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin:
+          name: hello-tier1
+          config:
+            buffer: 100
+            flush_after_seconds: 10.0
+            note: "hi there"
+            enable: true
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        let cfg = &inject[0].builtin_config;
+        assert_eq!(cfg.get("buffer").map(String::as_str), Some("100"));
+        assert_eq!(
+            cfg.get("flush_after_seconds").map(String::as_str),
+            Some("10.0")
+        );
+        assert_eq!(cfg.get("note").map(String::as_str), Some("hi there"));
+        assert_eq!(cfg.get("enable").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn parse_builtin_config_block_defaults_empty() {
+        // No `config:` block → empty map, every builtin still works.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin:
+          name: hello-tier1
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        assert!(inject[0].builtin_config.is_empty());
+    }
+
+    #[test]
+    fn parse_builtin_short_form_has_no_config() {
+        // Short form (`builtin: name`) carries no config map.
+        let yaml = r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin: hello-tier1
+"#;
+        let rules = parse_yaml(yaml).expect("parse");
+        let SpliceRule::Before { inject, .. } = &rules[0] else {
+            panic!("expected Before");
+        };
+        assert!(inject[0].builtin_config.is_empty());
+    }
+
+    #[test]
+    fn validate_builtin_config_rejects_list() {
+        // Lists must be encoded inside a string value the builtin
+        // parses on its end — the substrate is intentionally scalar-only.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin:
+          name: hello-tier1
+          config:
+            rules:
+              - "1.2.3.4/32"
+              - "5.6.7.8/32"
+"#,
+            "must be a scalar",
+        );
+    }
+
+    #[test]
+    fn validate_builtin_config_rejects_map() {
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin:
+          name: hello-tier1
+          config:
+            limits:
+              max: 100
+              min: 0
+"#,
+            "must be a scalar",
+        );
+    }
+
+    #[test]
+    fn validate_builtin_config_rejects_null() {
+        // Explicit nulls signal a config bug — surface clearly rather
+        // than silently emitting an empty string.
+        assert_err(
+            r#"
+version: 1
+rules:
+  - before:
+      interface: wasi:http/handler@0.3.0
+    inject:
+      - builtin:
+          name: hello-tier1
+          config:
+            buffer: null
+"#,
+            "is null",
         );
     }
 

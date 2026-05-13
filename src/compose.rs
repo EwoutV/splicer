@@ -793,6 +793,8 @@ mod tests {
                 name: "a-middleware".to_string(),
                 adapter_info: None,
                 builtin: None,
+                builtin_config: Default::default(),
+                config_provider_path: None,
                 path: None,
             }],
         }];
@@ -867,6 +869,8 @@ mod tests {
                 name: "tracing".to_string(),
                 path: Some(mdl_path.clone()),
                 builtin: None,
+                builtin_config: Default::default(),
+                config_provider_path: None,
                 adapter_info: Some(AdapterInjectionInfo {
                     adapter_path: adapter_path.to_string(),
                     matched_hook_interfaces: vec![

@@ -196,8 +196,15 @@ before any external `wac compose` run could resolve it.
 
 ### Builtin middleware
 
-Builtins ship with the splicer binary as embedded `.wasm` components.
-Reference one with `builtin:` instead of supplying a `name`/`path`:
+Builtins ship as OCI artifacts under
+`ghcr.io/ejrgilbert/splicer/builtins/<name>:<version>`. At splice
+time, splicer resolves each referenced builtin in this order:
+`$SPLICER_BUILTINS_DIR/<name>.wasm` (local override, intended for
+iterating on a builtin without re-publishing — `make build-builtins`
+populates `assets/builtins/`, the natural value to point this at) →
+on-disk cache at `<user-cache>/splicer/builtins/<name>@<version>.wasm`
+→ OCI pull (populating the cache for next time). Reference one with
+`builtin:` instead of supplying a `name`/`path`:
 
 ```yaml
 inject:
@@ -205,13 +212,16 @@ inject:
   - builtin:                            # long form: extras live inside
       name: hello-tier1
       alias: greeter                    # optional WAC-variable override
+      config:                           # optional, see "Builtin config" below
+        greeting: "wired-up-greeting"
 ```
 
-| Field             | Type   | Required | Description                                                                       |
-|-------------------|--------|----------|-----------------------------------------------------------------------------------|
-| `builtin`         | scalar **or** map | ✅ | Identifies a splicer-shipped builtin. Scalar form names the builtin directly. |
-| `builtin.name`    | string | ✅ (long form) | Builtin's registry name (e.g. `hello-tier1`).                              |
-| `builtin.alias`   | string | ❌       | WAC variable name override. Defaults to the builtin's name when omitted.          |
+| Field            | Type                | Required      | Description                                                                                     |
+|------------------|---------------------|---------------|-------------------------------------------------------------------------------------------------|
+| `builtin`        | scalar **or** map   | ✅             | Identifies a splicer-shipped builtin. Scalar form names the builtin directly.                   |
+| `builtin.name`   | string              | ✅ (long form) | Builtin's registry name (e.g. `hello-tier1`).                                                   |
+| `builtin.alias`  | string              | ❌             | WAC variable name override. Defaults to the builtin's name when omitted.                        |
+| `builtin.config` | map<string, scalar> | ❌             | Key-value config sealed into the builtin at splice time (see below). Only present in long form. |
 
 The two forms cannot be mixed: you cannot put `path:` next to
 `builtin:`, and you cannot put a top-level `name:` next to `builtin:`
@@ -220,6 +230,36 @@ The two forms cannot be mixed: you cannot put `path:` next to
 Available builtins are discovered at compile time from
 [`src/builtins.rs`](../src/builtins.rs) — see that file for the current
 list and source crates under [`builtins/`](../builtins/).
+
+#### Builtin config
+
+If a builtin imports the `splicer:builtin-config` substrate (see its
+WIT world to check), values you set under `builtin.config:` are sealed
+into a tiny per-inject-site provider component that splicer wires next
+to the builtin at WAC-composition time. The builtin reads each key at
+runtime via `splicer:builtin-config/get`; any key the YAML didn't set
+returns `none`, and the builtin falls back to its own hardcoded
+default.
+
+Values are scalars (strings, numbers, booleans) — splicer stringifies
+them verbatim and the builtin parses them at init. Lists and maps are
+rejected at parse time; if a builtin needs structured config it
+encodes the structure inside a single string value (JSON,
+newline-separated, etc.). Two co-injected builtins get independent
+providers — no key namespace collisions — but a key renamed inside a
+builtin between versions is a breaking change splicer can't migrate
+for you.
+
+If the builtin doesn't import `splicer:builtin-config`, splicer rejects
+the splice with a clear error rather than silently dropping the
+values — the most common cause is a typo in the builtin name or
+picking a builtin that simply doesn't consume the substrate.
+
+**Supported keys + defaults live in each builtin's README**
+(`builtins/<name>/README.md`). Splicer doesn't type-check values
+against a schema today, so an unknown key passes parse time and just
+gets ignored at runtime; consult the README before reaching for the
+source.
 
 # Ordering Semantics
 

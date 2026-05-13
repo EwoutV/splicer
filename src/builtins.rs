@@ -96,28 +96,61 @@ fn version_for(name: &str) -> Option<&'static str> {
         .map(|(_, v)| *v)
 }
 
-/// Names of every builtin shipped with this splicer build, sorted.
-/// Used to render a helpful error when YAML references an unknown
-/// builtin.
+/// Internal-only builtin names — built and shipped like other builtins
+/// (so the publish + materialize plumbing applies) but not exposed for
+/// users to reference in YAML. The `splicer:builtin-config` provider
+/// template is the only such builtin today: splicer materializes a
+/// patched copy on demand whenever a user-facing builtin imports the
+/// config substrate. Each entry's canonical name lives in the module
+/// that owns it.
+const INTERNAL_BUILTINS: &[&str] = &[crate::config_provider::PROVIDER_BUILTIN_NAME];
+
+fn is_internal(name: &str) -> bool {
+    INTERNAL_BUILTINS.contains(&name)
+}
+
+/// Names of every user-facing builtin shipped with this splicer build,
+/// sorted. Used to render a helpful error when YAML references an
+/// unknown builtin. Internal-only builtins (see [`INTERNAL_BUILTINS`])
+/// are filtered out.
 pub fn known_names() -> Vec<&'static str> {
-    let mut names: Vec<&'static str> = BUILTIN_VERSIONS.iter().map(|(n, _)| *n).collect();
+    let mut names: Vec<&'static str> = BUILTIN_VERSIONS
+        .iter()
+        .map(|(n, _)| *n)
+        .filter(|n| !is_internal(n))
+        .collect();
     names.sort();
     names
 }
 
-/// Resolve the named builtin's bytes (override → cache → OCI pull) and
-/// write them to `<splits_dir>/builtins/<name>.wasm`. Returns the
-/// resulting absolute path.
-pub fn materialize_into(splits_dir: &Path, name: &str) -> Result<PathBuf> {
+/// Resolve the named builtin's bytes (override → cache → OCI pull).
+/// Used both by [`materialize_into`] (which writes them to disk) and
+/// by the config-provider patcher (which patches them in memory before
+/// writing). Treats internal-only builtins the same as user-facing
+/// ones — they ship through the same channels.
+pub(crate) fn load_resolved_bytes(name: &str) -> Result<Vec<u8>> {
     let version = version_for(name).ok_or_else(|| {
         anyhow::anyhow!(
             "unknown builtin '{name}'. Available: [{}]",
             known_names().join(", ")
         )
     })?;
+    load_bytes(name, version).with_context(|| format!("Failed to load builtin '{name}@{version}'"))
+}
 
-    let bytes = load_bytes(name, version)
-        .with_context(|| format!("Failed to load builtin '{name}@{version}'"))?;
+/// Resolve the named builtin's bytes (override → cache → OCI pull) and
+/// write them to `<splits_dir>/builtins/<name>.wasm`. Returns the
+/// resulting absolute path. Rejects internal-only builtin names so a
+/// YAML rule can't smuggle one in via `builtin: <internal-name>`.
+pub fn materialize_into(splits_dir: &Path, name: &str) -> Result<PathBuf> {
+    if is_internal(name) {
+        anyhow::bail!(
+            "'{name}' is an internal builtin and cannot be referenced from YAML. \
+             Available: [{}]",
+            known_names().join(", ")
+        );
+    }
+    let bytes = load_resolved_bytes(name)?;
 
     let dir = splits_dir.join(BUILTIN_SUBDIR);
     std::fs::create_dir_all(&dir)
