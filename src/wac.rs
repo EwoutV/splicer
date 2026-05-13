@@ -135,6 +135,7 @@ pub fn generate_wac(
             let mut current_id = source_instance.unwrap();
 
             chain.push(source_instance.unwrap());
+
             while let Some(node) = composition.nodes.get(&current_id) {
                 if let Some(conn) = node
                     .imports
@@ -200,9 +201,11 @@ pub fn generate_wac(
     // This enforces an ordering semantic for the rule application.
     let mut diagnostics: Vec<ContractResult> = vec![];
     let mut generated_adapters: Vec<GeneratedAdapter> = vec![];
+
     for (rule_idx, rule) in rules.iter().enumerate() {
         let mut any_interface_matched = false;
         let mut any_full_match = false;
+
         for chain in chains.iter_mut() {
             let between = apply_rule_between(
                 rule,
@@ -227,6 +230,7 @@ pub fn generate_wac(
             diagnostics.extend(between.contract_results);
             diagnostics.extend(before.contract_results);
         }
+
         if !any_full_match {
             let iface = rule_interface(rule);
             if !any_interface_matched {
@@ -287,6 +291,10 @@ pub fn generate_wac(
             }
         }
     }
+
+    // Emit chains in dependency order so provider-side adapters are created before
+    // later consumers try to resolve the provider's instance variable.
+    chains.sort_by_key(|chain| chain.chain.last().copied().unwrap_or_default());
 
     // Let's now generate WAC to handle the chains we've planned to emit
     let mut mdl_override = None;
